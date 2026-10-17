@@ -2794,8 +2794,9 @@ static void sp_close_timeout(void *opaque)
 }
 
 /*
- * The sink's window was closed, or the sink was told to quit (ui/sdl2.c). A
- * renderer that ends on purpose says so first: the source makes its planned
+ * The sink's window was closed, or the sink was told to quit (ui/sdl2.c), or it
+ * got SIGTERM, SIGINT or SIGHUP (sp_sink_signal). A renderer that ends on
+ * purpose says so first: the source makes its planned
  * switch while this sink still answers and exports, and says SP_BYE when it
  * has what it needs; the sink ends then (sp_disconnected), or after
  * SP_CLOSE_WAIT_MS if no bye comes, or at once if no source is attached or the
@@ -2823,6 +2824,67 @@ bool spacebox_sink_close(void)
     timer_mod(sp.close_timer,
               qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + SP_CLOSE_WAIT_MS);
     return true;
+}
+
+/*
+ * A sink told to end by a signal (SIGTERM, SIGINT, SIGHUP: its stop script, a
+ * terminal) ends on purpose too, and ends as a closed window does
+ * (spacebox_sink_close): it detaches first. QEMU's own handler (os-posix.c)
+ * would end the process at once, and the source would take that for a sudden
+ * loss. The handler only writes the signal's number into a pipe that the main
+ * loop reads. A signal that comes while the sink already waits for the bye is
+ * logged and changes nothing: SP_CLOSE_WAIT_MS bounds the wait.
+ */
+static int sp_sig_fd[2] = { -1, -1 };
+
+static void sp_sink_signal(int sig)
+{
+    uint8_t b = sig;
+    ssize_t r = write(sp_sig_fd[1], &b, 1);
+
+    (void)r;
+}
+
+static void sp_sink_signal_read(void *opaque)
+{
+    uint8_t b[16];
+    ssize_t n = read(sp_sig_fd[0], b, sizeof(b));
+    ssize_t i;
+
+    for (i = 0; i < n; i++) {
+        if (sp.closing) {
+            fprintf(stderr, "[SPACEBOX-REMOTE] sink got signal %d while it waits "
+                    "for the bye: no change\n", b[i]);
+            continue;
+        }
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink got signal %d: closing as its "
+                "window would\n", b[i]);
+        spacebox_sink_close();
+    }
+}
+
+/* From the main loop: QEMU sets its handlers after the devices are made. */
+static void sp_sink_signals_install(void *opaque)
+{
+    static const int sigs[] = { SIGTERM, SIGINT, SIGHUP };
+    struct sigaction act;
+    size_t i;
+
+    if (!g_unix_open_pipe(sp_sig_fd, FD_CLOEXEC, NULL)) {
+        error_report("spacebox remote gpu: no pipe for signals; a signal ends "
+                     "the sink without a detach");
+        return;
+    }
+    g_unix_set_fd_nonblocking(sp_sig_fd[0], TRUE, NULL);
+    g_unix_set_fd_nonblocking(sp_sig_fd[1], TRUE, NULL);
+    qemu_set_fd_handler(sp_sig_fd[0], sp_sink_signal_read, NULL, NULL);
+    memset(&act, 0, sizeof(act));
+    act.sa_handler = sp_sink_signal;
+    act.sa_flags = SA_RESTART;
+    sigfillset(&act.sa_mask);
+    for (i = 0; i < ARRAY_SIZE(sigs); i++) {
+        sigaction(sigs[i], &act, NULL);
+    }
 }
 
 static void sp_input_event(DeviceState *dev, QemuConsole *src, InputEvent *evt)
@@ -3869,6 +3931,8 @@ void sp_remote_realize(VirtIOGPU *g, Error **errp)
         sp_state_realize(g);
         sp.input = qemu_input_handler_register(DEVICE(g), &sp_input_handler);
         qemu_input_handler_activate(sp.input);
+        aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                                sp_sink_signals_install, NULL);
         info_report("spacebox remote gpu: sink listening on %s", sp.path);
     }
 }

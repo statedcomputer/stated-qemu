@@ -32,6 +32,13 @@
  * SPACEBOX_GPU_REMOTE_ZSTD=<level>          compress the connection (default 1,
  *                                           0 = off; used when both ends offer
  *                                           it). See sp_z_filter().
+ * SPACEBOX_GPU_REMOTE_PROFILE=<file>        sink: send the capsets of this capset
+ *                                           profile instead of the renderer's own,
+ *                                           after checking that the renderer can do
+ *                                           them; a renderer that cannot refuses
+ *                                           every source. See sp_profile_load().
+ * SPACEBOX_GPU_REMOTE_CONTROL=<file>        sink: test commands, see
+ *                                           virtio-gpu-remote-state.c.
  *
  * Both ends are assumed little-endian. One source per sink; a lost connection
  * resets the sink and is not recovered on the source (prototype).
@@ -50,6 +57,8 @@
 #include "ui/input.h"
 #include "audio/audio.h"
 #include "virtio-gpu-remote-formats.h"
+#include "virtio-gpu-remote.h"
+#include "system/runstate.h"
 
 #include <virglrenderer.h>
 
@@ -83,6 +92,10 @@ enum {
     SP_ACK = 21,     /* nothing but the ack field */
     SP_AUDIO = 14,   /* source -> sink. a: signed 16 bit little endian samples,
                         arg0 rate, arg1 channels */
+    SP_SCROLL = 15,  /* either direction, only with SP_F_SCROLL. a: one or more
+                        complete text lines of the scroll channel. sink -> source:
+                        scroll events and PING; source -> sink: the guest
+                        agent's answers */
     SP_INFO = 13     /* sink's answers to the guest's queries, sent ahead so the
                         source can answer them itself. arg0 = 1: capset arg1,
                         arg2 = max version << 32 | size, a = data. arg0 = 2: a =
@@ -106,6 +119,13 @@ typedef struct SpHdr {
 
 #define SP_F_VIDEO 1    /* source: the guest is decoding video */
 #define SP_F_ZSTD 2     /* in SP_HELLO: this end can compress the connection */
+#define SP_F_SCROLL 4   /* in SP_HELLO from the source: it carries the scroll
+                           channel as SP_SCROLL (the QEMU source does not) */
+#define SP_F_RESTORED 8 /* in SP_HELLO from the source: it was restored from a
+                           snapshot and not paired since; seq = the last id it
+                           gave out before the snapshot. A sink that has more of
+                           its messages ran on after the snapshot: it goes back
+                           with the stream to seq (see sp_hello) */
 
 /*
  * A compressed connection (both ends set SP_F_ZSTD in their HELLO): after the
@@ -226,6 +246,12 @@ int64_t spacebox_frame_gap_us;  /* usual spacing of recent updates, 0 = not a st
  * runs ahead of its sound.
  */
 int64_t spacebox_last_input_us;
+/*
+ * Sink: when the last SP_SCROLL from the source arrived (this machine's clock,
+ * 0 = none). Read by ui/spacebox-scroll.m, which takes any answer of the
+ * guest agent as "ready".
+ */
+int64_t spacebox_scroll_answer_us;
 
 static struct {
     int mode;           /* 0 off, 1 video, 2 always; -1 not read yet */
@@ -396,7 +422,13 @@ static struct {
     uint64_t session;       /* own */
     uint64_t peer_session;  /* the peer this state belongs to, 0 = none */
     bool hello_done;
+    bool peer_scroll;       /* sink: the source's last HELLO set SP_F_SCROLL */
     bool broken;            /* source: the sink lost the state; restart needed */
+    bool refuse_now;        /* sink: close this connection (capset profile) */
+    bool bye;               /* sink: the source is done with it (SP_BYE) */
+    bool closing;           /* sink: closed by its user; ends at the source's bye */
+    QEMUTimer *close_timer; /* sink: ends a close the source does not answer */
+    uint64_t refused;       /* sink: sources refused for the capset profile */
     QEMUTimer *ack_timer;
     uint64_t n_reconnect, n_resent;
 
@@ -965,6 +997,11 @@ static void sp_rx(void *opaque)
         off += total;
         if (h.type == SP_HELLO) {
             sp_hello(&h);
+            if (sp.refuse_now) {
+                sp.refuse_now = false;
+                closed = true;
+                break;
+            }
             continue;
         }
         if (!sp.hello_done) {
@@ -987,6 +1024,10 @@ static void sp_rx(void *opaque)
             sp_rx_delay(h.t_us);
             sp_dispatch(&h, sp.rx->data + off - total + sizeof(h),
                         sp.rx->data + off - total + sizeof(h) + h.a_len);
+        }
+        if (sp.bye) {
+            closed = true;
+            break;
         }
         if (sp.rx_id - sp.rx_id_acked >= 256) {
             sp_send_full(false, SP_ACK, 0, NULL, 0, NULL, 0, 0, 0, 0);
@@ -1928,6 +1969,7 @@ void sp_source_handle_ctrl(VirtIOGPU *g, VirtQueue *vq)
         cmd->error = 0;
         cmd->finished = false;
         cmd->suspended = false;
+        virtio_gpu_ctrl_command_sp_clear(cmd);
         sp_source_one(g, cmd);
     }
 }
@@ -2286,6 +2328,285 @@ void sp_sink_response(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd,
 
 static bool sp_sink_renderer(VirtIOGPU *g);
 
+/*
+ * The capset profile (SPACEBOX_GPU_REMOTE_PROFILE). The guest reads the
+ * capsets once, at boot, and keeps using what they offer whichever renderer
+ * serves it later; so every renderer of a guest sends the same capsets, the
+ * profile, and each must be able to do all of it. The profile is made by
+ * screen/tools/capset-profile.py of the screen track from the capsets of the
+ * renderers, which also writes, for each field, how to check it:
+ *
+ *   spacebox-capset-profile 1
+ *   capset ID VERSION SIZE HEX           the bytes sent for capset ID
+ *   check ID OFFSET COUNT RULE NAME [ARG]
+ *
+ * RULE over COUNT 4-byte values at OFFSET, own value against the profile's:
+ * bits (own has every bit), ge/le (uint32), fge/fle (float), ige/ile (int32),
+ * align (profile 0, or own not 0 and <=), video (ARG is the offset of
+ * num_video_caps: each video capability of the profile needs an own entry
+ * with the same profile and entry point and at least its sizes and level),
+ * none (not checked: descriptive fields such as the renderer string).
+ */
+typedef struct SpProfCapset {
+    uint32_t id, ver, size;
+    uint8_t *data;
+} SpProfCapset;
+
+typedef struct SpProfCheck {
+    uint32_t id, off, count, arg;
+    char rule[8];
+    char name[48];
+} SpProfCheck;
+
+static struct {
+    char *path;
+    GArray *capsets;        /* SpProfCapset */
+    GArray *checks;         /* SpProfCheck */
+    bool checked, ok;
+    uint64_t refusals;
+} sp_prof;
+
+static bool sp_profile_load(const char *path, Error **errp)
+{
+    g_autofree char *text = NULL;
+    g_auto(GStrv) lines = NULL;
+    GError *gerr = NULL;
+    unsigned i;
+
+    if (!g_file_get_contents(path, &text, NULL, &gerr)) {
+        error_setg(errp, "spacebox remote gpu: capset profile %s: %s", path,
+                   gerr->message);
+        g_error_free(gerr);
+        return false;
+    }
+    if (!g_str_has_prefix(text, "spacebox-capset-profile 1\n")) {
+        error_setg(errp, "spacebox remote gpu: %s is not a capset profile of "
+                   "version 1", path);
+        return false;
+    }
+    sp_prof.path = g_strdup(path);
+    sp_prof.capsets = g_array_new(false, true, sizeof(SpProfCapset));
+    sp_prof.checks = g_array_new(false, true, sizeof(SpProfCheck));
+    lines = g_strsplit(text, "\n", -1);
+    for (i = 1; lines[i]; i++) {
+        g_auto(GStrv) f = g_strsplit_set(lines[i], " ", -1);
+        guint n = g_strv_length(f);
+
+        if (!n || !*f[0] || f[0][0] == '#') {
+            continue;
+        }
+        if (!strcmp(f[0], "capset") && n == 5) {
+            SpProfCapset c = {
+                .id = strtoul(f[1], NULL, 10), .ver = strtoul(f[2], NULL, 10),
+                .size = strtoul(f[3], NULL, 10),
+            };
+            size_t hl = strlen(f[4]), k;
+
+            if (!c.size || hl != 2 * (size_t)c.size) {
+                error_setg(errp, "spacebox remote gpu: %s line %u: capset %u "
+                           "has %zu hex digits for %u bytes", path, i + 1,
+                           c.id, hl, c.size);
+                return false;
+            }
+            c.data = g_malloc(c.size);
+            for (k = 0; k < c.size; k++) {
+                int hi = g_ascii_xdigit_value(f[4][2 * k]);
+                int lo = g_ascii_xdigit_value(f[4][2 * k + 1]);
+
+                if (hi < 0 || lo < 0) {
+                    error_setg(errp, "spacebox remote gpu: %s line %u: bad hex",
+                               path, i + 1);
+                    g_free(c.data);
+                    return false;
+                }
+                c.data[k] = hi << 4 | lo;
+            }
+            g_array_append_val(sp_prof.capsets, c);
+        } else if (!strcmp(f[0], "check") && (n == 6 || n == 7)) {
+            SpProfCheck c = {
+                .id = strtoul(f[1], NULL, 10), .off = strtoul(f[2], NULL, 10),
+                .count = strtoul(f[3], NULL, 10),
+                .arg = n == 7 ? strtoul(f[6], NULL, 10) : 0,
+            };
+
+            g_strlcpy(c.rule, f[4], sizeof(c.rule));
+            g_strlcpy(c.name, f[5], sizeof(c.name));
+            g_array_append_val(sp_prof.checks, c);
+        } else {
+            error_setg(errp, "spacebox remote gpu: %s line %u: not understood",
+                       path, i + 1);
+            return false;
+        }
+    }
+    /* Every check must lie inside its capset. */
+    for (i = 0; i < sp_prof.checks->len; i++) {
+        SpProfCheck *c = &g_array_index(sp_prof.checks, SpProfCheck, i);
+        SpProfCapset *cs = NULL;
+        unsigned j;
+
+        for (j = 0; j < sp_prof.capsets->len; j++) {
+            if (g_array_index(sp_prof.capsets, SpProfCapset, j).id == c->id) {
+                cs = &g_array_index(sp_prof.capsets, SpProfCapset, j);
+            }
+        }
+        if (!cs || (uint64_t)c->off + 4ull * c->count > cs->size ||
+            (!strcmp(c->rule, "video") && c->arg + 4 > cs->size)) {
+            error_setg(errp, "spacebox remote gpu: %s: check of %s outside "
+                       "capset %u", path, c->name, c->id);
+            return false;
+        }
+    }
+    if (!sp_prof.capsets->len) {
+        error_setg(errp, "spacebox remote gpu: %s has no capset", path);
+        return false;
+    }
+    info_report("spacebox remote gpu: capset profile %s: %u capsets, %u checks",
+                path, sp_prof.capsets->len, sp_prof.checks->len);
+    return true;
+}
+
+static uint32_t sp_u32(const uint8_t *b, uint32_t off)
+{
+    uint32_t v;
+
+    memcpy(&v, b + off, 4);
+    return v;
+}
+
+/* struct virgl_video_caps (virgl_hw.h): profile, entrypoint, max_level, ...,
+ * max_width, max_height (16 bits each). */
+static bool sp_profile_video_ok(const uint8_t *own, const uint8_t *prof,
+                                const SpProfCheck *c, GString *why)
+{
+    uint32_t n_prof = sp_u32(prof, c->arg), n_own = sp_u32(own, c->arg);
+    uint32_t i, j, max = c->count / 4;
+    bool ok = true;
+
+    for (i = 0; i < n_prof && i < max; i++) {
+        const uint8_t *p = prof + c->off + 16 * i;
+        bool found = false;
+
+        for (j = 0; j < n_own && j < max; j++) {
+            const uint8_t *o = own + c->off + 16 * j;
+
+            if (o[0] == p[0] && o[1] == p[1] && o[2] >= p[2] &&
+                (sp_u32(o, 4) & 0xffff) >= (sp_u32(p, 4) & 0xffff) &&
+                (sp_u32(o, 4) >> 16) >= (sp_u32(p, 4) >> 16)) {
+                found = true;
+            }
+        }
+        if (!found) {
+            g_string_append_printf(why, " %s[%u] (profile %u entry point %u "
+                                   "level %u %ux%u): no such entry here;",
+                                   c->name, i, p[0], p[1], p[2],
+                                   sp_u32(p, 4) & 0xffff, sp_u32(p, 4) >> 16);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+/* Can this renderer do the profile? Checked once, with the renderer up. */
+static bool sp_profile_ok(VirtIOGPU *g)
+{
+    g_autoptr(GString) why = g_string_new(NULL);
+    unsigned i, k;
+
+    if (!sp_prof.capsets || sp_prof.checked) {
+        return !sp_prof.capsets || sp_prof.ok;
+    }
+    if (!sp_sink_renderer(g)) {
+        error_report("spacebox remote gpu: capset profile: the renderer did "
+                     "not start; refusing the source");
+        return false;
+    }
+    sp_prof.checked = true;
+    for (i = 0; i < sp_prof.capsets->len; i++) {
+        SpProfCapset *cs = &g_array_index(sp_prof.capsets, SpProfCapset, i);
+        uint32_t ver = 0, size = 0;
+        g_autofree uint8_t *own = NULL;
+        unsigned j;
+
+        virgl_renderer_get_cap_set(cs->id, &ver, &size);
+        if (!size || ver < cs->ver || size < cs->size) {
+            g_string_append_printf(why, " capset %u: the renderer has version "
+                                   "%u size %u, the profile %u and %u;",
+                                   cs->id, ver, size, cs->ver, cs->size);
+            continue;
+        }
+        own = g_malloc0(size);
+        virgl_renderer_fill_caps(cs->id, cs->ver, own);
+        for (j = 0; j < sp_prof.checks->len; j++) {
+            SpProfCheck *c = &g_array_index(sp_prof.checks, SpProfCheck, j);
+            const char *r = c->rule;
+
+            if (c->id != cs->id || !strcmp(r, "none")) {
+                continue;
+            }
+            if (!strcmp(r, "video")) {
+                sp_profile_video_ok(own, cs->data, c, why);
+                continue;
+            }
+            for (k = 0; k < c->count; k++) {
+                uint32_t o = sp_u32(own, c->off + 4 * k);
+                uint32_t p = sp_u32(cs->data, c->off + 4 * k);
+                float of, pf;
+                bool bad;
+
+                memcpy(&of, &o, 4);
+                memcpy(&pf, &p, 4);
+                if (!strcmp(r, "bits")) {
+                    bad = (o & p) != p;
+                } else if (!strcmp(r, "ge")) {
+                    bad = o < p;
+                } else if (!strcmp(r, "le")) {
+                    bad = o > p;
+                } else if (!strcmp(r, "fge")) {
+                    bad = !(of >= pf);
+                } else if (!strcmp(r, "fle")) {
+                    bad = !(of <= pf);
+                } else if (!strcmp(r, "ige")) {
+                    bad = (int32_t)o < (int32_t)p;
+                } else if (!strcmp(r, "ile")) {
+                    bad = (int32_t)o > (int32_t)p;
+                } else if (!strcmp(r, "align")) {
+                    bad = p && (!o || o > p);
+                } else {
+                    g_string_append_printf(why, " %s: unknown rule %s;",
+                                           c->name, r);
+                    break;
+                }
+                if (bad) {
+                    if (!strcmp(r, "bits")) {
+                        g_string_append_printf(why, " capset %u %s[%u]: missing "
+                                               "bits 0x%08x;", cs->id, c->name,
+                                               k, p & ~o);
+                    } else if (r[0] == 'f') {
+                        g_string_append_printf(why, " capset %u %s[%u]: %g here,"
+                                               " profile %g (%s);", cs->id,
+                                               c->name, k, of, pf, r);
+                    } else {
+                        g_string_append_printf(why, " capset %u %s[%u]: %d here,"
+                                               " profile %d (%s);", cs->id,
+                                               c->name, k, (int32_t)o,
+                                               (int32_t)p, r);
+                    }
+                }
+            }
+        }
+    }
+    sp_prof.ok = why->len == 0;
+    if (sp_prof.ok) {
+        info_report("spacebox remote gpu: capset profile %s: this renderer "
+                    "can do it", sp_prof.path);
+    } else {
+        error_report("spacebox remote gpu: capset profile %s: this renderer "
+                     "cannot do it, every source is refused:%s",
+                     sp_prof.path, why->str);
+    }
+    return sp_prof.ok;
+}
+
 /* Send the answers to the guest's capability and display queries ahead. */
 static void sp_sink_send_info(VirtIOGPU *g, bool caps)
 {
@@ -2296,7 +2617,16 @@ static void sp_sink_send_info(VirtIOGPU *g, bool caps)
     if (sp.fd < 0) {
         return;
     }
-    if (caps && sp_sink_renderer(g)) {
+    if (caps && sp_prof.capsets) {
+        /* sp_profile_ok() has passed: the profile's bytes as they are (its
+         * timer query is already cleared). */
+        for (i = 0; i < sp_prof.capsets->len; i++) {
+            SpProfCapset *cs = &g_array_index(sp_prof.capsets, SpProfCapset, i);
+
+            sp_send(SP_INFO, 0, cs->data, cs->size, NULL, 0, 1, cs->id,
+                    ((uint64_t)cs->ver << 32) | cs->size);
+        }
+    } else if (caps && sp_sink_renderer(g)) {
         for (i = 0; i < g->capset_ids->len; i++) {
             uint32_t id = g_array_index(g->capset_ids, uint32_t, i);
             uint32_t ver = 0, size = 0;
@@ -2386,6 +2716,7 @@ static void sp_sink_ctrl(VirtIOGPU *g, SpHdr *h, uint8_t *a, uint8_t *b)
     cmd->sp_len = h->arg2;
     cmd->sp_expect = sp.next_expect;
     sp.next_expect = NULL;
+    sp_state_attach(cmd, h->id);
 
     memcpy(&hdr, req, MIN((size_t)h->a_len, sizeof(hdr)));
     if (hdr.type == VIRTIO_GPU_CMD_RESOURCE_FLUSH) {
@@ -2427,6 +2758,71 @@ static void sp_sink_reset(VirtIOGPU *g)
     VirtioDeviceClass *vdc = VIRTIO_DEVICE_GET_CLASS(g);
 
     vdc->reset(VIRTIO_DEVICE(g));
+    sp_state_forget();
+}
+
+void sp_sink_send(uint32_t type, const void *a, size_t a_len,
+                  const void *b, size_t b_len,
+                  uint64_t arg0, uint64_t arg1, uint64_t arg2)
+{
+    sp_send(type, 0, a, a_len, b, b_len, arg0, arg1, arg2);
+}
+
+/*
+ * Told to end (the control file): the source makes its planned switch while
+ * this sink still answers, and says SP_BYE when it has what it needs.
+ */
+void sp_sink_detach(void)
+{
+    if (!sp.peer_session) {
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink detach: no source, nothing sent\n");
+        return;
+    }
+    sp_send(SP_DETACH, 0, NULL, 0, NULL, 0, 0, 0, 0);
+    fprintf(stderr, "[SPACEBOX-REMOTE] sink detach: SP_DETACH sent, running until "
+            "the source says bye\n");
+}
+
+/* How long a closed sink waits for the source's bye before it ends anyway. */
+#define SP_CLOSE_WAIT_MS 20000
+
+static void sp_close_timeout(void *opaque)
+{
+    fprintf(stderr, "[SPACEBOX-REMOTE] sink closed: the source did not say bye "
+            "within %d ms, ending\n", SP_CLOSE_WAIT_MS);
+    qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+}
+
+/*
+ * The sink's window was closed, or the sink was told to quit (ui/sdl2.c). A
+ * renderer that ends on purpose says so first: the source makes its planned
+ * switch while this sink still answers and exports, and says SP_BYE when it
+ * has what it needs; the sink ends then (sp_disconnected), or after
+ * SP_CLOSE_WAIT_MS if no bye comes, or at once if no source is attached or the
+ * connection is lost meanwhile. Returns false when this is not a remote sink
+ * (the caller then closes as it would).
+ */
+bool spacebox_sink_close(void)
+{
+    if (sp.mode != SP_REMOTE_SINK) {
+        return false;
+    }
+    if (sp.closing) {
+        return true;
+    }
+    if (sp.fd < 0 || !sp.hello_done || !sp.peer_session) {
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink closed: no source attached, "
+                "ending\n");
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+        return true;
+    }
+    sp.closing = true;
+    fprintf(stderr, "[SPACEBOX-REMOTE] sink closed: detaching first\n");
+    sp_sink_detach();
+    sp.close_timer = timer_new_ms(QEMU_CLOCK_REALTIME, sp_close_timeout, NULL);
+    timer_mod(sp.close_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + SP_CLOSE_WAIT_MS);
+    return true;
 }
 
 static void sp_input_event(DeviceState *dev, QemuConsole *src, InputEvent *evt)
@@ -2475,6 +2871,34 @@ static void sp_input_sync(DeviceState *dev)
     sp_send(SP_INPUT, 0, &m, sizeof(m), NULL, 0, 0, 0, 0);
 }
 
+/*
+ * The scroll channel (ui/spacebox-scroll.m), on the main thread like the rest
+ * of the sink. True when the source's last HELLO asked for it in the stream;
+ * *conn is then the current connection's number, or 0 while there is no
+ * usable connection.
+ */
+bool spacebox_remote_scroll_stream(uint64_t *conn);
+bool spacebox_remote_scroll_stream(uint64_t *conn)
+{
+    if (!sp.peer_scroll) {
+        *conn = 0;
+        return false;
+    }
+    *conn = sp.fd >= 0 && sp.hello_done ? sp.conn_gen : 0;
+    return true;
+}
+
+/* Complete lines of the scroll channel to the source; false if not sent. */
+bool spacebox_remote_scroll_send(const void *buf, size_t len);
+bool spacebox_remote_scroll_send(const void *buf, size_t len)
+{
+    if (!sp.peer_scroll || sp.fd < 0 || !sp.hello_done) {
+        return false; /* not kept for later, like the input */
+    }
+    sp_send(SP_SCROLL, 0, buf, len, NULL, 0, 0, 0, 0);
+    return true;
+}
+
 static const QemuInputHandler sp_input_handler = {
     .name = "spacebox-remote-input",
     .mask = INPUT_EVENT_MASK_KEY | INPUT_EVENT_MASK_BTN |
@@ -2516,6 +2940,26 @@ static void sp_disconnected(void)
     g_byte_array_set_size(sp.rx, 0);
     g_byte_array_set_size(sp.rxw, 0);
 
+    if (sp.bye) {
+        /* A detached sink is not connected again: the source's state now
+         * lives in another renderer. */
+        if (sp.listen_fd >= 0) {
+            qemu_set_fd_handler(sp.listen_fd, NULL, NULL, NULL);
+            close(sp.listen_fd);
+            sp.listen_fd = -1;
+            unlink(sp.path);
+        }
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink detached: the source said bye; "
+                "connection closed, not listening, exiting\n");
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+        return;
+    }
+    if (sp.closing) {
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink closed: the connection was lost "
+                "before the source said bye, ending\n");
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+        return;
+    }
     /* Both ends keep their state. The source reconnects and the stream
      * continues from the last message the other end received. */
     if (sp.mode == SP_REMOTE_SINK) {
@@ -2540,10 +2984,46 @@ static void sp_hello(SpHdr *h)
     qemu_mutex_lock(&sp.tx_lock);
     sp.z_on = sp.z_level && (h->flags & SP_F_ZSTD);
     qemu_mutex_unlock(&sp.tx_lock);
-    if (resume) {
+    if (sp.mode == SP_REMOTE_SINK) {
+        sp.peer_scroll = h->flags & SP_F_SCROLL;
+    }
+    if (resume && sp.mode == SP_REMOTE_SINK && (h->flags & SP_F_RESTORED) &&
+        h->seq < sp.rx_id) {
+        /*
+         * The source was restored from a snapshot taken at its message seq,
+         * and this renderer ran on after it (a rollback). What it queued for
+         * the source was for the VM that ran on; the source's stream goes on
+         * from seq, and this end's from the last id the source has of it. The
+         * renderer's state stays: the source resets it to seq (SP_STATE_RESET),
+         * which keeps what did not change after the snapshot.
+         */
+        uint64_t had = sp.rx_id;
+
+        sp.n_reconnect++;
+        sp_tx_forget();
+        qemu_mutex_lock(&sp.tx_lock);
+        sp.tx_id = h->arg2;
+        qemu_mutex_unlock(&sp.tx_lock);
+        sp.rx_id = sp.rx_id_acked = h->seq;
+        info_report("spacebox remote gpu: resumed a source restored from a "
+                    "snapshot at its message %" PRIu64 "; this renderer had %"
+                    PRIu64 ": the stream goes back to %" PRIu64,
+                    (uint64_t)h->seq, had, (uint64_t)h->seq);
+    } else if (resume) {
         sp.n_reconnect++;
         info_report("spacebox remote gpu: resumed, peer has %" PRIu64 " of %"
                     PRIu64 " messages", (uint64_t)h->arg2, sp.tx_id);
+    } else if (sp.mode == SP_REMOTE_SINK && !sp_profile_ok(sp.g)) {
+        /* The renderer cannot do the capset profile (logged in full once; a
+         * source that keeps reconnecting is logged at 2, 4, 8, ... refusals). */
+        sp.refused++;
+        if (sp.refused > 1 && !(sp.refused & (sp.refused - 1))) {
+            info_report("spacebox remote gpu: source refused (%" PRIu64 "): "
+                        "the renderer cannot do the capset profile",
+                        sp.refused);
+        }
+        sp.refuse_now = true;
+        return;
     } else if (sp.mode == SP_REMOTE_SINK) {
         /* A source this renderer state does not belong to: start empty. */
         info_report("spacebox remote gpu: source attached");
@@ -2930,12 +3410,16 @@ static void sp_sink_audio(SpHdr *h, const uint8_t *a)
         AUD_set_active_out(sp_aud.voice, 1);
         /* For tests while nobody should hear anything: SPACEBOX_AUDIO_SILENT=1
          * plays at volume 0, SPACEBOX_AUDIO_DUMP=<file> records what is
-         * handed to the backend. */
+         * handed to the backend (unbuffered, so that a check that reads the
+         * file right after a sound has ended sees all of it). */
         if (getenv("SPACEBOX_AUDIO_SILENT")) {
             AUD_set_volume_out(sp_aud.voice, 1, 0, 0);
         }
         if (getenv("SPACEBOX_AUDIO_DUMP") && !sp_aud.dump) {
             sp_aud.dump = fopen(getenv("SPACEBOX_AUDIO_DUMP"), "wb");
+            if (sp_aud.dump) {
+                setvbuf(sp_aud.dump, NULL, _IONBF, 0);
+            }
         }
     }
 
@@ -3093,6 +3577,7 @@ static void sp_dispatch(SpHdr *h, uint8_t *a, uint8_t *b)
             if (h->a_len >= 4) {
                 memcpy(&type, a, 4);
             }
+            sp_state_ctrl_seen();
             sp_sink_ctrl(g, h, a, b);
             d = g_get_monotonic_time() - t0;
             sp_busy.total += d;
@@ -3131,6 +3616,23 @@ static void sp_dispatch(SpHdr *h, uint8_t *a, uint8_t *b)
             break;
         case SP_AUDIO:
             sp_sink_audio(h, a);
+            break;
+        case SP_SCROLL:
+            spacebox_scroll_answer_us = g_get_monotonic_time();
+            break;
+        case SP_WMARK:
+            sp_state_wmark(h->id, a, h->a_len);
+            break;
+        case SP_STATE_RESET:
+        case SP_IMPORT:
+        case SP_EXPORT:
+            if (sp_sink_renderer(g)) {
+                sp_state_queue(g, h->type, h->id, h->arg0, a, h->a_len,
+                               b, h->b_len);
+            }
+            break;
+        case SP_BYE:
+            sp.bye = true;
             break;
         default:
             break;
@@ -3343,7 +3845,11 @@ void sp_remote_realize(VirtIOGPU *g, Error **errp)
         timer_mod(sp.retry, qemu_clock_get_ms(QEMU_CLOCK_REALTIME));
     } else {
         struct sockaddr_un addr = { .sun_family = AF_UNIX };
+        const char *prof = getenv("SPACEBOX_GPU_REMOTE_PROFILE");
 
+        if (prof && *prof && !sp_profile_load(prof, errp)) {
+            return;
+        }
         sp.shadow = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                           NULL, g_free);
         sp.watch = g_hash_table_new_full(g_direct_hash, g_direct_equal,
@@ -3360,6 +3866,7 @@ void sp_remote_realize(VirtIOGPU *g, Error **errp)
         }
         qemu_set_fd_handler(sp.listen_fd, sp_sink_accept, NULL, NULL);
         sp_ach_sink_listen();
+        sp_state_realize(g);
         sp.input = qemu_input_handler_register(DEVICE(g), &sp_input_handler);
         qemu_input_handler_activate(sp.input);
         info_report("spacebox remote gpu: sink listening on %s", sp.path);

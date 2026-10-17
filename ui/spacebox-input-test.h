@@ -15,6 +15,55 @@ static void spacebox_window_request(struct sdl2_console *scon)
             SDL_GetWindowGrab(scon->real_window));
 }
 
+/* The hook's own events still in SDL's queue, by kind (fields of the event do not survive the
+ * queue of every SDL build, so they are counted: each one taken out of the queue is the
+ * hook's while its count is above 0). */
+static int spacebox_test_keys, spacebox_test_buttons, spacebox_test_motions;
+
+/* With the input-test hook on, a key, button or motion that this application did not
+ * post itself came from the person at the Mac; it is logged (motion at most every
+ * 200 ms), so that a check can tell that its run had other input than its own. */
+static void spacebox_input_real(const SDL_Event *ev)
+{
+    static int64_t last_motion;
+    int64_t now = g_get_real_time();
+
+    if (!getenv("SPACEBOX_INPUT_TEST")) {
+        return;
+    }
+    switch (ev->type) {
+    case SDL_KEYDOWN:
+    case SDL_KEYUP:
+        if (spacebox_test_keys > 0) {
+            spacebox_test_keys--;
+            return;
+        }
+        fprintf(stderr, "[SPACEBOX-INPUT-TEST] real key scancode=%d down=%d at %.3f\n",
+                ev->key.keysym.scancode, ev->type == SDL_KEYDOWN, now / 1e6);
+        break;
+    case SDL_MOUSEBUTTONDOWN:
+    case SDL_MOUSEBUTTONUP:
+        if (spacebox_test_buttons > 0) {
+            spacebox_test_buttons--;
+            return;
+        }
+        fprintf(stderr, "[SPACEBOX-INPUT-TEST] real button %d down=%d at %.3f\n",
+                ev->button.button, ev->type == SDL_MOUSEBUTTONDOWN, now / 1e6);
+        break;
+    case SDL_MOUSEMOTION:
+        if (spacebox_test_motions > 0) {
+            spacebox_test_motions--;
+            return;
+        }
+        if (now - last_motion < 200000) {
+            return;
+        }
+        last_motion = now;
+        fprintf(stderr, "[SPACEBOX-INPUT-TEST] real motion at %.3f\n", now / 1e6);
+        break;
+    }
+}
+
 /* Synthetic events in this SDL application's queue. Opt-in local validation;
  * does not post events to macOS or inspect any other application. */
 static void spacebox_input_test(struct sdl2_console *scon)
@@ -38,18 +87,25 @@ static void spacebox_input_test(struct sdl2_console *scon)
         ev.key.state = b ? SDL_PRESSED : SDL_RELEASED;
         ev.key.keysym.scancode = a;
         ev.key.keysym.sym = SDL_GetKeyFromScancode(a);
-        SDL_PushEvent(&ev);
+        if (SDL_PushEvent(&ev) == 1) {
+            spacebox_test_keys++;
+        }
     } else if (!strcmp(command, "motion") && count == 3) {
         ev.type = SDL_MOUSEMOTION;
         ev.motion.windowID = id;
         test_x=a;test_y=b;
         ev.motion.x = a;
         ev.motion.y = b;
-        SDL_PushEvent(&ev);
+        if (SDL_PushEvent(&ev) == 1) {
+            spacebox_test_motions++;
+        }
     } else if (!strcmp(command, "button") && count == 3) {
         ev.type = b ? SDL_MOUSEBUTTONDOWN : SDL_MOUSEBUTTONUP;
         ev.button.windowID=id;ev.button.button=a;ev.button.state=b?SDL_PRESSED:SDL_RELEASED;
-        ev.button.x=test_x;ev.button.y=test_y;ev.button.clicks=1;SDL_PushEvent(&ev);
+        ev.button.x=test_x;ev.button.y=test_y;ev.button.clicks=1;
+        if (SDL_PushEvent(&ev) == 1) {
+            spacebox_test_buttons++;
+        }
     } else if (!strcmp(command, "resize") && count == 3 && a>=640 && b>=400) {
         SDL_SetWindowSize(scon->real_window,a,b);
     } else if (!strcmp(command, "focusgain")) {
@@ -61,6 +117,16 @@ static void spacebox_input_test(struct sdl2_console *scon)
         SDL_PushEvent(&ev);
     } else if (!strcmp(command, "raise")) {
         SDL_RaiseWindow(scon->real_window);
+    } else if (!strcmp(command, "close")) {
+        /* as a click on the window's close button */
+        ev.type = SDL_WINDOWEVENT;
+        ev.window.windowID = id;
+        ev.window.event = SDL_WINDOWEVENT_CLOSE;
+        SDL_PushEvent(&ev);
+    } else if (!strcmp(command, "quit")) {
+        /* as the application's Quit (Cmd-Q) */
+        ev.type = SDL_QUIT;
+        SDL_PushEvent(&ev);
     }
     int w, h, pw, ph;
     SDL_GetWindowSize(scon->real_window, &w, &h);

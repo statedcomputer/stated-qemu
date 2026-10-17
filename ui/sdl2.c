@@ -668,6 +668,9 @@ static void handle_mousewheel(SDL_Event *ev)
     qemu_input_event_sync();
 }
 
+/* hw/display/virtio-gpu-remote.c: a remote sink's close (it detaches first). */
+bool spacebox_sink_close(void);
+
 static void handle_windowevent(SDL_Event *ev)
 {
     struct sdl2_console *scon = get_scon_from_window(ev->window.windowID);
@@ -718,6 +721,9 @@ static void handle_windowevent(SDL_Event *ev)
         break;
     case SDL_WINDOWEVENT_CLOSE:
         if (qemu_console_is_graphic(scon->dcl.con)) {
+            if (spacebox_sink_close()) {
+                break; /* the remote sink detaches first, then ends */
+            }
             if (scon->opts->has_window_close && !scon->opts->window_close) {
                 allow_close = false;
             }
@@ -761,10 +767,12 @@ void sdl2_poll_events(struct sdl2_console *scon)
         switch (ev->type) {
         case SDL_KEYDOWN:
             idle = 0;
+            spacebox_input_real(ev);
             handle_keydown(ev);
             break;
         case SDL_KEYUP:
             idle = 0;
+            spacebox_input_real(ev);
             handle_keyup(ev);
             break;
         case SDL_TEXTINPUT:
@@ -772,6 +780,9 @@ void sdl2_poll_events(struct sdl2_console *scon)
             handle_textinput(ev);
             break;
         case SDL_QUIT:
+            if (spacebox_sink_close()) {
+                break;
+            }
             if (scon->opts->has_window_close && !scon->opts->window_close) {
                 allow_close = false;
             }
@@ -782,11 +793,13 @@ void sdl2_poll_events(struct sdl2_console *scon)
             break;
         case SDL_MOUSEMOTION:
             idle = 0;
+            spacebox_input_real(ev);
             handle_mousemotion(ev);
             break;
         case SDL_MOUSEBUTTONDOWN:
         case SDL_MOUSEBUTTONUP:
             idle = 0;
+            spacebox_input_real(ev);
             handle_mousebutton(ev);
             break;
         case SDL_MOUSEWHEEL:

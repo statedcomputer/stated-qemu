@@ -147,8 +147,32 @@ struct virtio_gpu_ctrl_command {
     uint64_t sp_len;
     void *sp_snap;
     void *sp_expect;
+    uint64_t sp_id;     /* the message's id in the source's stream */
+    void *sp_wmark;     /* SP_WMARK before it: the resources it may write */
+    void *sp_op;        /* not a guest command: a step of the sink's own, in
+                           order with the commands (virtio-gpu-remote-state.c) */
     QTAILQ_ENTRY(virtio_gpu_ctrl_command) next;
 };
+
+/*
+ * virtqueue_pop() does not zero the command: a command popped from the
+ * guest's queue must clear the sink's fields, or a stale sp_remote routes
+ * its response to the sink's path.
+ */
+static inline void virtio_gpu_ctrl_command_sp_clear(
+    struct virtio_gpu_ctrl_command *cmd)
+{
+    cmd->sp_remote = false;
+    cmd->sp_res = 0;
+    cmd->sp_seq = 0;
+    cmd->sp_off = 0;
+    cmd->sp_len = 0;
+    cmd->sp_snap = NULL;
+    cmd->sp_expect = NULL;
+    cmd->sp_id = 0;
+    cmd->sp_wmark = NULL;
+    cmd->sp_op = NULL;
+}
 
 struct VirtIOGPUBase {
     VirtIODevice parent_obj;
@@ -422,6 +446,7 @@ void sp_sink_snapshot_readback(struct virtio_gpu_ctrl_command *cmd);
 void sp_sink_notify_event(uint32_t event_type);
 void sp_sink_after_submit(struct virtio_gpu_ctrl_command *cmd);
 void sp_sink_poll_watches(void);
+bool sp_sink_before_cmd(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd);
 void virtio_gpu_sp_update_cursor(VirtIOGPU *g,
                                  struct virtio_gpu_update_cursor *cursor);
 void virtio_gpu_base_sp_notify_event(VirtIOGPUBase *g, uint32_t event_type);

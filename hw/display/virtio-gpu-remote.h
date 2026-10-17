@@ -1,0 +1,66 @@
+/*
+ * Spacebox remote GPU: what the connection (virtio-gpu-remote.c) and the
+ * sink's record of its state (virtio-gpu-remote-state.c) share. Internal to
+ * these two files.
+ */
+
+#ifndef HW_DISPLAY_VIRTIO_GPU_REMOTE_H
+#define HW_DISPLAY_VIRTIO_GPU_REMOTE_H
+
+#include "hw/virtio/virtio-gpu.h"
+
+/*
+ * The messages that build a renderer's state again (sent by the Firecracker
+ * device; the QEMU source never sends them). See the protocol of the screen
+ * track; the header and the other types are in virtio-gpu-remote.c.
+ */
+enum {
+    SP_WMARK = 16,       /* source -> sink. a: u32[] resources the next SP_CTRL
+                            may write (on the GPU or by an upload) */
+    SP_STATE_RESET = 17, /* source -> sink. arg0 = N: drop every context and
+                            every resource but those that existed at message id
+                            N and were not written after it (N = 0: all) */
+    SP_STATE_KEPT = 18,  /* sink -> source. arg0 = N, a: u32[] the kept resources */
+    SP_IMPORT = 19,      /* source -> sink. a: SpXfer, b: the bytes */
+    SP_EXPORT = 22,      /* source -> sink. a: u32[] resources, in that order */
+    SP_EXPORT_DATA = 23, /* sink -> source. a: SpXfer, b: at most SP_XFER_MAX bytes */
+    SP_EXPORT_DONE = 24, /* sink -> source. arg0 SP_EXPORT_DATA messages sent,
+                            arg1 their bytes; a: u32[] asked but not exported */
+    SP_DETACH = 25,      /* sink -> source: this sink ends on purpose */
+    SP_BYE = 26,         /* source -> sink: done with this sink, which exits */
+};
+
+#define SP_XFER_MAX (16u << 20)
+
+/*
+ * The contents of one part of a resource. kind 0: the bytes of box at level in
+ * the guest layout of the resource's format (stride and layer_stride, 0 =
+ * packed), as virgl_renderer_transfer_write_iov() takes them with context 0.
+ * Other kinds are made and read by sinks only (virtio-gpu-remote-state.c).
+ */
+typedef struct SpXfer {
+    uint32_t res;
+    uint32_t kind;
+    uint32_t level;
+    uint32_t stride;
+    uint32_t layer_stride;
+    uint32_t sample;
+    uint32_t box[6];    /* x, y, z, w, h, d */
+} QEMU_PACKED SpXfer;
+
+/* virtio-gpu-remote.c */
+void sp_sink_send(uint32_t type, const void *a, size_t a_len,
+                  const void *b, size_t b_len,
+                  uint64_t arg0, uint64_t arg1, uint64_t arg2);
+void sp_sink_detach(void);
+
+/* virtio-gpu-remote-state.c */
+void sp_state_realize(VirtIOGPU *g);
+void sp_state_forget(void);
+void sp_state_wmark(uint64_t id, const void *a, size_t len);
+void sp_state_attach(struct virtio_gpu_ctrl_command *cmd, uint64_t id);
+void sp_state_queue(VirtIOGPU *g, uint32_t type, uint64_t id, uint64_t arg0,
+                    const void *a, size_t a_len, const void *b, size_t b_len);
+void sp_state_ctrl_seen(void);
+
+#endif

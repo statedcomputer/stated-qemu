@@ -1,3 +1,5 @@
+#include "qemu/timer.h"
+
 /* Launcher command for this application's own visible window. */
 static void spacebox_window_request(struct sdl2_console *scon)
 {
@@ -64,6 +66,106 @@ static void spacebox_input_real(const SDL_Event *ev)
     }
 }
 
+/*
+ * "type HOLD_MS GAP_MS SHIFT TEXT": TEXT (the letters a to z, and "_" for a space) typed at a
+ * fixed pace by a timer of the main loop: each key down at start + i * (HOLD_MS + GAP_MS), up
+ * HOLD_MS later, with the left Shift down just before each key and up just after it when SHIFT
+ * is 1. The times are absolute, so a late event does not move the ones after it. Each event goes
+ * to the handlers of SDL's key events (handle_keydown, handle_keyup) as a key taken from the
+ * queue does, without the wait for the next poll of the queue (one frame), which would bunch
+ * the keys. Each event is logged with the time it was handed over and how late it was.
+ */
+static struct {
+    QEMUTimer *timer;
+    struct sdl2_console *scon;
+    char text[128];
+    int n, i;
+    bool up_next, shift;
+    int64_t start_ns, hold_ns, gap_ns;
+} spacebox_typing;
+
+static void spacebox_typing_key(int scancode, bool down)
+{
+    SDL_Event ev = {0};
+
+    ev.type = down ? SDL_KEYDOWN : SDL_KEYUP;
+    ev.key.windowID = SDL_GetWindowID(spacebox_typing.scon->real_window);
+    ev.key.state = down ? SDL_PRESSED : SDL_RELEASED;
+    ev.key.keysym.scancode = scancode;
+    ev.key.keysym.sym = SDL_GetKeyFromScancode(scancode);
+    if (down) {
+        handle_keydown(&ev);
+    } else {
+        handle_keyup(&ev);
+    }
+}
+
+static void spacebox_typing_tick(void *opaque)
+{
+    char ch = spacebox_typing.text[spacebox_typing.i];
+    int sc = ch == '_' ? SDL_SCANCODE_SPACE : SDL_SCANCODE_A + (ch - 'a');
+    bool down = !spacebox_typing.up_next;
+    int64_t due = spacebox_typing.start_ns +
+                  spacebox_typing.i * (spacebox_typing.hold_ns + spacebox_typing.gap_ns) +
+                  (down ? 0 : spacebox_typing.hold_ns);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+
+    if (down && spacebox_typing.shift) {
+        spacebox_typing_key(SDL_SCANCODE_LSHIFT, true);
+    }
+    spacebox_typing_key(sc, down);
+    if (!down && spacebox_typing.shift) {
+        spacebox_typing_key(SDL_SCANCODE_LSHIFT, false);
+    }
+    fprintf(stderr, "[SPACEBOX-INPUT-TEST] typed %d scancode=%d down=%d at %.6f late_us=%" PRId64 "\n",
+            spacebox_typing.i, sc, down, g_get_real_time() / 1e6, (now - due) / 1000);
+    if (down) {
+        spacebox_typing.up_next = true;
+        due += spacebox_typing.hold_ns;
+    } else {
+        spacebox_typing.up_next = false;
+        if (++spacebox_typing.i == spacebox_typing.n) {
+            fprintf(stderr, "[SPACEBOX-INPUT-TEST] typing done: %d keys\n", spacebox_typing.n);
+            return;
+        }
+        due += spacebox_typing.gap_ns;
+    }
+    timer_mod_ns(spacebox_typing.timer, due);
+}
+
+static void spacebox_typing_start(struct sdl2_console *scon, const char *line)
+{
+    int hold, gap, shift, i;
+    char text[128];
+
+    if (sscanf(line, "%*s %d %d %d %127s", &hold, &gap, &shift, text) != 4 ||
+        hold < 1 || gap < 1 || (spacebox_typing.timer && timer_pending(spacebox_typing.timer))) {
+        fprintf(stderr, "[SPACEBOX-INPUT-TEST] type: not taken: %s", line);
+        return;
+    }
+    for (i = 0; text[i]; i++) {
+        if (text[i] != '_' && (text[i] < 'a' || text[i] > 'z')) {
+            fprintf(stderr, "[SPACEBOX-INPUT-TEST] type: not taken (a to z and _ only): %s", line);
+            return;
+        }
+    }
+    if (!spacebox_typing.timer) {
+        spacebox_typing.timer = timer_new_ns(QEMU_CLOCK_REALTIME, spacebox_typing_tick, NULL);
+    }
+    spacebox_typing.scon = scon;
+    g_strlcpy(spacebox_typing.text, text, sizeof(spacebox_typing.text));
+    spacebox_typing.n = strlen(text);
+    spacebox_typing.i = 0;
+    spacebox_typing.up_next = false;
+    spacebox_typing.shift = shift;
+    spacebox_typing.hold_ns = hold * 1000000LL;
+    spacebox_typing.gap_ns = gap * 1000000LL;
+    spacebox_typing.start_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 1000000;
+    fprintf(stderr, "[SPACEBOX-INPUT-TEST] typing %d keys, hold %d ms, gap %d ms, shift %d\n",
+            spacebox_typing.n, hold, gap, shift);
+    timer_mod_ns(spacebox_typing.timer, spacebox_typing.start_ns);
+}
+
 /* Synthetic events in this SDL application's queue. Opt-in local validation;
  * does not post events to macOS or inspect any other application. */
 static void spacebox_input_test(struct sdl2_console *scon)
@@ -72,12 +174,17 @@ static void spacebox_input_test(struct sdl2_console *scon)
     if (!path || !scon->real_window) return;
     FILE *f = fopen(path, "r");
     if (!f) return;
-    char command[24];
+    char line[256] = "", command[24];
     int a = 0, b = 0;
-    int count = fscanf(f, "%23s %d %d", command, &a, &b);
+    if (!fgets(line, sizeof(line), f)) line[0] = 0;
     fclose(f);
     unlink(path);
+    int count = sscanf(line, "%23s %d %d", command, &a, &b);
     if (count < 1) return;
+    if (!strcmp(command, "type")) {
+        spacebox_typing_start(scon, line);
+        return;
+    }
     static int test_x, test_y;
     SDL_Event ev = {0};
     Uint32 id = SDL_GetWindowID(scon->real_window);

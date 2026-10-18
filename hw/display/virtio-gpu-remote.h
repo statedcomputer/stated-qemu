@@ -22,7 +22,8 @@ enum {
                             N and were not written after it (N = 0: all) */
     SP_STATE_KEPT = 18,  /* sink -> source. arg0 = N, a: u32[] the kept resources */
     SP_IMPORT = 19,      /* source -> sink. a: SpXfer, b: the bytes */
-    SP_EXPORT = 22,      /* source -> sink. arg0 the request id; a: u32[]
+    SP_EXPORT = 22,      /* source -> sink. arg0 the request id (not 0: an
+                            export without one is refused); a: u32[]
                             resources, in that order */
     SP_EXPORT_DATA = 23, /* sink -> source. arg2 the request id; a: SpXfer,
                             b: at most SP_XFER_MAX bytes */

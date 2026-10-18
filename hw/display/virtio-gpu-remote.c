@@ -3685,9 +3685,17 @@ static void sp_dispatch(SpHdr *h, uint8_t *a, uint8_t *b)
         case SP_WMARK:
             sp_state_wmark(h->id, a, h->a_len);
             break;
+        case SP_EXPORT:
+            if (!h->arg0) {
+                /* the request id is required: an export without one is an error */
+                fprintf(stderr, "[SPACEBOX-REMOTE] sink export: refused: message "
+                        "%" PRIu64 " has no request id (arg0 0); nothing "
+                        "exported, no reply\n", h->id);
+                break;
+            }
+            /* fallthrough */
         case SP_STATE_RESET:
         case SP_IMPORT:
-        case SP_EXPORT:
             if (sp_sink_renderer(g)) {
                 sp_state_queue(g, h->type, h->id, h->arg0, a, h->a_len,
                                b, h->b_len);

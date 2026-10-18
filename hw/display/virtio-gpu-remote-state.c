@@ -28,7 +28,10 @@
  *                                           "clear" (set every render target and
  *                                           depth buffer to zero, then show the
  *                                           scanout again), "stats" (log the
- *                                           resources).
+ *                                           resources), "stall-export MS" (the
+ *                                           next SP_EXPORT waits MS ms, with
+ *                                           the sink's main loop held, before it
+ *                                           runs: a renderer that stalls).
  */
 
 #include "qemu/osdep.h"
@@ -82,6 +85,7 @@ static struct {
     } imp;                      /* the imports since the last log line */
     bool ctx0_dirty;            /* kind-0 imports not yet finished in context 0 */
     unsigned ctx0_stale;        /* GL errors found waiting in context 0 */
+    unsigned export_stall_ms;   /* the control's "stall-export MS", for the next export */
 } sps;
 
 /*
@@ -2480,8 +2484,16 @@ static void sp_state_export(VirtIOGPU *g, SpOp *op)
     uint64_t msgs = 0, bytes = 0;
     unsigned asked = 0, done = 0, i;
     int64_t t0 = g_get_monotonic_time();
+    uint64_t req = op->arg0;
     size_t k;
 
+    if (sps.export_stall_ms) {
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink export %#" PRIx64 ": stalled "
+                "%u ms (control)\n", req, sps.export_stall_ms);
+        g_usleep(sps.export_stall_ms * 1000ull);
+        sps.export_stall_ms = 0;
+        t0 = g_get_monotonic_time();
+    }
     sp_state_settle();
     sps.ctx0_stale = 0;
     for (k = 0; op->a && k + 4 <= op->a->len; k += 4) {
@@ -2511,19 +2523,20 @@ static void sp_state_export(VirtIOGPU *g, SpOp *op)
 
             sp_sink_send(SP_EXPORT_DATA, p->data, sizeof(SpXfer),
                          p->data + sizeof(SpXfer), p->len - sizeof(SpXfer),
-                         0, 0, 0);
+                         0, 0, req);
             msgs++;
             bytes += p->len - sizeof(SpXfer);
         }
         done++;
     }
     sp_sink_send(SP_EXPORT_DONE, skipped->data, skipped->len * sizeof(uint32_t),
-                 NULL, 0, msgs, bytes, 0);
+                 NULL, 0, msgs, bytes, req);
     fprintf(stderr, "[SPACEBOX-REMOTE] sink export: %u resources asked, %u "
             "exported in %" PRIu64 " messages, %" PRIu64 " bytes, %u not "
-            "exported, %.1f ms; %u stale GL errors of context 0 cleared\n",
+            "exported, %.1f ms; %u stale GL errors of context 0 cleared; "
+            "request %#" PRIx64 "\n",
             asked, done, msgs, bytes, skipped->len,
-            (g_get_monotonic_time() - t0) / 1000.0, sps.ctx0_stale);
+            (g_get_monotonic_time() - t0) / 1000.0, sps.ctx0_stale, req);
 }
 
 /* ---- in order with the commands ------------------------------------------- */
@@ -2621,6 +2634,10 @@ static void sp_control_tick(void *opaque)
         }
     } else if (!strcmp(text, "stats")) {
         sp_state_stats();
+    } else if (!strncmp(text, "stall-export ", 13)) {
+        sps.export_stall_ms = MIN(strtoul(text + 13, NULL, 10), 60000);
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink control: the next export "
+                "stalls %u ms\n", sps.export_stall_ms);
     } else {
         fprintf(stderr, "[SPACEBOX-REMOTE] sink control: unknown command\n");
     }

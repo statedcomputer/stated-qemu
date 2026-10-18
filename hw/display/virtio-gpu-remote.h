@@ -22,10 +22,13 @@ enum {
                             N and were not written after it (N = 0: all) */
     SP_STATE_KEPT = 18,  /* sink -> source. arg0 = N, a: u32[] the kept resources */
     SP_IMPORT = 19,      /* source -> sink. a: SpXfer, b: the bytes */
-    SP_EXPORT = 22,      /* source -> sink. a: u32[] resources, in that order */
-    SP_EXPORT_DATA = 23, /* sink -> source. a: SpXfer, b: at most SP_XFER_MAX bytes */
+    SP_EXPORT = 22,      /* source -> sink. arg0 the request id; a: u32[]
+                            resources, in that order */
+    SP_EXPORT_DATA = 23, /* sink -> source. arg2 the request id; a: SpXfer,
+                            b: at most SP_XFER_MAX bytes */
     SP_EXPORT_DONE = 24, /* sink -> source. arg0 SP_EXPORT_DATA messages sent,
-                            arg1 their bytes; a: u32[] asked but not exported */
+                            arg1 their bytes, arg2 the request id; a: u32[]
+                            asked but not exported */
     SP_DETACH = 25,      /* sink -> source: this sink ends on purpose */
     SP_BYE = 26,         /* source -> sink: done with this sink, which exits */
 };

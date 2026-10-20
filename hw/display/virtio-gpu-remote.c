@@ -2699,7 +2699,7 @@ static bool sp_profile_ok(VirtIOGPU *g)
                     video);
     } else {
         error_report("spacebox remote gpu: capset profile %s (%s): this "
-                     "renderer cannot do it, every source is refused:%s; video "
+                     "renderer cannot do it, every source is refused:%s video "
                      "decode %s (%u entries)", sp_prof.p.name,
                      sp_prof.p.digest, why->str, video ? "on" : "off", video);
     }
@@ -2745,7 +2745,7 @@ static void sp_sink_spec(VirtIOGPU *g, const uint8_t *a, size_t len)
                     video ? "on" : "off", video);
     } else if (!(sp_spec.refusals & (sp_spec.refusals - 1))) {
         error_report("spacebox remote gpu: the source's spec %s: this renderer "
-                     "cannot do it, the source is refused (%" PRIu64 "):%s; "
+                     "cannot do it, the source is refused (%" PRIu64 "):%s "
                      "video decode %s (%u entries)", p.digest,
                      sp_spec.refusals, why->str, video ? "on" : "off", video);
     }

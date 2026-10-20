@@ -31,7 +31,9 @@
  *                                           resources), "stall-export MS" (the
  *                                           next SP_EXPORT waits MS ms, with
  *                                           the sink's main loop held, before it
- *                                           runs: a renderer that stalls).
+ *                                           runs: a renderer that stalls), "gpu
+ *                                           off", "gpu on" (the user's toggle, as
+ *                                           its hotkey Ctrl+Alt+A).
  */
 
 #include "qemu/osdep.h"
@@ -2634,6 +2636,9 @@ static void sp_control_tick(void *opaque)
         }
     } else if (!strcmp(text, "stats")) {
         sp_state_stats();
+    } else if (!strcmp(text, "gpu off") || !strcmp(text, "gpu on")) {
+        /* the user's toggle, as the hotkey (virtio-gpu-remote.c) */
+        sp_sink_gpu(!strcmp(text, "gpu on"));
     } else if (!strncmp(text, "stall-export ", 13)) {
         sps.export_stall_ms = MIN(strtoul(text + 13, NULL, 10), 60000);
         fprintf(stderr, "[SPACEBOX-REMOTE] sink control: the next export "

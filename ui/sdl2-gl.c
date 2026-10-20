@@ -29,9 +29,11 @@
 #include "ui/console.h"
 #include "ui/input.h"
 #include "ui/sdl2.h"
+#include "qemu/timer.h"
 #include "spacebox-capture.h"
 #include "spacebox-pacing.h"
 #include "spacebox-presenter.h"
+#include "spacebox-stream.h"
 
 static void sdl2_set_scanout_mode(struct sdl2_console *scon, bool scanout)
 {
@@ -272,4 +274,5 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
 
     spacebox_capture_client(ww, wh);
     spacebox_swap(scon->real_window, ww, wh);
+    spacebox_stream_frame(scon);
 }

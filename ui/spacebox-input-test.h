@@ -175,11 +175,11 @@ static void spacebox_input_test(struct sdl2_console *scon)
     FILE *f = fopen(path, "r");
     if (!f) return;
     char line[256] = "", command[24];
-    int a = 0, b = 0;
+    int a = 0, b = 0, mod = 0;
     if (!fgets(line, sizeof(line), f)) line[0] = 0;
     fclose(f);
     unlink(path);
-    int count = sscanf(line, "%23s %d %d", command, &a, &b);
+    int count = sscanf(line, "%23s %d %d %d", command, &a, &b, &mod);
     if (count < 1) return;
     if (!strcmp(command, "type")) {
         spacebox_typing_start(scon, line);
@@ -188,12 +188,15 @@ static void spacebox_input_test(struct sdl2_console *scon)
     static int test_x, test_y;
     SDL_Event ev = {0};
     Uint32 id = SDL_GetWindowID(scon->real_window);
-    if (!strcmp(command, "key") && count == 3) {
+    if (!strcmp(command, "key") && (count == 3 || count == 4)) {
+        /* "key SCANCODE DOWN [MOD]": MOD, the modifiers held (SDL_Keymod), as a
+         * person's key event carries them */
         ev.type = b ? SDL_KEYDOWN : SDL_KEYUP;
         ev.key.windowID = id;
         ev.key.state = b ? SDL_PRESSED : SDL_RELEASED;
         ev.key.keysym.scancode = a;
         ev.key.keysym.sym = SDL_GetKeyFromScancode(a);
+        ev.key.keysym.mod = mod;
         if (SDL_PushEvent(&ev) == 1) {
             spacebox_test_keys++;
         }

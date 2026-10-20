@@ -38,6 +38,16 @@ enum {
     SP_SPEC_REPLY = 28,  /* sink -> source, not resent. arg0 1: this renderer
                             can do the spec, 0: it cannot (the source closes);
                             a: text, what it cannot do */
+    SP_GPU = 29,         /* sink -> source, the user's toggle. arg0 1: the local
+                            GPU renders (on), 0: the renderer inside the guest
+                            renders and this sink shows its pictures (off) */
+    SP_STREAM = 30,      /* source -> sink (the renderer inside the guest).
+                            arg0 1: send pictures of the scanout, 0: stop */
+    SP_PICTURE = 31,     /* either direction, not resent. a: a JPEG of the
+                            scanout; arg0, arg1 the scanout's size; arg2 the
+                            renderer's count of its pictures */
+    SP_GPU_STATE = 32,   /* source -> sink: what the toggle made. arg0 1 on, 0
+                            off; arg1 1: it could not be turned off */
 };
 
 #define SP_XFER_MAX (16u << 20)
@@ -63,6 +73,22 @@ void sp_sink_send(uint32_t type, const void *a, size_t a_len,
                   const void *b, size_t b_len,
                   uint64_t arg0, uint64_t arg1, uint64_t arg2);
 void sp_sink_detach(void);
+void sp_sink_send_once(uint32_t type, const void *a, size_t a_len,
+                       uint64_t arg0, uint64_t arg1, uint64_t arg2);
+size_t sp_sink_backlog(void);
+void sp_sink_gpu(bool on);
+
+/* called by ui/sdl2.c, which declares them itself */
+void spacebox_gpu_toggle(void);
+const char *spacebox_gpu_caption(unsigned *gen);
+
+/* virtio-gpu-remote-picture.c; the first two are called by ui/spacebox-stream.h */
+bool spacebox_stream_on(void);
+void spacebox_stream_take(uint8_t *px, int w, int h, int stride, bool bottom_up);
+void sp_picture_stream(bool on);
+void sp_picture_show(VirtIOGPU *g, bool off, uint64_t sw, uint64_t sh,
+                     uint64_t n, const uint8_t *a, size_t len);
+void sp_picture_end(void);
 
 /* virtio-gpu-remote-state.c */
 void sp_state_realize(VirtIOGPU *g);

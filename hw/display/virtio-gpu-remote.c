@@ -44,6 +44,9 @@
  *                                           spec. See sp_profile_load(), sp_sink_spec().
  * SPACEBOX_GPU_REMOTE_CONTROL=<file>        sink: test commands, see
  *                                           virtio-gpu-remote-state.c.
+ * SPACEBOX_STREAM_SCALE=2                   sink inside the guest: the pictures of
+ *                                           the user's toggle at half the scanout's
+ *                                           size (virtio-gpu-remote-picture.c).
  *
  * Both ends are assumed little-endian. One source per sink; a lost connection
  * resets the sink and is not recovered on the source (prototype).
@@ -501,6 +504,24 @@ static struct {
     uint64_t n_ctrl, n_submit, submit_bytes, n_xfer, xfer_bytes, tx_bytes, rx_bytes;
     uint64_t n_mem, mem_bytes, n_back, back_bytes;
 } sp = { .fd = -1, .listen_fd = -1 };
+
+/*
+ * The user's toggle of the GPU acceleration (sink: the hotkey Ctrl+Alt+A of
+ * ui/sdl2.c, or "gpu off|on" of the control file). On, this renderer runs the
+ * guest's commands. Off, the source runs the guest on the renderer inside the
+ * guest and this sink shows that renderer's pictures (SP_PICTURE,
+ * virtio-gpu-remote-picture.c); input, sound and the cursor go on as before.
+ * The toggle is this sink's: a new pairing starts with it on (the renderer that
+ * comes back after a loss), and a pairing that resumes tells the source again
+ * (it may be another process, after a move).
+ */
+static struct {
+    bool off;       /* what the user asked */
+    bool used;      /* asked on this pairing */
+    int state;      /* what the source made (SP_GPU_STATE): 1 on, 0 off, -1 not told */
+    bool refused;   /* the source could not turn it off */
+    unsigned gen;   /* counts changes (the window's title) */
+} sp_gpu = { .state = -1 };
 
 int sp_remote_mode(void)
 {
@@ -2944,6 +2965,73 @@ void sp_sink_detach(void)
             "the source says bye\n");
 }
 
+/* A message to the source that is not resent (a picture of the toggle). */
+void sp_sink_send_once(uint32_t type, const void *a, size_t a_len,
+                       uint64_t arg0, uint64_t arg1, uint64_t arg2)
+{
+    sp_send_full(false, type, 0, a, a_len, NULL, 0, arg0, arg1, arg2);
+}
+
+size_t sp_sink_backlog(void)
+{
+    return sp_tx_backlog();
+}
+
+/* The user's toggle: asked of the source (SP_GPU), which answers SP_GPU_STATE. */
+void sp_sink_gpu(bool on)
+{
+    if (sp.mode != SP_REMOTE_SINK) {
+        return;
+    }
+    if (sp.fd < 0 || !sp.hello_done || !sp.peer_session || sp.spec_wait) {
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink gpu %s: no source paired, nothing "
+                "asked\n", on ? "on" : "off");
+        return;
+    }
+    sp_gpu.off = !on;
+    sp_gpu.used = true;
+    sp_gpu.refused = false;
+    sp_gpu.gen++;
+    if (on) {
+        sp_picture_end();
+    }
+    sp_send(SP_GPU, 0, NULL, 0, NULL, 0, on, 0, 0);
+    fprintf(stderr, "[SPACEBOX-REMOTE] sink gpu %s: asked of the source\n",
+            on ? "on" : "off");
+}
+
+/* ui/sdl2.c: the hotkey turns the toggle over. */
+void spacebox_gpu_toggle(void)
+{
+    sp_sink_gpu(sp_gpu.off);
+}
+
+/* ui/sdl2.c: the toggle's part of the window's title ("" when this is not a
+ * remote sink), and the count of its changes. */
+const char *spacebox_gpu_caption(unsigned *gen)
+{
+#ifdef CONFIG_DARWIN
+#define SP_GPU_KEY "\u2303\u2325A"
+#else
+#define SP_GPU_KEY "Ctrl-Alt-A"
+#endif
+    *gen = sp_gpu.gen;
+    if (sp.mode != SP_REMOTE_SINK) {
+        return "";
+    }
+    if (sp_gpu.off) {
+        return sp_gpu.state == 0 ? " - GPU acceleration off (" SP_GPU_KEY ")"
+                                 : " - GPU acceleration: turning off";
+    }
+    if (sp_gpu.state == 0) {
+        return " - GPU acceleration: turning on";
+    }
+    return sp_gpu.refused
+        ? " - GPU acceleration on: it cannot be turned off now (" SP_GPU_KEY ")"
+        : " - GPU acceleration on (" SP_GPU_KEY ")";
+#undef SP_GPU_KEY
+}
+
 /* How long a closed sink waits for the source's bye before it ends anyway. */
 #define SP_CLOSE_WAIT_MS 20000
 
@@ -3258,6 +3346,14 @@ static void sp_hello(SpHdr *h)
         sp_sink_reset(sp.g);
         sp.peer_session = h->arg0;
         sp.spec_wait = spec_src;
+        if (sp_gpu.used || sp_gpu.off) {
+            fprintf(stderr, "[SPACEBOX-REMOTE] sink gpu: a new pairing: the GPU "
+                    "acceleration is on\n");
+        }
+        sp_gpu.off = sp_gpu.used = sp_gpu.refused = false;
+        sp_gpu.state = -1;
+        sp_gpu.gen++;
+        sp_picture_end();
     } else if (sp.peer_session && sp.seq) {
         error_report("spacebox remote gpu: the sink has lost this guest's "
                      "renderer state (it restarted); the guest display cannot "
@@ -3277,6 +3373,13 @@ static void sp_hello(SpHdr *h)
         sp_send(SP_DISPLAY, 0, NULL, 0, NULL, 0, VIRTIO_GPU_EVENT_DISPLAY, 0, 0);
     }
     sp_tx_start(resume ? h->arg2 : 0);
+    if (sp.mode == SP_REMOTE_SINK) {
+        /* the renderer inside the guest: each connection starts with no pictures */
+        sp_picture_stream(false);
+        if (resume && sp_gpu.used) {
+            sp_send(SP_GPU, 0, NULL, 0, NULL, 0, !sp_gpu.off, 0, 0);
+        }
+    }
     if (sp.mode == SP_REMOTE_SOURCE) {
         sp_source_handle_ctrl(sp.g, sp.g->ctrl_vq);
     }
@@ -3827,8 +3930,32 @@ static void sp_dispatch(SpHdr *h, uint8_t *a, uint8_t *b)
                 struct virtio_gpu_update_cursor c;
 
                 memcpy(&c, a, sizeof(c));
-                virtio_gpu_sp_update_cursor(g, &c);
+                if (h->b_len == 64 * 64 * 4) {
+                    /* the toggle off: the image comes with it, this renderer
+                     * does not hold the guest's resources now */
+                    virtio_gpu_sp_cursor_pixels(g, &c, b);
+                } else {
+                    virtio_gpu_sp_update_cursor(g, &c);
+                }
             }
+            break;
+        case SP_STREAM:
+            sp_picture_stream(h->arg0);
+            break;
+        case SP_PICTURE:
+            sp_picture_show(g, sp_gpu.off, h->arg0, h->arg1, h->arg2, a, h->a_len);
+            break;
+        case SP_GPU_STATE:
+            sp_gpu.state = h->arg0 ? 1 : 0;
+            sp_gpu.refused = h->arg1;
+            if (h->arg1) {
+                sp_gpu.off = false;
+            }
+            sp_gpu.gen++;
+            fprintf(stderr, "[SPACEBOX-REMOTE] sink gpu: the source says the GPU "
+                    "acceleration is %s%s\n", h->arg0 ? "on" : "off",
+                    h->arg1 ? " (no renderer inside the guest can take the guest now)"
+                            : "");
             break;
         case SP_RESET:
             sp_sink_reset(g);
@@ -4014,6 +4141,8 @@ static void sp_stats(void *opaque)
         QTAILQ_FOREACH(c, &sp.g->cmdq, next) nq++;
         QTAILQ_FOREACH(c, &sp.g->fenceq, next) nf++;
         c = QTAILQ_FIRST(&sp.g->cmdq);
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink gpu toggle: off=%d told=%d "
+                "refused=%d\n", sp_gpu.off, sp_gpu.state, sp_gpu.refused);
         fprintf(stderr, "[SPACEBOX-REMOTE] sink cmdq=%u fenceq=%u blocked=%d", nq, nf,
                 sp.g->parent_obj.renderer_blocked);
         if (c) {

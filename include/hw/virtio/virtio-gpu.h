@@ -449,6 +449,9 @@ void sp_sink_poll_watches(void);
 bool sp_sink_before_cmd(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd);
 void virtio_gpu_sp_update_cursor(VirtIOGPU *g,
                                  struct virtio_gpu_update_cursor *cursor);
+void virtio_gpu_sp_cursor_pixels(VirtIOGPU *g,
+                                 struct virtio_gpu_update_cursor *cursor,
+                                 const void *pixels);
 void virtio_gpu_base_sp_notify_event(VirtIOGPUBase *g, uint32_t event_type);
 
 #endif

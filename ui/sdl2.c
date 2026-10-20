@@ -248,11 +248,17 @@ static void sdl2_redraw(struct sdl2_console *scon)
     }
 }
 
+/* hw/display/virtio-gpu-remote.c: the user's toggle of the GPU acceleration */
+void spacebox_gpu_toggle(void);
+const char *spacebox_gpu_caption(unsigned *gen);
+
 static void sdl_update_caption(struct sdl2_console *scon)
 {
     char win_title[1024];
     char icon_title[1024];
     const char *status = "";
+    unsigned gen;
+    const char *gpu = spacebox_gpu_caption(&gen);
 
     if (!runstate_is_running()) {
         status = " [Stopped]";
@@ -275,11 +281,11 @@ static void sdl_update_caption(struct sdl2_console *scon)
     }
 
     if (qemu_name) {
-        snprintf(win_title, sizeof(win_title), "QEMU (%s-%d)%s", qemu_name,
-                 scon->idx, status);
+        snprintf(win_title, sizeof(win_title), "QEMU (%s-%d)%s%s", qemu_name,
+                 scon->idx, status, gpu);
         snprintf(icon_title, sizeof(icon_title), "QEMU (%s)", qemu_name);
     } else {
-        snprintf(win_title, sizeof(win_title), "QEMU%s", status);
+        snprintf(win_title, sizeof(win_title), "QEMU%s%s", status, gpu);
         snprintf(icon_title, sizeof(icon_title), "QEMU");
     }
 
@@ -456,11 +462,25 @@ static int get_mod_state(void)
     }
 }
 
+/* get_mod_state() of the modifiers that a key event carries (an event put in
+ * SDL's queue, as the input-test hook does, leaves SDL's own state as it was) */
+static int event_mod_state(SDL_Keymod mod)
+{
+    if (alt_grab) {
+        return (mod & (gui_grab_code | KMOD_LSHIFT)) ==
+            (gui_grab_code | KMOD_LSHIFT);
+    } else if (ctrl_grab) {
+        return (mod & KMOD_RCTRL) == KMOD_RCTRL;
+    }
+    return (mod & gui_grab_code) == gui_grab_code;
+}
+
 static void handle_keydown(SDL_Event *ev)
 {
     int win;
     struct sdl2_console *scon = get_scon_from_window(ev->key.windowID);
-    int gui_key_modifier_pressed = get_mod_state();
+    int gui_key_modifier_pressed = get_mod_state() ||
+                                   event_mod_state(ev->key.keysym.mod);
 
     if (!scon) {
         return;
@@ -498,6 +518,12 @@ static void handle_keydown(SDL_Event *ev)
             break;
         case SDL_SCANCODE_F:
             toggle_full_screen(scon);
+            scon->gui_keysym = true;
+            break;
+        case SDL_SCANCODE_A:
+            /* Spacebox: the GPU acceleration off (the guest renders, its
+             * pictures are shown here) or on; the title says which */
+            spacebox_gpu_toggle();
             scon->gui_keysym = true;
             break;
         case SDL_SCANCODE_G:
@@ -760,6 +786,17 @@ void sdl2_poll_events(struct sdl2_console *scon)
 
     spacebox_window_request(scon);
     spacebox_input_test(scon);
+    {
+        /* the toggle's state changed: the title says it */
+        static unsigned gpu_gen;
+        unsigned gen;
+
+        spacebox_gpu_caption(&gen);
+        if (gen != gpu_gen) {
+            gpu_gen = gen;
+            sdl_update_caption(scon);
+        }
+    }
 #ifdef CONFIG_DARWIN
     spacebox_scroll_tick(scon->real_window);
 #endif

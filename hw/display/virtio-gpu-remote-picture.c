@@ -34,6 +34,7 @@
 /* the device drops a picture while its link to the user has more than 1 MiB
  * waiting; this end does the same with its own link to the device */
 #define SP_PIC_BACKLOG (1u << 20)
+#define SP_PIC_QUEUE 3
 
 /* ---- libjpeg's errors: back to the caller, not exit() --------------------- */
 
@@ -65,9 +66,15 @@ static struct {
     uint8_t *px;
     int w, h, stride;
     bool bottom_up;
-    /* the newest JPEG, waiting for the main loop to send it */
-    uint8_t *jpg;
-    unsigned long jpg_len;
+    /* the JPEGs made and not sent yet, oldest first: the main loop sends them all
+     * when it runs (it is busy with the guest's drawing between); a JPEG that
+     * finds the queue full replaces its oldest (counted as coalesced) */
+    struct {
+        uint8_t *data;
+        unsigned long len;
+        int w, h;
+    } q[SP_PIC_QUEUE];
+    int qn;
     int jpg_w, jpg_h, out_w, out_h;
     uint64_t n;         /* pictures sent since the start (arg2) */
     /* counts of the second */
@@ -176,12 +183,17 @@ static void *sp_stream_worker(void *opaque)
         sps.enc_us += g_get_monotonic_time() - t0;
         if (jpg) {
             sps.encoded++;
-            if (sps.jpg) {
-                free(sps.jpg);
+            if (sps.qn == SP_PIC_QUEUE) {
+                free(sps.q[0].data);
+                memmove(&sps.q[0], &sps.q[1], sizeof(sps.q[0]) * (SP_PIC_QUEUE - 1));
+                sps.qn--;
                 sps.coalesced++;
             }
-            sps.jpg = jpg;
-            sps.jpg_len = len;
+            sps.q[sps.qn].data = jpg;
+            sps.q[sps.qn].len = len;
+            sps.q[sps.qn].w = w;
+            sps.q[sps.qn].h = h;
+            sps.qn++;
             sps.jpg_w = w;
             sps.jpg_h = h;
             sps.out_w = ow;
@@ -216,38 +228,40 @@ static void sp_stream_stats(void)
     sps.bytes = sps.enc_us = 0;
 }
 
-/* The main loop: send the newest JPEG to the source. */
+/* The main loop: send the JPEGs made to the source, in order. */
 static void sp_stream_bh(void *opaque)
 {
-    uint8_t *jpg;
-    unsigned long len;
-    int w, h;
+    for (;;) {
+        uint8_t *jpg;
+        unsigned long len;
+        int w, h;
 
-    qemu_mutex_lock(&sps.lock);
-    jpg = sps.jpg;
-    len = sps.jpg_len;
-    w = sps.jpg_w;
-    h = sps.jpg_h;
-    sps.jpg = NULL;
-    qemu_mutex_unlock(&sps.lock);
-    if (!jpg) {
-        return;
-    }
-    if (sps.on && sp_sink_backlog() <= SP_PIC_BACKLOG) {
-        sp_sink_send_once(SP_PICTURE, jpg, len, w, h, ++sps.n);
         qemu_mutex_lock(&sps.lock);
-        sps.sent++;
-        sps.bytes += len;
+        if (!sps.qn) {
+            sp_stream_stats();
+            qemu_mutex_unlock(&sps.lock);
+            return;
+        }
+        jpg = sps.q[0].data;
+        len = sps.q[0].len;
+        w = sps.q[0].w;
+        h = sps.q[0].h;
+        memmove(&sps.q[0], &sps.q[1], sizeof(sps.q[0]) * (SP_PIC_QUEUE - 1));
+        sps.qn--;
         qemu_mutex_unlock(&sps.lock);
-    } else {
-        qemu_mutex_lock(&sps.lock);
-        sps.dropped++;
-        qemu_mutex_unlock(&sps.lock);
+        if (sps.on && sp_sink_backlog() <= SP_PIC_BACKLOG) {
+            sp_sink_send_once(SP_PICTURE, jpg, len, w, h, ++sps.n);
+            qemu_mutex_lock(&sps.lock);
+            sps.sent++;
+            sps.bytes += len;
+            qemu_mutex_unlock(&sps.lock);
+        } else {
+            qemu_mutex_lock(&sps.lock);
+            sps.dropped++;
+            qemu_mutex_unlock(&sps.lock);
+        }
+        free(jpg);
     }
-    free(jpg);
-    qemu_mutex_lock(&sps.lock);
-    sp_stream_stats();
-    qemu_mutex_unlock(&sps.lock);
 }
 
 /* SP_STREAM, and at every pairing (none then). */

@@ -290,7 +290,14 @@ static void sdl_update_caption(struct sdl2_console *scon)
     }
 
     if (scon->real_window) {
+        static char said[1024];
+
         SDL_SetWindowTitle(scon->real_window, win_title);
+        if (*gpu && strcmp(said, win_title)) {
+            /* for the checks of the toggle */
+            g_strlcpy(said, win_title, sizeof(said));
+            fprintf(stderr, "[SPACEBOX-WINDOW] title: %s\n", win_title);
+        }
     }
 }
 

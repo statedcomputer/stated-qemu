@@ -8,7 +8,8 @@
  * renderer then reads its scanout back after each frame it shows (ui/sdl2-gl.c,
  * ui/spacebox-stream.h: at most 30 a second, by a token bucket that takes the
  * last frame of a burst), encodes it as JPEG (libjpeg-turbo, quality 80, 4:2:0)
- * on a thread of its own, the guest's CPU, and sends it to the device on its
+ * on a thread of its own (at a lower priority than the guest's programs), the
+ * guest's CPU, and sends it to the device on its
  * link (SP_PICTURE, not resent). The device passes each one to the user's
  * renderer, which decodes it and shows it in its window as a 2D surface; when
  * the toggle is on again the device's switch back sets the virgl scanout again.
@@ -29,12 +30,19 @@
 
 #include <setjmp.h>
 #include <jpeglib.h>
+#ifdef __linux__
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#endif
 
 #define SP_PIC_QUALITY 80
 /* the device drops a picture while its link to the user has more than 1 MiB
  * waiting; this end does the same with its own link to the device */
 #define SP_PIC_BACKLOG (1u << 20)
 #define SP_PIC_QUEUE 3
+/* the encoder's niceness (Linux): it takes the CPU that the guest's own programs
+ * leave, so that its work does not delay their input and drawing */
+#define SP_PIC_NICE 10
 
 /* ---- libjpeg's errors: back to the caller, not exit() --------------------- */
 
@@ -146,6 +154,12 @@ static uint8_t *sp_stream_encode(const uint8_t *px, int w, int h, int stride,
 
 static void *sp_stream_worker(void *opaque)
 {
+#ifdef __linux__
+    if (setpriority(PRIO_PROCESS, syscall(SYS_gettid), SP_PIC_NICE)) {
+        fprintf(stderr, "[SPACEBOX-STREAM] the encoder's niceness not set: %s\n",
+                strerror(errno));
+    }
+#endif
     for (;;) {
         uint8_t *px, *half = NULL, *jpg;
         int w, h, stride, ow, oh;

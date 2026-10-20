@@ -84,7 +84,8 @@ const char *spacebox_gpu_caption(unsigned *gen);
 
 /* virtio-gpu-remote-picture.c; the first two are called by ui/spacebox-stream.h */
 bool spacebox_stream_on(void);
-void spacebox_stream_take(uint8_t *px, int w, int h, int stride, bool bottom_up);
+void spacebox_stream_take(uint8_t *px, int w, int h, int stride, bool bottom_up,
+                          int64_t read_us);
 void sp_picture_stream(bool on);
 void sp_picture_show(VirtIOGPU *g, bool off, uint64_t sw, uint64_t sh,
                      uint64_t n, const uint8_t *a, size_t len);

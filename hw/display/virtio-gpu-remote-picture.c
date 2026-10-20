@@ -79,7 +79,7 @@ static struct {
     uint64_t n;         /* pictures sent since the start (arg2) */
     /* counts of the second */
     int64_t stats_at;
-    uint64_t taken, coalesced, encoded, sent, dropped, bytes, enc_us;
+    uint64_t taken, coalesced, encoded, sent, dropped, bytes, enc_us, read_us;
 } sps;
 
 bool spacebox_stream_on(void)
@@ -217,15 +217,16 @@ static void sp_stream_stats(void)
     if (sps.taken || sps.sent || sps.dropped) {
         fprintf(stderr, "[SPACEBOX-STREAM] us=%" PRId64 " secs=%.3f taken=%" PRIu64
                 " coalesced=%" PRIu64 " encoded=%" PRIu64 " sent=%" PRIu64
-                " dropped=%" PRIu64 " bytes=%" PRIu64 " enc_ms=%.1f size=%dx%d"
-                " out=%dx%d\n", g_get_real_time(),
+                " dropped=%" PRIu64 " bytes=%" PRIu64 " read_ms=%.1f enc_ms=%.1f"
+                " size=%dx%d out=%dx%d\n", g_get_real_time(),
                 (now - sps.stats_at) / 1e6, sps.taken, sps.coalesced,
                 sps.encoded, sps.sent, sps.dropped, sps.bytes,
-                sps.enc_us / 1000.0, sps.jpg_w, sps.jpg_h, sps.out_w, sps.out_h);
+                sps.read_us / 1000.0, sps.enc_us / 1000.0, sps.jpg_w, sps.jpg_h,
+                sps.out_w, sps.out_h);
     }
     sps.stats_at = now;
     sps.taken = sps.coalesced = sps.encoded = sps.sent = sps.dropped = 0;
-    sps.bytes = sps.enc_us = 0;
+    sps.bytes = sps.enc_us = sps.read_us = 0;
 }
 
 /* The main loop: send the JPEGs made to the source, in order. */
@@ -282,9 +283,10 @@ void sp_picture_stream(bool on)
     sps.on = on;
 }
 
-/* ui: a picture of the scanout read back (RGBX, stride bytes a row); taken
- * over, freed here. */
-void spacebox_stream_take(uint8_t *px, int w, int h, int stride, bool bottom_up)
+/* ui: a picture of the scanout read back (RGBX, stride bytes a row) in read_us
+ * of the main loop; taken over, freed here. */
+void spacebox_stream_take(uint8_t *px, int w, int h, int stride, bool bottom_up,
+                          int64_t read_us)
 {
     if (!sps.on) {
         g_free(px);
@@ -309,6 +311,7 @@ void spacebox_stream_take(uint8_t *px, int w, int h, int stride, bool bottom_up)
     sps.stride = stride;
     sps.bottom_up = bottom_up;
     sps.taken++;
+    sps.read_us += read_us;
     qemu_cond_signal(&sps.cond);
     qemu_mutex_unlock(&sps.lock);
 }

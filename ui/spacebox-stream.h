@@ -7,7 +7,8 @@
  * its framebuffer), not the window. */
 
 bool spacebox_stream_on(void);
-void spacebox_stream_take(uint8_t *px, int w, int h, int stride, bool bottom_up);
+void spacebox_stream_take(uint8_t *px, int w, int h, int stride, bool bottom_up,
+                          int64_t read_us);
 
 #define SPACEBOX_STREAM_RATE 30
 #define SPACEBOX_STREAM_BURST 3
@@ -23,6 +24,7 @@ static void spacebox_stream_read(struct sdl2_console *scon)
 {
     GLint read_fb, read_buffer, alignment, row_length, pack_buffer;
     int w = scon->w, h = scon->h;
+    int64_t t0;
     uint8_t *px;
 
     if (!scon->scanout_mode || !scon->guest_fb.framebuffer ||
@@ -41,7 +43,9 @@ static void spacebox_stream_read(struct sdl2_console *scon)
     glPixelStorei(GL_PACK_ALIGNMENT, 4);
     glPixelStorei(GL_PACK_ROW_LENGTH, 0);
     px = g_malloc((size_t)w * h * 4);
+    t0 = g_get_monotonic_time();
     glReadPixels(scon->x, scon->y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    t0 = g_get_monotonic_time() - t0;
     glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fb);
     glReadBuffer(read_buffer);
     glBindBuffer(GL_PIXEL_PACK_BUFFER, pack_buffer);
@@ -49,7 +53,7 @@ static void spacebox_stream_read(struct sdl2_console *scon)
     glPixelStorei(GL_PACK_ROW_LENGTH, row_length);
     /* the texture's first row is the picture's top unless y0_top (egl_fb_blit
      * flips it into the window then) */
-    spacebox_stream_take(px, w, h, w * 4, scon->y0_top);
+    spacebox_stream_take(px, w, h, w * 4, scon->y0_top, t0);
 }
 
 /* Takes a token if one is there. */

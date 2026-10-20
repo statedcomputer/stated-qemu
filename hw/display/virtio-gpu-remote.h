@@ -32,6 +32,12 @@ enum {
                             asked but not exported */
     SP_DETACH = 25,      /* sink -> source: this sink ends on purpose */
     SP_BYE = 26,         /* source -> sink: done with this sink, which exits */
+    SP_SPEC = 27,        /* source -> sink, not resent: the first message of a
+                            new pairing of a source whose HELLO has SP_F_SPEC.
+                            a: the guest's GPU spec (the capset profile format) */
+    SP_SPEC_REPLY = 28,  /* sink -> source, not resent. arg0 1: this renderer
+                            can do the spec, 0: it cannot (the source closes);
+                            a: text, what it cannot do */
 };
 
 #define SP_XFER_MAX (16u << 20)

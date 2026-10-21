@@ -19,6 +19,13 @@
  *                                           (default 8, 0 = wait for the sink).
  *                                           Without it every frame of the guest
  *                                           waits one network round trip.
+ * SPACEBOX_GPU_REMOTE_FENCE_AGE_MS=<ms>     source: beyond the window, answer early
+ *                                           while the oldest unanswered command is
+ *                                           younger than two round trips plus this
+ *                                           (default 20, 0 = not beyond the window).
+ *                                           See sp_source_may_answer_early().
+ * SPACEBOX_GPU_REMOTE_FENCE_AGE_VIDEO_MS=<ms> source: the same age while the guest
+ *                                           decodes video (default 100).
  * SPACEBOX_GPU_REMOTE_KEEP_TIMER_QUERY=1    sink: leave GPU timer queries advertised.
  *                                           By default they are hidden from the
  *                                           guest: a compositor that times every
@@ -492,11 +499,12 @@ static struct {
     unsigned fence_out;     /* source: answered early, not yet finished by the sink */
     unsigned wait_out;      /* source: fenced commands waiting for the sink */
     unsigned hard_out;      /* source: ... of which the answer brings data */
-    uint64_t n_early, n_local, n_waited, n_ahead;
+    uint64_t n_early, n_local, n_waited, n_ahead, n_ahead_video;
     /* source: send times of fenced commands the sink has not answered yet, oldest first */
     int64_t fq[512];
     unsigned fq_head, fq_len;
     int64_t fence_age_us;   /* source: see sp_source_may_answer_early() */
+    int64_t fence_age_video_us; /* source: the same while the guest decodes video */
     int64_t rtt_min_cur, rtt_min_prev, rtt_min_t0;
     int64_t rtt_us;         /* source: last measured command round trip */
     bool stats;
@@ -541,6 +549,8 @@ int sp_remote_mode(void)
         sp.fence_window = p ? MAX(atoi(p), 0) : 8;
         p = getenv("SPACEBOX_GPU_REMOTE_FENCE_AGE_MS");
         sp.fence_age_us = (p ? MAX(atoi(p), 0) : 20) * 1000;
+        p = getenv("SPACEBOX_GPU_REMOTE_FENCE_AGE_VIDEO_MS");
+        sp.fence_age_video_us = (p ? MAX(atoi(p), 0) : 100) * 1000;
         sp.rtt_min_cur = sp.rtt_min_prev = INT64_MAX;
         p = getenv("SPACEBOX_GPU_REMOTE_TX_LIMIT_MB");
         sp.tx_limit = (size_t)MAX(p ? atoi(p) : 8, 1) << 20;
@@ -1543,11 +1553,21 @@ static void sp_fq_pop(void)
  * alone stops a guest that issues many small fenced commands per frame (video
  * decode does) although the sink is only one round trip behind; an age bounds
  * what matters, how far the guest runs ahead of the display.
+ *
+ * The age is fence_age_video while the guest decodes video (until a second
+ * after its last decode, the time of SP_F_VIDEO, so the pauses between a
+ * clip's frames keep it). Decoding a large video loads the link, the sink's
+ * answers come up to about 150 ms late, and with the short age the guest's
+ * player waits for them and drops frames. The sink shows video frames by the
+ * guest's clock anyway. Without video the short age bounds how much later
+ * than the guest the user sees an answer to the input.
  */
 static bool sp_source_may_answer_early(void)
 {
     unsigned out = sp.fence_out + sp.wait_out;
     int64_t rtt_min = MIN(sp.rtt_min_cur, sp.rtt_min_prev);
+    int64_t now, age;
+    bool video;
 
     if (sp.hard_out) {
         return false;
@@ -1555,12 +1575,16 @@ static bool sp_source_may_answer_early(void)
     if (out < sp.fence_window) {
         return true;
     }
-    if (!sp.fence_age_us || !sp.fq_len || sp.fq_len >= G_N_ELEMENTS(sp.fq) / 2 ||
+    now = g_get_monotonic_time();
+    video = sp_video_until > now;
+    age = video ? sp.fence_age_video_us : sp.fence_age_us;
+    if (!age || !sp.fq_len || sp.fq_len >= G_N_ELEMENTS(sp.fq) / 2 ||
         rtt_min == INT64_MAX) {
         return false;
     }
-    if (g_get_monotonic_time() - sp.fq[sp.fq_head] < 2 * rtt_min + sp.fence_age_us) {
+    if (now - sp.fq[sp.fq_head] < 2 * rtt_min + age) {
         sp.n_ahead++;
+        sp.n_ahead_video += video;
         return true;
     }
     return false;
@@ -4120,12 +4144,14 @@ static void sp_stats(void *opaque)
         fprintf(stderr, " last_seq=%" PRIu64 " answered_here=%" PRIu64
                 " fence_early=%" PRIu64 " waited=%" PRIu64 " fence_out=%u rtt_ms=%.1f"
                 " not_sent=%" PRIu64 " not_sent_bytes=%" PRIu64
-                " early_by_age=%" PRIu64 " rtt_min_ms=%.1f\n",
+                " early_by_age=%" PRIu64 " rtt_min_ms=%.1f"
+                " early_by_video_age=%" PRIu64 "\n",
                 sp.seq, sp.n_local, sp.n_early, sp.n_waited, sp.fence_out,
                 sp.rtt_us / 1000.0, sp.n_defer, sp.defer_bytes, sp.n_ahead,
                 MIN(sp.rtt_min_cur, sp.rtt_min_prev) == INT64_MAX ? 0.0 :
-                MIN(sp.rtt_min_cur, sp.rtt_min_prev) / 1000.0);
-        sp.n_local = sp.n_early = sp.n_waited = sp.n_ahead = 0;
+                MIN(sp.rtt_min_cur, sp.rtt_min_prev) / 1000.0,
+                sp.n_ahead_video);
+        sp.n_local = sp.n_early = sp.n_waited = sp.n_ahead = sp.n_ahead_video = 0;
         sp.n_defer = sp.defer_bytes = 0;
         for (unsigned i = 0; i < 64; i++) {
             if (sp.ctx_qpoll[i]) {

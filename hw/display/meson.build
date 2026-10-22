@@ -82,9 +82,11 @@ if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
                                method: 'pkg-config')
     configure_file(output: 'spacebox-zstd.h',
                    configuration: {'SPACEBOX_ZSTD': spacebox_zstd.found()})
+    # spacebox: the pictures of the user's toggle are JPEG (libjpeg-turbo)
+    spacebox_jpeg = dependency('libjpeg', method: 'pkg-config')
     virtio_gpu_gl_ss = ss.source_set()
     virtio_gpu_gl_ss.add(when: ['CONFIG_VIRTIO_GPU', virgl, opengl],
-                         if_true: [files('virtio-gpu-gl.c', 'virtio-gpu-virgl.c', 'virtio-gpu-remote.c'), pixman, virgl, spacebox_zstd])
+                         if_true: [files('virtio-gpu-gl.c', 'virtio-gpu-virgl.c', 'virtio-gpu-remote.c', 'virtio-gpu-remote-state.c', 'virtio-gpu-remote-picture.c'), pixman, virgl, spacebox_zstd, spacebox_jpeg])
     hw_display_modules += {'virtio-gpu-gl': virtio_gpu_gl_ss}
   endif
 

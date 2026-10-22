@@ -5,6 +5,11 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 extern int64_t spacebox_last_input_us;
+/* hw/display/virtio-gpu-remote.c: the scroll channel inside the remote GPU's
+ * stream, when the source asked for it (main thread, like this file). */
+extern int64_t spacebox_scroll_answer_us;
+bool spacebox_remote_scroll_stream(uint64_t *conn);
+bool spacebox_remote_scroll_send(const void *buf, size_t len);
 
 static NSWindow *sp_window;
 static id sp_monitor;
@@ -25,8 +30,33 @@ static char sp_pending[65536];
 static size_t sp_pending_len;
 static int64_t sp_retry, sp_ping, sp_last_ready;
 static uint64_t sp_sequence;
+static bool sp_on_stream;
+static uint64_t sp_conn;
+static int64_t sp_answer_seen;
+/* The source carries the channel in the stream: PING on each new connection
+ * and every second; any SP_SCROLL back is the agent's answer. */
+static void sp_stream_poll(uint64_t conn)
+{
+    int64_t now=g_get_monotonic_time();
+    if(conn && (conn!=sp_conn || now-sp_ping>1000000)) { spacebox_remote_scroll_send("PING\n",5);sp_ping=now; }
+    sp_conn=conn;
+    if(spacebox_scroll_answer_us!=sp_answer_seen) {
+        sp_answer_seen=spacebox_scroll_answer_us;
+        if(!sp_ready) fprintf(stderr,"[SPACEBOX-SCROLL] bridge_ready=1 path=stream\n");
+        sp_ready=true;sp_last_ready=sp_answer_seen;
+    }
+    if(sp_ready && now-sp_last_ready>3000000) { sp_ready=false;fprintf(stderr,"[SPACEBOX-SCROLL] bridge_ready=0 timeout=1 path=stream\n"); }
+}
 static void sp_bridge_poll(void)
 {
+    uint64_t conn;
+    bool stream=spacebox_remote_scroll_stream(&conn);
+    if(stream!=sp_on_stream) {
+        /* Another kind of source: the other path starts not ready. */
+        sp_on_stream=stream;sp_ready=false;sp_pending_len=0;sp_conn=0;
+        if(sp_fd>=0) { close(sp_fd);sp_fd=-1; }
+    }
+    if(stream) { sp_stream_poll(conn);return; }
     const char *path=getenv("SPACEBOX_SCROLL_SOCKET");
     if (!path) return;
     if (sp_fd<0 && g_get_monotonic_time()>=sp_retry) {
@@ -44,13 +74,13 @@ static void sp_bridge_poll(void)
     if(sp_fd<0)return;
     char reply[128];ssize_t n=recv(sp_fd,reply,sizeof(reply),0);
     if(n>0) {
-        if(!sp_ready) fprintf(stderr,"[SPACEBOX-SCROLL] bridge_ready=1\n");
+        if(!sp_ready) fprintf(stderr,"[SPACEBOX-SCROLL] bridge_ready=1 path=socket\n");
         sp_ready=true;sp_last_ready=g_get_monotonic_time();
     }
     else if(n==0 || (n<0 && errno!=EAGAIN && errno!=EWOULDBLOCK)) { close(sp_fd);sp_fd=-1;sp_ready=false;sp_pending_len=0;return; }
     int64_t now=g_get_monotonic_time();
     if(now-sp_ping>1000000) { send(sp_fd,"PING\n",5,0);sp_ping=now; }
-    if(sp_ready && now-sp_last_ready>3000000) { sp_ready=false;fprintf(stderr,"[SPACEBOX-SCROLL] bridge_ready=0 timeout=1\n"); }
+    if(sp_ready && now-sp_last_ready>3000000) { sp_ready=false;fprintf(stderr,"[SPACEBOX-SCROLL] bridge_ready=0 timeout=1 path=socket\n"); }
     if(sp_pending_len) {
         ssize_t wrote=send(sp_fd,sp_pending,sp_pending_len,0);
         if(wrote>0) { memmove(sp_pending,sp_pending+wrote,sp_pending_len-wrote);sp_pending_len-=wrote; }
@@ -62,8 +92,8 @@ static bool sp_route(NSEvent *event, const char *origin)
     sp_log(event,origin);
     const char *bypass=getenv("SPACEBOX_SCROLL_BYPASS");
     if(bypass && !access(bypass,F_OK))return false;
-    if(!getenv("SPACEBOX_SCROLL_SOCKET"))return false;
     sp_bridge_poll();
+    if(!sp_on_stream && !getenv("SPACEBOX_SCROLL_SOCKET"))return false;
     if(!sp_ready)return false;
     bool precise=[event hasPreciseScrollingDeltas];
     /* Match native point deltas. macOS already applied natural direction.
@@ -72,7 +102,8 @@ static bool sp_route(NSEvent *event, const char *origin)
     double y=precise ? -[event scrollingDeltaY] : -40.0*[event deltaY];
     spacebox_last_input_us=g_get_monotonic_time(); /* hw/display/virtio-gpu-remote.c */
     char line[192];int n=snprintf(line,sizeof(line),"%llu %lld %.9g %.9g %d %lu %lu\n",(unsigned long long)++sp_sequence,(long long)g_get_monotonic_time(),x,y,precise,(unsigned long)[event phase],(unsigned long)[event momentumPhase]);
-    if(n>0 && n<sizeof(line) && sp_pending_len+n<=sizeof(sp_pending)) {
+    if(sp_on_stream) { if(n>0 && n<sizeof(line)) spacebox_remote_scroll_send(line,n); }
+    else if(n>0 && n<sizeof(line) && sp_pending_len+n<=sizeof(sp_pending)) {
         memcpy(sp_pending+sp_pending_len,line,n);sp_pending_len+=n;sp_bridge_poll();
     } else fprintf(stderr,"[SPACEBOX-SCROLL-ERROR] bounded queue overflow\n");
     return true; /* Exactly one path; suppress SDL's quantized wheel. */

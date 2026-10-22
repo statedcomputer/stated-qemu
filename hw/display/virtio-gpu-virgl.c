@@ -985,6 +985,10 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
 {
     bool cmd_suspended = false;
 
+    if (cmd->sp_remote && sp_sink_before_cmd(g, cmd)) {
+        return; /* a step of the remote sink's own, done */
+    }
+
     VIRTIO_GPU_FILL_CMD(cmd->cmd_hdr);
 
     virgl_renderer_force_ctx_0();

@@ -119,6 +119,31 @@ void virtio_gpu_sp_update_cursor(VirtIOGPU *g,
     update_cursor(g, cursor);
 }
 
+/* Spacebox: a cursor whose image came with it (64 x 64, 32 bit, as the guest's
+ * cursor resource holds it), for a sink that does not hold the resource. */
+void virtio_gpu_sp_cursor_pixels(VirtIOGPU *g,
+                                 struct virtio_gpu_update_cursor *cursor,
+                                 const void *pixels)
+{
+    struct virtio_gpu_scanout *s;
+
+    if (cursor->hdr.type != VIRTIO_GPU_CMD_UPDATE_CURSOR ||
+        cursor->pos.scanout_id >= g->parent_obj.conf.max_outputs) {
+        update_cursor(g, cursor);
+        return;
+    }
+    s = &g->parent_obj.scanout[cursor->pos.scanout_id];
+    if (!s->current_cursor) {
+        s->current_cursor = cursor_alloc(64, 64);
+    }
+    s->current_cursor->hot_x = cursor->hot_x;
+    s->current_cursor->hot_y = cursor->hot_y;
+    memcpy(s->current_cursor->data, pixels, 64 * 64 * 4);
+    dpy_cursor_define(s->con, s->current_cursor);
+    s->cursor = *cursor;
+    dpy_mouse_set(s->con, cursor->pos.x, cursor->pos.y, cursor->resource_id);
+}
+
 struct virtio_gpu_simple_resource *
 virtio_gpu_find_resource(VirtIOGPU *g, uint32_t resource_id)
 {
@@ -1155,6 +1180,7 @@ static void virtio_gpu_handle_ctrl(VirtIODevice *vdev, VirtQueue *vq)
         cmd->error = 0;
         cmd->finished = false;
         cmd->suspended = false;
+        virtio_gpu_ctrl_command_sp_clear(cmd);
         QTAILQ_INSERT_TAIL(&g->cmdq, cmd, next);
         cmd = virtqueue_pop(vq, sizeof(struct virtio_gpu_ctrl_command));
     }

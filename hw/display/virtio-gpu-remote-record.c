@@ -5,7 +5,9 @@
  *                                the control file's "record-start FILE" and
  *                                "record-stop" start and stop it while the sink
  *                                runs. With no record nothing of it runs but a
- *                                check of spacebox_video_record_on.
+ *                                check of spacebox_video_record_on here, and in
+ *                                virglrenderer a ticket stored into the textures
+ *                                of each decoded picture (below).
  *
  * JSON lines, one each (screen/README.md of the spacebox repository, "The
  * sink's record of video frames"):
@@ -29,7 +31,10 @@
  * Tickets come from virglrenderer (virgl_renderer_video_record): a picture's
  * ticket follows it into what the draws that read it write, so the scanout
  * that a RESOURCE_FLUSH shows holds the tickets of its pictures; the
- * presenter carries them with the frame to its swap.
+ * presenter carries them with the frame to its swap. The pictures get their
+ * tickets also with no record (virglrenderer stores one into their textures),
+ * so those that a player decoded before the record began (ahead, while it
+ * was paused) have theirs when the record shows them; they have no pic line.
  *
  * The controls (the control file, virtio-gpu-remote-state.c):
  *   video-rect X Y W H | off   where the presenter reads the frame code, in
@@ -388,7 +393,7 @@ static void sp_rec_stop(void)
         fprintf(stderr, "[SPACEBOX-VIDEO-RECORD] stop: no record\n");
         return;
     }
-    virgl_renderer_video_record(NULL, 0, 0);
+    virgl_renderer_video_record(NULL, rec.vw, rec.vh);
     sp_rec_unshown(true);
     qemu_mutex_lock(&rec.lock);
     spacebox_video_record_on = false;
@@ -523,8 +528,10 @@ bool sp_record_control(const char *text)
             return true;
         }
         json = sp_rec_size_json();
+        /* also with no record: the uploads before one starts get tickets */
+        virgl_renderer_video_record(spacebox_video_record_on ? &sp_rec_cbs : NULL,
+                                    rec.vw, rec.vh);
         if (spacebox_video_record_on) {
-            virgl_renderer_video_record(&sp_rec_cbs, rec.vw, rec.vh);
             more = g_strdup_printf(",\"size\":%s", json);
             sp_rec_ctl("video-size", more);
         }

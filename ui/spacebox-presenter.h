@@ -6,6 +6,9 @@
 #include <CoreGraphics/CoreGraphics.h>
 #include <pthread/qos.h>
 #include "qemu/thread.h"
+#include "qemu/atomic.h"
+#include "ui/spacebox-video-record.h"
+#include "spacebox-frame-code.h"
 /* Frames kept ahead of the one on screen. Without pacing only a few are ever
  * in use (their textures are made on first use); with pacing up to about 12. */
 #define SP_SLOTS 16
@@ -21,6 +24,11 @@ typedef struct SpSlot {
     int64_t submitted;
     int64_t due;    /* show no earlier than this, 0 = at once */
     int64_t gap;    /* usual spacing of the stream this frame belongs to, 0 = none */
+    /* the record of video frames: the tickets of the video pictures the frame
+     * shows, and the size of the picture it was made from (the scanout) */
+    uint64_t tickets[SP_REC_TICKETS];
+    unsigned ntickets;
+    int src_w, src_h;
 } SpSlot;
 typedef struct SpPresenter {
     SDL_Window *window;
@@ -53,6 +61,51 @@ static bool sp_fence_done(GLsync fence)
     return r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED;
 }
 
+/*
+ * The record of video frames: the frame code in the frame about to be shown,
+ * at the top of the video's rectangle (the control's video-rect, in the
+ * scanout's pixels). The slot holds the scanout scaled to the window, bottom
+ * row first. Three rows across the central half of the cells' height are read
+ * back from the slot's texture (readfb); -1 when there is no rectangle or it
+ * is not inside the frame.
+ */
+static int sp_present_code(SpSlot *s, bool *ok, int64_t *read_us)
+{
+    static uint8_t *buf;
+    static size_t buf_size;
+    const uint8_t *rows[3];
+    int x, y, w, h, code;
+    int64_t t0 = g_get_monotonic_time();
+
+    *ok = false;
+    *read_us = -1;
+    if (!spacebox_video_rect(&x, &y, &w, &h) || !s->src_w || !s->src_h) {
+        return -1;
+    }
+    double sx = (double)s->fb.width / s->src_w, sy = (double)s->fb.height / s->src_h;
+    int left = (int)(x * sx), width = (int)(w * sx);
+    double cell = w / (double)SP_CODE_CELLS;    /* in the scanout's pixels */
+
+    if (width < SP_CODE_CELLS || left < 0 || left + width > s->fb.width ||
+        (y + cell) * sy > s->fb.height) {
+        return -1;
+    }
+    if (buf_size < (size_t)width * 4 * 3) {
+        buf_size = (size_t)width * 4 * 3;
+        buf = g_realloc(buf, buf_size);
+    }
+    for (int k = 0; k < 3; k++) {
+        int row = (int)((y + cell * (3 + k) / 8) * sy);
+
+        rows[k] = buf + (size_t)k * width * 4;
+        glReadPixels(left, s->fb.height - 1 - row, width, 1, GL_RGBA,
+                     GL_UNSIGNED_BYTE, (void *)rows[k]);
+    }
+    code = spacebox_frame_code_read(rows, 3, width, ok);
+    *read_us = g_get_monotonic_time() - t0;
+    return code;
+}
+
 static bool sp_has_ready(SpPresenter *p)
 {
     for (int i = 0; i < SP_SLOTS; i++) if (p->slots[i].state == SP_READY) return true;
@@ -62,7 +115,7 @@ static bool sp_has_ready(SpPresenter *p)
 static void *sp_present_thread(void *opaque)
 {
     SpPresenter *p = opaque;
-    uint64_t seen = 0;
+    uint64_t seen = 0, record_discarded = 0;
     int shown = -1;
     GLuint readfb;
     int64_t last_stats = 0, last_control = 0;
@@ -184,6 +237,9 @@ static void *sp_present_thread(void *opaque)
         glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                GL_TEXTURE_2D, s->fb.texture, 0);
         glReadBuffer(GL_COLOR_ATTACHMENT0);
+        bool recording = qatomic_read(&spacebox_video_record_on), code_ok = false;
+        int64_t code_us = -1;
+        int code = recording ? sp_present_code(s, &code_ok, &code_us) : -1;
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         glDrawBuffer(GL_BACK);
         glViewport(0, 0, s->fb.width, s->fb.height);
@@ -199,6 +255,7 @@ static void *sp_present_thread(void *opaque)
             glReadPixels(s->fb.width / 2, s->fb.height / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, probe_px);
         }
         spacebox_swap(p->window, s->fb.width, s->fb.height);
+        int64_t swapped = g_get_monotonic_time();
         if (probe) {
             fprintf(probe, "%lld %u %u %u\n", (long long)g_get_monotonic_time(), probe_px[0], probe_px[1], probe_px[2]);
         }
@@ -234,6 +291,8 @@ static void *sp_present_thread(void *opaque)
         s->consumed = consumed;
         s->state = SP_DISPLAYED;
         p->presented++;
+        uint64_t presented = p->presented, coalesced = p->discarded - record_discarded;
+        record_discarded = p->discarded;
         int64_t now = g_get_monotonic_time();
         if (stats_us && now - last_stats > stats_us) {
             fprintf(stderr, "[SPACEBOX-PRESENT-STATS] us=%lld submitted=%llu presented=%llu coalesced=%llu busy=%llu"
@@ -250,6 +309,21 @@ static void *sp_present_thread(void *opaque)
             last_stats = now;
         }
         qemu_mutex_unlock(&p->lock);
+        if (recording) {
+            spacebox_video_record_swap(presented, swapped, code, code_ok, s->tickets,
+                                       s->ntickets, coalesced, code_us);
+        }
+        int pause_ms = qatomic_xchg(&spacebox_present_pause_ms, 0);
+        if (pause_ms) {
+            /* the test pause (pause-present): nothing is shown for pause_ms */
+            int64_t until = swapped + (int64_t)pause_ms * 1000, t;
+            qemu_mutex_lock(&p->lock);
+            while (!p->stop && (t = g_get_monotonic_time()) < until) {
+                qemu_cond_timedwait(&p->wake, &p->lock, (int)MAX((until - t) / 1000, 1));
+            }
+            qemu_mutex_unlock(&p->lock);
+            spacebox_video_record_paused(pause_ms, swapped, g_get_monotonic_time());
+        }
     }
     glFinish();
     glDeleteFramebuffers(1, &readfb);
@@ -317,11 +391,17 @@ static SpSlot *sp_present_acquire(struct sdl2_console *scon, int w, int h)
     return pick;
 }
 
-static void sp_present_submit(struct sdl2_console *scon, SpSlot *s)
+/* src_w x src_h: the size of the picture the frame was made from */
+static void sp_present_submit(struct sdl2_console *scon, SpSlot *s, int src_w, int src_h)
 {
     SpPresenter *p = scon->presenter;
     GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     glFlush();
+    s->ntickets = MIN(spacebox_frame_ntickets, SP_REC_TICKETS);
+    memcpy(s->tickets, spacebox_frame_tickets, s->ntickets * sizeof(s->tickets[0]));
+    spacebox_frame_ntickets = 0;
+    s->src_w = src_w;
+    s->src_h = src_h;
     qemu_mutex_lock(&p->lock);
     s->ready = fence;
     s->sequence = ++p->sequence;

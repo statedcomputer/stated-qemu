@@ -86,7 +86,7 @@ if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
     spacebox_jpeg = dependency('libjpeg', method: 'pkg-config')
     virtio_gpu_gl_ss = ss.source_set()
     virtio_gpu_gl_ss.add(when: ['CONFIG_VIRTIO_GPU', virgl, opengl],
-                         if_true: [files('virtio-gpu-gl.c', 'virtio-gpu-virgl.c', 'virtio-gpu-remote.c', 'virtio-gpu-remote-state.c', 'virtio-gpu-remote-picture.c'), pixman, virgl, spacebox_zstd, spacebox_jpeg])
+                         if_true: [files('virtio-gpu-gl.c', 'virtio-gpu-virgl.c', 'virtio-gpu-remote.c', 'virtio-gpu-remote-state.c', 'virtio-gpu-remote-picture.c', 'virtio-gpu-remote-record.c'), pixman, virgl, spacebox_zstd, spacebox_jpeg])
     hw_display_modules += {'virtio-gpu-gl': virtio_gpu_gl_ss}
   endif
 

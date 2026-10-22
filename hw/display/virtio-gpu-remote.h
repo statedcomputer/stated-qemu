@@ -78,6 +78,11 @@ void sp_sink_send_once(uint32_t type, const void *a, size_t a_len,
 size_t sp_sink_backlog(void);
 void sp_sink_gpu(bool on);
 
+/* virtio-gpu-remote-record.c: the record of video frames */
+void sp_record_realize(void);
+bool sp_record_control(const char *text);
+void sp_record_cmd(struct virtio_gpu_ctrl_command *cmd);
+
 /* called by ui/sdl2.c, which declares them itself */
 void spacebox_gpu_toggle(void);
 const char *spacebox_gpu_caption(unsigned *gen);

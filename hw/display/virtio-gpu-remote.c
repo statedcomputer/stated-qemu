@@ -51,6 +51,8 @@
  *                                           spec. See sp_profile_load(), sp_sink_spec().
  * SPACEBOX_GPU_REMOTE_CONTROL=<file>        sink: test commands, see
  *                                           virtio-gpu-remote-state.c.
+ * SPACEBOX_VIDEO_RECORD=<file>              sink: the record of video frames
+ *                                           (virtio-gpu-remote-record.c).
  * SPACEBOX_STREAM_SCALE=2                   sink inside the guest: the pictures of
  *                                           the user's toggle at half the scanout's
  *                                           size (virtio-gpu-remote-picture.c).
@@ -73,6 +75,7 @@
 #include "audio/audio.h"
 #include "virtio-gpu-remote-formats.h"
 #include "virtio-gpu-remote.h"
+#include "ui/spacebox-video-record.h"
 #include "system/runstate.h"
 
 #include <virglrenderer.h>
@@ -209,6 +212,7 @@ static struct SpDelayStat {
     int64_t max;
 } sp_txd, sp_rxd;
 static int64_t sp_rx_min = INT64_MAX, sp_rx_min_prev = INT64_MAX, sp_rx_min_t0;
+static int64_t sp_rx_now;   /* when sp_rx() read the messages it handles */
 
 static void sp_rx_delay(int64_t t_us)
 {
@@ -1014,6 +1018,7 @@ static void sp_rx(void *opaque)
         }
     }
     sp.wire_rx += got;
+    sp_rx_now = g_get_monotonic_time();
 
     sp.rx_busy = true;
   more:
@@ -2923,6 +2928,13 @@ static void sp_sink_ctrl(VirtIOGPU *g, SpHdr *h, uint8_t *a, uint8_t *b)
     cmd->sp_expect = sp.next_expect;
     sp.next_expect = NULL;
     sp_state_attach(cmd, h->id);
+    if (spacebox_video_record_on) {
+        /* the source's time on this clock as the lateness takes it (sp_rx_delay) */
+        int64_t base = MIN(sp_rx_min, sp_rx_min_prev);
+
+        cmd->sp_t_dev = h->t_us && base != INT64_MAX ? h->t_us + base : 0;
+        cmd->sp_t_rx = sp_rx_now;
+    }
 
     memcpy(&hdr, req, MIN((size_t)h->a_len, sizeof(hdr)));
     if (hdr.type == VIRTIO_GPU_CMD_RESOURCE_FLUSH) {
@@ -4259,6 +4271,7 @@ void sp_remote_realize(VirtIOGPU *g, Error **errp)
         qemu_set_fd_handler(sp.listen_fd, sp_sink_accept, NULL, NULL);
         sp_ach_sink_listen();
         sp_state_realize(g);
+        sp_record_realize();
         sp.input = qemu_input_handler_register(DEVICE(g), &sp_input_handler);
         qemu_input_handler_activate(sp.input);
         aio_bh_schedule_oneshot(qemu_get_aio_context(),

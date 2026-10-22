@@ -33,7 +33,11 @@
  *                                           the sink's main loop held, before it
  *                                           runs: a renderer that stalls), "gpu
  *                                           off", "gpu on" (the user's toggle, as
- *                                           its hotkey Ctrl+Alt+A).
+ *                                           its hotkey Ctrl+Alt+A); the record
+ *                                           of video frames' "video-rect",
+ *                                           "video-size", "pause-present",
+ *                                           "record-start", "record-stop"
+ *                                           (virtio-gpu-remote-record.c).
  */
 
 #include "qemu/osdep.h"
@@ -2572,6 +2576,7 @@ bool sp_sink_before_cmd(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
     GByteArray *wm = cmd->sp_wmark;
     SpOp *op = cmd->sp_op;
 
+    sp_record_cmd(cmd);
     cmd->sp_wmark = NULL;
     if (sps.ctx0_dirty && (!op || op->type != SP_IMPORT)) {
         /* the imports complete before what comes after them reads them */
@@ -2643,6 +2648,8 @@ static void sp_control_tick(void *opaque)
         sps.export_stall_ms = MIN(strtoul(text + 13, NULL, 10), 60000);
         fprintf(stderr, "[SPACEBOX-REMOTE] sink control: the next export "
                 "stalls %u ms\n", sps.export_stall_ms);
+    } else if (sp_record_control(text)) {
+        /* the record of video frames (virtio-gpu-remote-record.c) */
     } else {
         fprintf(stderr, "[SPACEBOX-REMOTE] sink control: unknown command\n");
     }

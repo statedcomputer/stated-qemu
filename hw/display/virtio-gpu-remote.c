@@ -3214,6 +3214,14 @@ void sp_sink_send(uint32_t type, const void *a, size_t a_len,
  * Told to end (the control file): the source makes its planned switch while
  * this sink still answers, and says SP_BYE when it has what it needs.
  */
+void sp_video_pending_log(const char *at)
+{
+    if (sp.mode == SP_REMOTE_SINK) {
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink video pictures pending at %s: %u\n",
+                at, virgl_renderer_video_pending());
+    }
+}
+
 void sp_sink_detach(void)
 {
     if (!sp.peer_session) {
@@ -3221,6 +3229,7 @@ void sp_sink_detach(void)
         return;
     }
     sp_send(SP_DETACH, 0, NULL, 0, NULL, 0, 0, 0, 0);
+    sp_video_pending_log("the detach");
     fprintf(stderr, "[SPACEBOX-REMOTE] sink detach: SP_DETACH sent, running until "
             "the source says bye\n");
 }
@@ -3248,6 +3257,7 @@ void sp_sink_gpu(bool on)
                 "asked\n", on ? "on" : "off");
         return;
     }
+    sp_video_pending_log(on ? "the toggle on" : "the toggle off");
     sp_gpu.off = !on;
     sp_gpu.used = true;
     sp_gpu.refused = false;
@@ -3501,6 +3511,7 @@ static void sp_disconnected(void)
     if (fd < 0) {
         return;
     }
+    sp_video_pending_log("the connection's end");
     sp_rx_stop();
     qemu_mutex_lock(&sp.tx_lock);
     sp.fd = -1;
@@ -3552,6 +3563,7 @@ static void sp_hello(SpHdr *h)
         return;
     }
     if (sp.mode == SP_REMOTE_SINK) {
+        sp_video_pending_log("a source's hello");
         sp_sink_pace_reset();
     }
     qemu_mutex_lock(&sp.tx_lock);

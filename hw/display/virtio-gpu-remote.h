@@ -77,6 +77,9 @@ void sp_sink_send_once(uint32_t type, const void *a, size_t a_len,
                        uint64_t arg0, uint64_t arg1, uint64_t arg2);
 size_t sp_sink_backlog(void);
 void sp_sink_gpu(bool on);
+/* the sink's log: the video pictures that a decoder's thread has not yet
+ * handed over, at a transition (at: what happens) */
+void sp_video_pending_log(const char *at);
 
 /* virtio-gpu-remote-record.c: the record of video frames */
 void sp_record_realize(void);

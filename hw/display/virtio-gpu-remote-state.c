@@ -2240,6 +2240,7 @@ static void sp_state_reset(VirtIOGPU *g, uint64_t n)
     int64_t t0 = g_get_monotonic_time();
     GList *l;
 
+    sp_video_pending_log("the state's reset");
     /* contexts first: their sub-contexts, objects and attachments go with them */
     for (l = ctxs; l; l = l->next) {
         virgl_renderer_context_destroy(GPOINTER_TO_UINT(l->data));
@@ -2491,6 +2492,8 @@ static void sp_state_export(VirtIOGPU *g, SpOp *op)
     unsigned asked = 0, done = 0, i;
     int64_t t0 = g_get_monotonic_time();
     uint64_t req = op->arg0;
+
+    sp_video_pending_log("the export");
     size_t k;
 
     if (sps.export_stall_ms) {

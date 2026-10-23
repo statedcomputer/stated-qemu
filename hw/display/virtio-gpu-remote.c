@@ -255,10 +255,20 @@ static int64_t sp_aud_delay_us; /* sink: how much later sound is played, 0 = sil
  * clock" seen recently is the delay of an undisturbed message; a frame is
  * shown at "source clock + that + allowance", which restores the guest's
  * spacing for every frame that is late by less than the allowance. The
- * allowance follows how late recent screen updates were (95th percentile,
- * capped) and costs that much latency, so by default it is used only while
- * the guest decodes video. SPACEBOX_PRESENT_JITTER=off|video|always,
- * SPACEBOX_PRESENT_JITTER_MAX_MS (default 50).
+ * allowance follows how late the screen updates of the last 10 s were (the
+ * latest of them, capped; when video starts after none for a second, it
+ * goes to the cap and comes down from there; how it rises is below) and
+ * costs that much latency,
+ * so by default it is used only while the guest decodes video. (It followed
+ * the 95th percentile of the last 128 updates, about 2 s: a burst of late
+ * updates after a calm stretch was a stall, and so was the percentile's rise
+ * a few frames after it.) SPACEBOX_PRESENT_JITTER=off|video|always,
+ * SPACEBOX_PRESENT_JITTER_MAX_MS (default 250: below the limit of 12 frames
+ * that the presenter keeps, 200 ms at 60/s). The video task's turn G3a
+ * measured the link adding 150 to 200 ms to the screen updates in the first
+ * seconds of a 2160p60 play (Chromium decodes ahead in a burst), each one a
+ * stall of 108 to 150 ms with the earlier cap of 50 ms; a picture shown that
+ * much later is the price of showing it without a stall.
  *
  * The guest's own spacing is not even either: a 60 Hz video on its 120 Hz
  * desktop comes out as updates 1, 2 or 3 refreshes apart. While pacing, the
@@ -287,8 +297,9 @@ int64_t spacebox_scroll_answer_us;
 static struct {
     int mode;           /* 0 off, 1 video, 2 always; -1 not read yet */
     int64_t max_us;
-    int64_t late[128];  /* lateness of recent screen updates */
-    unsigned n, pos;
+    int64_t late_max[10];   /* the latest update of each of the last 10 s */
+    int64_t late_sec[10];   /* ... and that second (of the read time) */
+    int64_t video_last;     /* the read time of the last update with video */
     int64_t allowance;
     int64_t input_us;
     uint64_t paced, late_frames, frames, unpaced_for_input;
@@ -310,14 +321,15 @@ static void sp_sink_pace_frame(const SpHdr *h)
     /* the lateness is the network's: from the message's read off the socket */
     int64_t now = g_get_monotonic_time(), read = sp_rx_now ? sp_rx_now : now;
     int64_t base = MIN(sp_rx_min, sp_rx_min_prev);
-    int64_t late, target, sorted[G_N_ELEMENTS(sp_pace.late)];
+    int64_t late, target, sec, gap, cap, sorted[G_N_ELEMENTS(sp_pace.gap)];
+    bool starting;
 
     if (sp_pace.mode < 0) {
         const char *m = getenv("SPACEBOX_PRESENT_JITTER");
         const char *x = getenv("SPACEBOX_PRESENT_JITTER_MAX_MS");
 
         sp_pace.mode = !m || !strcmp(m, "video") ? 1 : !strcmp(m, "always") ? 2 : 0;
-        sp_pace.max_us = (x ? MAX(atoi(x), 0) : 50) * 1000;
+        sp_pace.max_us = (x ? MAX(atoi(x), 0) : 250) * 1000;
     }
     spacebox_frame_due_us = 0;
     spacebox_frame_gap_us = 0;
@@ -334,16 +346,26 @@ static void sp_sink_pace_frame(const SpHdr *h)
     }
     sp_pace.last_t_us = h->t_us;
     late = MAX(read - h->t_us - base, 0);
-    sp_pace.late[sp_pace.pos] = late;
-    sp_pace.pos = (sp_pace.pos + 1) % G_N_ELEMENTS(sp_pace.late);
-    sp_pace.n = MIN(sp_pace.n + 1, G_N_ELEMENTS(sp_pace.late));
+    sec = read / G_USEC_PER_SEC;
+    if (sp_pace.late_sec[sec % 10] != sec) {
+        sp_pace.late_sec[sec % 10] = sec;
+        sp_pace.late_max[sec % 10] = 0;
+    }
+    sp_pace.late_max[sec % 10] = MAX(sp_pace.late_max[sec % 10], late);
     sp_pace.frames++;
 
-    if (sp_pace.mode == 0 || (sp_pace.mode == 1 && !(h->flags & SP_F_VIDEO))) {
+    /* an update without the video flag within a second of video is paced
+     * still: the flag follows the guest's decoding, which comes in batches */
+    starting = !sp_pace.video_last || read - sp_pace.video_last > G_USEC_PER_SEC;
+    if (sp_pace.mode == 0 ||
+        (sp_pace.mode == 1 && !(h->flags & SP_F_VIDEO) && starting)) {
         sp_pace.allowance = 0;
         return;
     }
     if (sp_pace.input_us < 0) {
+    if (sp_pace.mode == 2 || (h->flags & SP_F_VIDEO)) {
+        sp_pace.video_last = read;
+    }
         const char *i = getenv("SPACEBOX_PRESENT_INPUT_MS");
 
         sp_pace.input_us = (i ? MAX(atoi(i), 0) : 1500) * 1000;
@@ -353,9 +375,13 @@ static void sp_sink_pace_frame(const SpHdr *h)
         sp_pace.unpaced_for_input++;
         return; /* the allowance is kept, so pacing picks up where it was */
     }
-    memcpy(sorted, sp_pace.late, sp_pace.n * sizeof(sorted[0]));
-    qsort(sorted, sp_pace.n, sizeof(sorted[0]), sp_cmp_i64);
-    target = MIN(sorted[sp_pace.n * 95 / 100], sp_pace.max_us);
+    target = 0;
+    for (int i = 0; i < 10; i++) {
+        if (sec - sp_pace.late_sec[i] < 10) {
+            target = MAX(target, sp_pace.late_max[i]);
+        }
+    }
+    target = MIN(starting ? sp_pace.max_us : target, sp_pace.max_us);
     if (sp_aud_delay_us) {
         /*
          * Sound is played later by its buffer; keep the picture with it. On top
@@ -376,11 +402,25 @@ static void sp_sink_pace_frame(const SpHdr *h)
         target = MAX(target, sp_aud_delay_us + av_offset);
     }
     /* The presenter keeps the waiting frames as textures (SP_SLOTS in
-     * ui/spacebox-presenter.h is 16); do not ask it to keep more than 12, nor
-     * to wait longer than a quarter of a second. */
-    target = MIN(target, MIN(MAX(12 * sp_pace.usual_gap, 40000), 250000));
+     * ui/spacebox-presenter.h is 16); do not ask it to keep more than 12 (of
+     * 60/s while the spacing is not known yet), nor to wait longer than a
+     * quarter of a second. */
+    gap = sp_pace.usual_gap ? sp_pace.usual_gap : 16667;
+    cap = MIN(MAX(12 * gap, 40000), 250000);
+    target = MIN(target, cap);
+    /*
+     * A rise of the allowance moves every later frame by as much: a gap on
+     * the screen. An update later than the allowance makes that gap anyway,
+     * so the allowance takes its lateness at once; any other rise (video
+     * starting, the lateness of other updates) is spread over the frames, a
+     * third of their spacing each, which keeps each interval under the
+     * judder bound of 1.5 times the spacing.
+     */
+    if (late > sp_pace.allowance) {
+        sp_pace.allowance = MIN(late, cap);
+    }
     if (target > sp_pace.allowance) {
-        sp_pace.allowance = target;
+        sp_pace.allowance += MIN(target - sp_pace.allowance, gap / 3);
     } else {
         sp_pace.allowance -= (sp_pace.allowance - target) / 64;
     }
@@ -408,7 +448,9 @@ static void sp_sink_pace_frame(const SpHdr *h)
  */
 static void sp_sink_pace_reset(void)
 {
-    sp_pace.n = sp_pace.pos = 0;
+    memset(sp_pace.late_max, 0, sizeof(sp_pace.late_max));
+    memset(sp_pace.late_sec, 0, sizeof(sp_pace.late_sec));
+    sp_pace.video_last = 0;
     sp_pace.allowance = 0;
     sp_pace.usual_gap = 0;
     sp_pace.gap_n = sp_pace.gap_pos = 0;

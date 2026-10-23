@@ -33,7 +33,9 @@
  *                                           the sink's main loop held, before it
  *                                           runs: a renderer that stalls), "gpu
  *                                           off", "gpu on" (the user's toggle, as
- *                                           its hotkey Ctrl+Alt+A); the record
+ *                                           its hotkey Ctrl+Alt+A), "hold-log
+ *                                           on|off" (a line for each write in
+ *                                           pieces, virtio-gpu-remote.c); the record
  *                                           of video frames' "video-rect",
  *                                           "video-size", "pause-present",
  *                                           "record-start", "record-stop"
@@ -2652,6 +2654,9 @@ static void sp_control_tick(void *opaque)
     } else if (!strcmp(text, "gpu off") || !strcmp(text, "gpu on")) {
         /* the user's toggle, as the hotkey (virtio-gpu-remote.c) */
         sp_sink_gpu(!strcmp(text, "gpu on"));
+    } else if (!strcmp(text, "hold-log on") || !strcmp(text, "hold-log off")) {
+        /* a line for each write in pieces (virtio-gpu-remote.c) */
+        sp_sink_hold_log(!strcmp(text, "hold-log on"));
     } else if (!strncmp(text, "stall-export ", 13)) {
         sps.export_stall_ms = MIN(strtoul(text + 13, NULL, 10), 60000);
         fprintf(stderr, "[SPACEBOX-REMOTE] sink control: the next export "

@@ -55,8 +55,6 @@
  *                                           virtio-gpu-remote-state.c.
  * SPACEBOX_VIDEO_RECORD=<file>              sink: the record of video frames
  *                                           (virtio-gpu-remote-record.c).
- * SPACEBOX_GPU_REMOTE_HOLD_LOG=1            sink: a line for each write in pieces
- *                                           (see "Large writes in pieces").
  * SPACEBOX_STREAM_SCALE=2                   sink inside the guest: the pictures of
  *                                           the user's toggle at half the scanout's
  *                                           size (virtio-gpu-remote-picture.c).
@@ -1394,16 +1392,21 @@ static struct {
     unsigned n;
     SpRxMsg *grp, *grp_tail;    /* the command being put together */
     SpRxMsg *notice;            /* its SP_HOLD with no pieces */
-    SpWait *cur;                /* the write whose pieces come */
-    unsigned incomplete;        /* writes not complete */
+    unsigned incomplete;        /* writes not complete (their notices come ahead of
+                                   their pieces, which come one write after the other) */
     bool running;               /* a waiting command runs: a stream's rest goes */
     SpWait *at;                 /* ... before this one (NULL: at the end) */
-    int log;                    /* SPACEBOX_GPU_REMOTE_HOLD_LOG; -1 = not read */
+    bool log;                   /* a line for each write (the control's "hold-log on") */
     struct {
         uint64_t notices, writes, bytes, waited, passed, flushes, split, dropped;
         int64_t write_max;
     } st;                       /* statistics, 5 s */
-} sph = { .q = QTAILQ_HEAD_INITIALIZER(sph.q), .log = -1 };
+} sph = { .q = QTAILQ_HEAD_INITIALIZER(sph.q) };
+
+void sp_sink_hold_log(bool on)
+{
+    sph.log = on;
+}
 
 static void sp_msg_append(SpRxMsg **head, SpRxMsg **tail, SpRxMsg *m)
 {
@@ -1664,7 +1667,6 @@ static void sp_hold_drop(const char *why)
         sp_wait_free(e);
     }
     sph.n = 0;
-    sph.cur = NULL;
     sph.incomplete = 0;
     sp_rx_free(sph.grp);
     sph.grp = sph.grp_tail = NULL;
@@ -1759,11 +1761,7 @@ static void sp_hold_write(const SpHdr *h, const uint8_t *a)
         e->touch = sp_notice_touches(h, a);
     }
     e->t_notice = sp_rx_now;
-    if (sph.log < 0) {
-        sph.log = getenv("SPACEBOX_GPU_REMOTE_HOLD_LOG") != NULL;
-    }
     sp_wait_add(e);
-    sph.cur = e;
     sph.incomplete++;
     sph.st.notices++;
 }
@@ -1772,15 +1770,18 @@ static void sp_hold_write(const SpHdr *h, const uint8_t *a)
  * command, which may run */
 static void sp_hold_piece(const SpHdr *h, const uint8_t *a)
 {
-    SpWait *e = sph.cur;
+    SpWait *e;
     size_t off = 0;
 
-    if (!e || h->arg0 != e->w || h->arg1 != e->wbuf->len ||
-        e->wbuf->len + h->a_len > e->wlen) {
+    QTAILQ_FOREACH(e, &sph.q, next) {
+        if (e->w && e->w == h->arg0) {
+            break;
+        }
+    }
+    if (!e || h->arg1 != e->wbuf->len || e->wbuf->len + h->a_len > e->wlen) {
         error_report("spacebox remote gpu: a piece of write %" PRIu64 " at %" PRIu64
-                     " does not follow (the write that comes: %" PRIu64 " at %u)",
-                     (uint64_t)h->arg0, (uint64_t)h->arg1, e ? e->w : 0,
-                     e ? e->wbuf->len : 0);
+                     " does not follow (%s)", (uint64_t)h->arg0, (uint64_t)h->arg1,
+                     e ? "not where its write is" : "no such write waits");
         return;
     }
     g_byte_array_append(e->wbuf, a, h->a_len);
@@ -1815,7 +1816,6 @@ static void sp_hold_piece(const SpHdr *h, const uint8_t *a)
     e->wbuf = NULL;
     e->w = 0;
     e->t_done = sp_rx_now;
-    sph.cur = NULL;
     sph.incomplete--;
     sph.st.writes++;
     sph.st.bytes += e->wlen;

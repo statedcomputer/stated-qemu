@@ -122,5 +122,7 @@ void sp_state_ctrl_seen(void);
  * renderer stopped it before a command that touches what waiting commands
  * hold: its rest waits, and the command is done with no answer */
 bool sp_sink_submit_held(struct virtio_gpu_ctrl_command *cmd);
+/* the control's "hold-log on|off": a line for each write in pieces when it runs */
+void sp_sink_hold_log(bool on);
 
 #endif

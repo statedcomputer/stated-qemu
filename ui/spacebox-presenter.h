@@ -11,8 +11,9 @@
 #include "ui/spacebox-video-record.h"
 #include "spacebox-frame-code.h"
 /* Frames kept ahead of the one on screen. Without pacing only a few are ever
- * in use (their textures are made on first use); with pacing up to about 12. */
-#define SP_SLOTS 16
+ * in use (their textures are made on first use); with pacing up to 24
+ * (hw/display/virtio-gpu-remote.c, sp_sink_pace_frame). */
+#define SP_SLOTS 32
 /* hw/display/virtio-gpu-remote.c: when to show the frame being submitted, 0 = at once */
 extern int64_t spacebox_frame_due_us;
 extern int64_t spacebox_frame_gap_us;

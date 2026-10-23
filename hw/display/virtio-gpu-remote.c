@@ -264,12 +264,15 @@ static int64_t sp_aud_delay_us; /* sink: how much later sound is played, 0 = sil
  * the 95th percentile of the last 128 updates, about 2 s: a burst of late
  * updates after a calm stretch was a stall, and so was the percentile's rise
  * a few frames after it.) SPACEBOX_PRESENT_JITTER=off|video|always,
- * SPACEBOX_PRESENT_JITTER_MAX_MS (default 250: below the limit of 12 frames
- * that the presenter keeps, 200 ms at 60/s). The video task's turn G3a
- * measured the link adding 150 to 200 ms to the screen updates in the first
- * seconds of a 2160p60 play (Chromium decodes ahead in a burst), each one a
- * stall of 108 to 150 ms with the earlier cap of 50 ms; a picture shown that
- * much later is the price of showing it without a stall.
+ * SPACEBOX_PRESENT_JITTER_MAX_MS (default 350; the presenter keeps at most 24
+ * frames, 400 ms at 60/s). The video task's turn G3a measured the link
+ * holding the guest's screen updates behind one large picture's bitstream:
+ * a 3.8 MB picture of a 2160p30 clip (a cut) takes about 330 ms on a link of
+ * 11.5 MB/s, and 1 to 2.4 MB pictures (a 2160p60 play's start, where Chromium
+ * decodes ahead) 90 to 210 ms; each was a stall with the earlier cap of 50 ms.
+ * A picture shown that much later is the price of showing it without a stall
+ * (with sound, the picture is then that much less the sound's delay behind
+ * the sound).
  *
  * The guest's own spacing is not even either: a 60 Hz video on its 120 Hz
  * desktop comes out as updates 1, 2 or 3 refreshes apart. While pacing, the
@@ -330,7 +333,7 @@ static void sp_sink_pace_frame(const SpHdr *h)
         const char *x = getenv("SPACEBOX_PRESENT_JITTER_MAX_MS");
 
         sp_pace.mode = !m || !strcmp(m, "video") ? 1 : !strcmp(m, "always") ? 2 : 0;
-        sp_pace.max_us = (x ? MAX(atoi(x), 0) : 250) * 1000;
+        sp_pace.max_us = (x ? MAX(atoi(x), 0) : 350) * 1000;
     }
     spacebox_frame_due_us = 0;
     spacebox_frame_gap_us = 0;
@@ -403,11 +406,10 @@ static void sp_sink_pace_frame(const SpHdr *h)
         target = MAX(target, sp_aud_delay_us + av_offset);
     }
     /* The presenter keeps the waiting frames as textures (SP_SLOTS in
-     * ui/spacebox-presenter.h is 16); do not ask it to keep more than 12 (of
-     * 60/s while the spacing is not known yet), nor to wait longer than a
-     * quarter of a second. */
+     * ui/spacebox-presenter.h is 32); do not ask it to keep more than 24 (of
+     * 60/s while the spacing is not known yet). */
     gap = sp_pace.usual_gap ? sp_pace.usual_gap : 16667;
-    cap = MIN(MAX(12 * gap, 40000), 250000);
+    cap = MIN(MAX(24 * gap, 40000), MAX(sp_pace.max_us, 40000));
     target = MIN(target, cap);
     /*
      * A rise of the allowance moves every later frame by as much: a gap on

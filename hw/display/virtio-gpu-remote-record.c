@@ -11,7 +11,8 @@
  *
  * JSON lines, one each (screen/README.md of the spacebox repository, "The
  * sink's record of video frames"):
- *   swap  each swap of the Mac's presenter (ui/spacebox-presenter.h): its time,
+ *   swap  each swap of the Mac's presenter (ui/spacebox-presenter.h): its
+ *         return, the refresh it is shown at (from the display link's times),
  *         the frame code read in the picture swapped, the tickets of the video
  *         pictures it shows, the frames the presenter dropped since the last
  *         swap
@@ -19,11 +20,13 @@
  *         the guest decoded itself into a texture of the video's size
  *         (video-size); its stage times: the source's time of the command
  *         that decoded or uploaded it (mapped to this clock as the lateness
- *         of the messages is), when this sink read that command, the
- *         decoder's start and end, the hand-over into its textures, the first
- *         draw that read it, the first swap that showed it. Written at that
- *         swap, or 10 s after the picture with no swap.
- *   ctl   the record's start and stop, the controls, the test pause
+ *         of the messages is), when this sink's reader read that command off
+ *         the link and when its main loop ran it, the decoder's start and
+ *         end, the hand-over into its textures, the first draw that read it,
+ *         the first swap that showed it. Written at that swap, or 10 s after
+ *         the picture with no swap.
+ *   ctl   the record's start (with the sink's build, sp_rec_build()) and
+ *         stop, the controls, the test pause
  * Every time is CLOCK_MONOTONIC in microseconds (this clock is
  * g_get_monotonic_time(), which on macOS does not count sleep: the
  * difference is taken at the record's start).
@@ -58,6 +61,10 @@
 #include "virtio-gpu-remote.h"
 
 #include <virglrenderer.h>
+
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 
 /* a picture whose ticket no swap showed this long after it is written alone */
 #define SP_REC_UNSHOWN_US (10 * G_USEC_PER_SEC)
@@ -166,6 +173,7 @@ static void sp_rec_pic_line(SpRecPic *p, int64_t t_swap)
                            p->ticket, p->fmt, p->w, p->h);
     sp_rec_time(s, "t_dev", p->t_dev);
     sp_rec_time(s, "t_rx", p->t_rx);
+    sp_rec_time(s, "t_read", p->t_read);
     sp_rec_mtime(s, "t_dec0", p->t_dec0);
     sp_rec_mtime(s, "t_dec1", p->t_dec1);
     sp_rec_mtime(s, "t_tex", p->t_tex);
@@ -173,7 +181,6 @@ static void sp_rec_pic_line(SpRecPic *p, int64_t t_swap)
     sp_rec_time(s, "t_swap", t_swap);
     g_string_append_c(s, '}');
     sp_rec_put(s);
-    sp_rec_time(s, "t_read", p->t_read);
     rec.n_pics++;
     if (!t_swap) {
         rec.unshown++;
@@ -201,6 +208,7 @@ static void sp_rec_picture(void *opaque, uint64_t ticket, uint32_t codec,
     p->codec = codec;
     p->fmt = fmt;
     p->t_dev = rec.cmd_dev;
+    p->t_read = rec.cmd_read;
     p->t_rx = rec.cmd_rx;
     p->made = t0;
     qemu_mutex_lock(&rec.lock);
@@ -208,7 +216,6 @@ static void sp_rec_picture(void *opaque, uint64_t ticket, uint32_t codec,
     qemu_mutex_unlock(&rec.lock);
     rec.main_us += g_get_monotonic_time() - t0;
 }
-    p->t_read = rec.cmd_read;
 
 static void sp_rec_decoded(void *opaque, uint64_t ticket, uint32_t width,
                            uint32_t height, int64_t t_dec0, int64_t t_dec1,
@@ -255,6 +262,7 @@ static const struct virgl_renderer_video_record sp_rec_cbs = {
 void sp_record_cmd(struct virtio_gpu_ctrl_command *cmd)
 {
     rec.cmd_dev = cmd->sp_t_dev;
+    rec.cmd_read = cmd->sp_t_read;
     rec.cmd_rx = cmd->sp_t_rx;
 }
 
@@ -262,7 +270,6 @@ void sp_record_flush(uint32_t resource_id, bool begin)
 {
     if (!begin) {
         spacebox_frame_ntickets = 0;
-    rec.cmd_read = cmd->sp_t_read;
     } else if (spacebox_video_record_on) {
         int64_t t0 = g_get_monotonic_time();
 
@@ -304,7 +311,9 @@ static void sp_rec_tick(void *opaque)
 /* the presenter's thread */
 void spacebox_video_record_swap(uint64_t seq, int64_t t_swap, int code,
                                 bool code_ok, const uint64_t *tickets,
-                                unsigned n, uint64_t coalesced, int64_t read_us)
+                                unsigned n, uint64_t coalesced, int64_t read_us,
+                                int64_t t_show, int64_t t_call, int64_t t_vsync,
+                                int64_t t_out)
 {
     GString *s;
 
@@ -325,7 +334,12 @@ void spacebox_video_record_swap(uint64_t seq, int64_t t_swap, int code,
     for (unsigned i = 0; i < n; i++) {
         g_string_append_printf(s, "%s%" PRIu64, i ? "," : "", tickets[i]);
     }
-    g_string_append_printf(s, "],\"coalesced\":%" PRIu64 "}", coalesced);
+    g_string_append_printf(s, "],\"coalesced\":%" PRIu64, coalesced);
+    sp_rec_time(s, "t_show_us", t_show);
+    sp_rec_time(s, "t_call_us", t_call);
+    sp_rec_time(s, "t_vsync_us", t_vsync);
+    sp_rec_time(s, "t_out_us", t_out);
+    g_string_append_c(s, '}');
     sp_rec_put(s);
     for (unsigned i = 0; i < n; i++) {
         SpRecPic *p = g_hash_table_lookup(rec.pics, &tickets[i]);
@@ -419,9 +433,45 @@ static void sp_rec_stop(void)
     rec.path = NULL;
 }
 
+/*
+ * The sink's build, which the record names so that a calibration of its
+ * refresh times can be matched to it: SPACEBOX_SINK_BUILD, else the folder of
+ * the build that holds this program (BUILD/qemu-build/qemu-system-aarch64, as
+ * screen/mac/sink.sh starts it). NULL when neither is known.
+ */
+static char *sp_rec_build(void)
+{
+    const char *b = getenv("SPACEBOX_SINK_BUILD");
+    g_autofree char *exe = NULL, *dir = NULL, *name = NULL, *real = NULL;
+
+    if (b && *b) {
+        return g_strdup(b);
+    }
+#ifdef __APPLE__
+    {
+        char buf[4096];
+        uint32_t size = sizeof(buf);
+
+        if (_NSGetExecutablePath(buf, &size) == 0) {
+            exe = g_strdup(buf);
+        }
+    }
+#else
+    exe = g_file_read_link("/proc/self/exe", NULL);
+#endif
+    if (!exe) {
+        return NULL;
+    }
+    real = realpath(exe, NULL);
+    dir = g_path_get_dirname(real ? real : exe);
+    name = g_path_get_basename(dir);
+    return strcmp(name, "qemu-build") ? NULL : g_path_get_dirname(dir);
+}
+
 static void sp_rec_start(const char *path)
 {
     g_autofree char *more = NULL, *rect = NULL, *size = NULL, *qpath = NULL;
+    g_autofree char *build = NULL, *b = sp_rec_build();
     FILE *f;
 
     if (spacebox_video_record_on) {
@@ -443,9 +493,14 @@ static void sp_rec_start(const char *path)
     rect = sp_rec_rect_json();
     size = sp_rec_size_json();
     qpath = g_strescape(path, NULL);
+    if (b) {
+        g_autofree char *qb = g_strescape(b, NULL);
+
+        build = g_strdup_printf(",\"sink_build\":\"%s\"", qb);
+    }
     more = g_strdup_printf(",\"path\":\"%s\",\"clock\":\"CLOCK_MONOTONIC\","
-                           "\"video_rect\":%s,\"video_size\":%s,\"version\":1",
-                           qpath, rect, size);
+                           "\"video_rect\":%s,\"video_size\":%s,\"version\":1%s",
+                           qpath, rect, size, build ? build : "");
     sp_rec_ctl("record-start", more);
     qemu_mutex_lock(&rec.lock);
     spacebox_video_record_on = true;

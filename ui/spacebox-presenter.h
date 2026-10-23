@@ -4,6 +4,7 @@
 #ifdef CONFIG_DARWIN
 #include <CoreVideo/CoreVideo.h>
 #include <CoreGraphics/CoreGraphics.h>
+#include <mach/mach_time.h>
 #include <pthread/qos.h>
 #include "qemu/thread.h"
 #include "qemu/atomic.h"
@@ -37,8 +38,13 @@ typedef struct SpPresenter {
     QemuMutex lock;
     QemuCond wake;
     CVDisplayLinkRef link;
+    CGDirectDisplayID display;  /* the display the link follows: the window's */
+    int64_t display_checked;
     bool stop;
     uint64_t tick, sequence, presented, discarded, busy;
+    /* the last tick of the display link (host time, mach_absolute_time):
+     * the refresh it came at and the refresh it prepares for */
+    uint64_t tick_now_host, tick_out_host;
     SpSlot slots[SP_SLOTS];
 } SpPresenter;
 
@@ -49,9 +55,88 @@ static CVReturn sp_present_tick(CVDisplayLinkRef link, const CVTimeStamp *now,
     SpPresenter *p = opaque;
     qemu_mutex_lock(&p->lock);
     p->tick++;
+    p->tick_now_host = now->hostTime;
+    p->tick_out_host = out->hostTime;
     qemu_cond_signal(&p->wake);
     qemu_mutex_unlock(&p->lock);
     return kCVReturnSuccess;
+}
+
+/*
+ * The record of video frames: at which refresh of the display a swap is shown
+ * (t_show_us), from the display link's own times of the window's display. The
+ * link's tick before the swap gives the refresh it came at (vsync) and the
+ * one that what is made now will be shown at (out); a swap that starts k
+ * refreshes after that vsync is shown k refreshes after out. Its accuracy is
+ * measured against a capture of the screen (screen/README.md, "The refresh
+ * time of a swap"). 0 when the link has not ticked.
+ */
+static int64_t sp_present_host_us(uint64_t host)
+{
+    static mach_timebase_info_data_t tb;
+    static int64_t off;     /* g_get_monotonic_time() - the host time in us */
+    static int64_t off_at;
+    int64_t now = g_get_monotonic_time();
+
+    if (!tb.denom) {
+        mach_timebase_info(&tb);
+    }
+    if (!off_at || now - off_at > G_USEC_PER_SEC) {
+        /* both clocks read at once; again each second (one may count sleep) */
+        off = now - (int64_t)(mach_absolute_time() * tb.numer / tb.denom / 1000);
+        off_at = now;
+    }
+    return (int64_t)(host * tb.numer / tb.denom / 1000) + off;
+}
+
+static int64_t sp_present_show_time(uint64_t now_host, uint64_t out_host,
+                                    int64_t call, int64_t refresh_us,
+                                    int64_t *vsync, int64_t *out)
+{
+    int64_t k;
+
+    if (!now_host || !out_host || refresh_us <= 0) {
+        *vsync = *out = 0;
+        return 0;
+    }
+    *vsync = sp_present_host_us(now_host);
+    *out = sp_present_host_us(out_host);
+    k = call > *vsync ? (call - *vsync) / refresh_us : 0;
+    return *out + k * refresh_us;
+}
+
+/* The display link follows the display that shows the window (checked every
+ * two seconds, on the thread that submits frames, which may call SDL). */
+static void sp_present_follow_window(SpPresenter *p)
+{
+    int64_t now = g_get_monotonic_time();
+    int index = SDL_GetWindowDisplayIndex(p->window);
+    SDL_Rect b;
+    CGDirectDisplayID ids[16];
+    uint32_t n = 0;
+
+    if (now - p->display_checked < 2 * G_USEC_PER_SEC) {
+        return;
+    }
+    p->display_checked = now;
+    if (index < 0 || SDL_GetDisplayBounds(index, &b) ||
+        CGGetActiveDisplayList(16, ids, &n) != kCGErrorSuccess) {
+        return;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        CGRect r = CGDisplayBounds(ids[i]);
+
+        if ((int)r.origin.x == b.x && (int)r.origin.y == b.y &&
+            (int)r.size.width == b.w && (int)r.size.height == b.h) {
+            if (ids[i] != p->display &&
+                CVDisplayLinkSetCurrentCGDisplay(p->link, ids[i]) == kCVReturnSuccess) {
+                fprintf(stderr, "[SPACEBOX-PRESENT] the window is on display %u: "
+                        "the display link follows it\n", ids[i]);
+                p->display = ids[i];
+            }
+            return;
+        }
+    }
 }
 
 static bool sp_fence_done(GLsync fence)
@@ -254,8 +339,20 @@ static void *sp_present_thread(void *opaque)
             glBindFramebuffer(GL_READ_FRAMEBUFFER, readfb);
             glReadPixels(s->fb.width / 2, s->fb.height / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, probe_px);
         }
+        int64_t swap_call = g_get_monotonic_time(), vsync_us = 0, out_us = 0, show_us = 0;
+        uint64_t now_host = 0, out_host = 0;
+        if (recording) {
+            qemu_mutex_lock(&p->lock);
+            now_host = p->tick_now_host;
+            out_host = p->tick_out_host;
+            qemu_mutex_unlock(&p->lock);
+        }
         spacebox_swap(p->window, s->fb.width, s->fb.height);
         int64_t swapped = g_get_monotonic_time();
+        if (recording) {
+            show_us = sp_present_show_time(now_host, out_host, swap_call, refresh_us,
+                                           &vsync_us, &out_us);
+        }
         if (probe) {
             fprintf(probe, "%lld %u %u %u\n", (long long)g_get_monotonic_time(), probe_px[0], probe_px[1], probe_px[2]);
         }
@@ -311,7 +408,8 @@ static void *sp_present_thread(void *opaque)
         qemu_mutex_unlock(&p->lock);
         if (recording) {
             spacebox_video_record_swap(presented, swapped, code, code_ok, s->tickets,
-                                       s->ntickets, coalesced, code_us);
+                                       s->ntickets, coalesced, code_us, show_us,
+                                       swap_call, vsync_us, out_us);
         }
         int pause_ms = qatomic_xchg(&spacebox_present_pause_ms, 0);
         if (pause_ms) {
@@ -357,6 +455,8 @@ void sdl2_gl_present_init(struct sdl2_console *scon)
         return;
     }
     scon->presenter = p;
+    p->display = CGMainDisplayID();
+    sp_present_follow_window(p);
     CVDisplayLinkSetOutputCallback(p->link, sp_present_tick, p);
     qemu_thread_create(&p->thread, "sp-present", sp_present_thread, p, QEMU_THREAD_JOINABLE);
     CVDisplayLinkStart(p->link);
@@ -397,6 +497,7 @@ static void sp_present_submit(struct sdl2_console *scon, SpSlot *s, int src_w, i
     SpPresenter *p = scon->presenter;
     GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     glFlush();
+    sp_present_follow_window(p);
     s->ntickets = MIN(spacebox_frame_ntickets, SP_REC_TICKETS);
     memcpy(s->tickets, spacebox_frame_tickets, s->ntickets * sizeof(s->tickets[0]));
     spacebox_frame_ntickets = 0;

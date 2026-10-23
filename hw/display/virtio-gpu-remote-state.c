@@ -2593,6 +2593,11 @@ bool sp_sink_before_cmd(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
         if (wm) {
             g_byte_array_unref(wm);
         }
+        if (sp_sink_submit_held(cmd)) {
+            /* the renderer stopped its command stream: the rest waits and answers */
+            cmd->finished = true;
+            return true;
+        }
         return false;
     }
     cmd->sp_op = NULL;

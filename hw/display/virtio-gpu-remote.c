@@ -68,6 +68,7 @@
 #include "qemu/thread.h"
 #include "qemu/timer.h"
 #include "qemu/sockets.h"
+#include "qemu/event_notifier.h"
 #include "hw/virtio/virtio.h"
 #include "hw/virtio/virtio-gpu.h"
 #include "ui/console.h"
@@ -212,11 +213,15 @@ static struct SpDelayStat {
     int64_t max;
 } sp_txd, sp_rxd;
 static int64_t sp_rx_min = INT64_MAX, sp_rx_min_prev = INT64_MAX, sp_rx_min_t0;
-static int64_t sp_rx_now;   /* when sp_rx() read the messages it handles */
+/* the message that the main loop handles: when the link's reader read it off
+ * the socket (sp_rx_thread), and when the main loop took it */
+static int64_t sp_rx_now, sp_rx_run;
+/* statistics: from the reader's read of a message to the main loop's */
+static struct SpDelayStat sp_rxq;
 
-static void sp_rx_delay(int64_t t_us)
+/* the lateness of a message read at now (its read time) */
+static void sp_rx_delay(int64_t t_us, int64_t now)
 {
-    int64_t now = g_get_monotonic_time();
     int64_t d = now - t_us, base;
 
     if (!t_us) {
@@ -302,7 +307,8 @@ static int sp_cmp_i64(const void *a, const void *b)
 
 static void sp_sink_pace_frame(const SpHdr *h)
 {
-    int64_t now = g_get_monotonic_time();
+    /* the lateness is the network's: from the message's read off the socket */
+    int64_t now = g_get_monotonic_time(), read = sp_rx_now ? sp_rx_now : now;
     int64_t base = MIN(sp_rx_min, sp_rx_min_prev);
     int64_t late, target, sorted[G_N_ELEMENTS(sp_pace.late)];
 
@@ -327,7 +333,7 @@ static void sp_sink_pace_frame(const SpHdr *h)
         sp_pace.gap_n = sp_pace.gap_pos = 0; /* a pause: not a steady stream */
     }
     sp_pace.last_t_us = h->t_us;
-    late = MAX(now - h->t_us - base, 0);
+    late = MAX(read - h->t_us - base, 0);
     sp_pace.late[sp_pace.pos] = late;
     sp_pace.pos = (sp_pace.pos + 1) % G_N_ELEMENTS(sp_pace.late);
     sp_pace.n = MIN(sp_pace.n + 1, G_N_ELEMENTS(sp_pace.late));
@@ -391,7 +397,25 @@ static void sp_sink_pace_frame(const SpHdr *h)
         return;
     }
     sp_pace.paced++;
-    spacebox_frame_due_us = now - late + sp_pace.allowance;
+    spacebox_frame_due_us = read - late + sp_pace.allowance;
+}
+
+/*
+ * Each connection starts the pacing again: the allowance, the lateness of the
+ * recent updates and the base of the lateness (the source's clock may be
+ * another machine's after a move, and a new session's frames owe nothing to
+ * the last one's), and the sound's delay until the next sound arrives.
+ */
+static void sp_sink_pace_reset(void)
+{
+    sp_pace.n = sp_pace.pos = 0;
+    sp_pace.allowance = 0;
+    sp_pace.usual_gap = 0;
+    sp_pace.gap_n = sp_pace.gap_pos = 0;
+    sp_pace.last_t_us = 0;
+    sp_rx_min = sp_rx_min_prev = INT64_MAX;
+    sp_rx_min_t0 = 0;
+    sp_aud_delay_us = 0;
 }
 
 typedef struct SpPending {
@@ -429,6 +453,16 @@ static struct {
     int fd;
     bool rx_busy;
 
+    /* the link's reader (sp_rx_thread) and the messages it queued for the
+     * main loop (sp_rx); under rx_lock */
+    struct SpReader *reader;
+    QemuMutex rx_lock;
+    QemuCond rx_cond;       /* to the reader: the HELLO handled, room, the end */
+    struct SpRxMsg *rx_head, *rx_tail;
+    size_t rx_queued;       /* their bytes */
+    bool rx_woken;          /* the main loop was woken for them */
+    EventNotifier rx_notify;
+
     /*
      * Reliable messages stay in tx_queue until the peer acknowledges them, so
      * that a new connection can continue where the old one stopped. tx_next is
@@ -462,18 +496,12 @@ static struct {
     QEMUTimer *ack_timer;
     uint64_t n_reconnect, n_resent;
 
-    GByteArray *rx;
-
     /* compression of the connection */
     int z_level;            /* 0 = not offered */
     bool z_on;              /* both ends offered it (set with the peer's HELLO) */
     uint64_t conn_gen;      /* counts connections: each starts new zstd streams */
-    GByteArray *rxw;        /* bytes as received, before sp_rx_unwrap() */
-    bool rx_hello_in;       /* the peer's HELLO has been taken out of rxw */
-    uint64_t wire_tx, wire_rx; /* bytes written to / read from the socket */
-#ifdef SPACEBOX_ZSTD
-    ZSTD_DCtx *z_d;
-#endif
+    uint64_t wire_tx, wire_rx; /* bytes written to / read from the socket
+                                  (wire_rx and rx_bytes under rx_lock) */
 
     uint64_t seq;
     GHashTable *pending;
@@ -677,21 +705,21 @@ static size_t sp_z_pack(ZSTD_CCtx *c, const SpBuf *b, uint8_t **out,
 }
 
 /*
- * The reader's side: move what has arrived (sp.rxw) into sp.rx as plain
+ * The reader's side: move what has arrived (raw) into plain as plain
  * messages. 1 = moved something, 0 = nothing complete yet, -1 = bad data.
  */
-static int sp_z_unpack(void)
+static int sp_z_unpack(ZSTD_DCtx *zd, GByteArray *raw, GByteArray *plain)
 {
     size_t off = 0;
 
-    while (sp.rxw->len - off >= sizeof(SpZHdr)) {
+    while (raw->len - off >= sizeof(SpZHdr)) {
         SpZHdr zh;
         SpZFilter zf = { 0 };
         size_t hl = sizeof(zh), clen, at;
         ZSTD_inBuffer in;
         ZSTD_outBuffer o;
 
-        memcpy(&zh, sp.rxw->data + off, sizeof(zh));
+        memcpy(&zh, raw->data + off, sizeof(zh));
         clen = zh.clen & ~SP_Z_FILTERED;
         if (zh.clen & SP_Z_FILTERED) {
             hl += sizeof(zf);
@@ -700,70 +728,41 @@ static int sp_z_unpack(void)
             clen > (size_t)zh.rlen + (zh.rlen >> 7) + 1024) {
             return -1;
         }
-        if (sp.rxw->len - off < hl + clen) {
+        if (raw->len - off < hl + clen) {
             break;
         }
         if (zh.clen & SP_Z_FILTERED) {
-            memcpy(&zf, sp.rxw->data + off + sizeof(zh), sizeof(zf));
+            memcpy(&zf, raw->data + off + sizeof(zh), sizeof(zf));
             if (zf.off < sizeof(SpHdr) || zf.off >= zh.rlen || !zf.bpp ||
                 zf.bpp > 64) {
                 return -1;
             }
         }
-        at = sp.rx->len;
-        g_byte_array_set_size(sp.rx, at + zh.rlen);
-        in = (ZSTD_inBuffer){ sp.rxw->data + off + hl, clen, 0 };
-        o = (ZSTD_outBuffer){ sp.rx->data + at, zh.rlen, 0 };
+        at = plain->len;
+        g_byte_array_set_size(plain, at + zh.rlen);
+        in = (ZSTD_inBuffer){ raw->data + off + hl, clen, 0 };
+        o = (ZSTD_outBuffer){ plain->data + at, zh.rlen, 0 };
         while (in.pos < in.size || o.pos < o.size) {
             size_t before = in.pos + o.pos;
-            size_t r = ZSTD_decompressStream(sp.z_d, &o, &in);
+            size_t r = ZSTD_decompressStream(zd, &o, &in);
 
             if (ZSTD_isError(r) || in.pos + o.pos == before) {
-                g_byte_array_set_size(sp.rx, at);
+                g_byte_array_set_size(plain, at);
                 return -1;
             }
         }
         if (zf.bpp) {
-            sp_z_unfilter(sp.rx->data + at + zf.off, zh.rlen - zf.off, zf.bpp,
+            sp_z_unfilter(plain->data + at + zf.off, zh.rlen - zf.off, zf.bpp,
                           zf.stride);
         }
         off += hl + clen;
     }
     if (off) {
-        g_byte_array_remove_range(sp.rxw, 0, off);
+        g_byte_array_remove_range(raw, 0, off);
     }
     return off ? 1 : 0;
 }
 #endif
-
-/*
- * Move received bytes from sp.rxw to sp.rx. The first message of a connection
- * is the peer's HELLO, never compressed; it is handed over alone, because it
- * decides how the rest is to be read.
- */
-static int sp_rx_unwrap(void)
-{
-    if (!sp.rx_hello_in) {
-        if (sp.rxw->len < sizeof(SpHdr)) {
-            return 0;
-        }
-        g_byte_array_append(sp.rx, sp.rxw->data, sizeof(SpHdr));
-        g_byte_array_remove_range(sp.rxw, 0, sizeof(SpHdr));
-        sp.rx_hello_in = true;
-        return 1;
-    }
-#ifdef SPACEBOX_ZSTD
-    if (sp.z_on) {
-        return sp_z_unpack();
-    }
-#endif
-    if (!sp.rxw->len) {
-        return 0;
-    }
-    g_byte_array_append(sp.rx, sp.rxw->data, sp.rxw->len);
-    g_byte_array_set_size(sp.rxw, 0);
-    return 1;
-}
 
 static void *sp_tx_thread(void *opaque)
 {
@@ -989,94 +988,328 @@ static void sp_sink_spec(VirtIOGPU *g, const uint8_t *a, size_t len);
 static void sp_hello(SpHdr *h);
 static void sp_disconnected(void);
 
-static void sp_rx(void *opaque)
-{
-    static uint8_t tmp[1 << 18];
-    size_t off = 0, got = 0;
-    bool closed = false;
-    int unwrapped = 0;
+/*
+ * The link is read on a thread of its own (sp_rx_thread), one for each
+ * connection: it takes the bytes off the socket, unpacks them (zstd), cuts
+ * them into whole messages, each with the time its last byte was read, and
+ * queues them for the main loop (sp_rx), which it wakes. So the reading never
+ * waits for the main loop's work (the guest's drawing, the decoding), and the
+ * lateness of a message (sp_rx_delay, the pacing) is taken where it left the
+ * network. The first message of a connection is the peer's HELLO, never
+ * compressed: the reader hands it over alone and waits until the main loop
+ * has handled it, because it decides how the rest is to be read. At most
+ * SP_RX_QUEUE_MAX bytes wait for the main loop; beyond that the reader stops
+ * reading, as the main loop's own reading did.
+ */
+#define SP_RX_QUEUE_MAX (64u << 20)
 
-    if (sp.fd < 0 || sp.rx_busy) {
+typedef struct SpRxMsg {
+    struct SpRxMsg *next;
+    int64_t t_read;     /* g_get_monotonic_time() when its last byte was read */
+    size_t len;         /* 0: the connection ended (closed, or bad data) */
+    uint8_t data[];     /* SpHdr, a, b */
+} SpRxMsg;
+
+typedef struct SpReader {
+    int fd;
+    QemuThread thread;
+    bool stop;          /* to the reader: end (under sp.rx_lock) */
+    bool hello_wait;    /* the reader waits for the main loop's HELLO (ditto) */
+} SpReader;
+
+static SpRxMsg *sp_rx_msg(const uint8_t *data, size_t len, int64_t t_read)
+{
+    SpRxMsg *m = g_malloc(sizeof(*m) + len);
+
+    m->next = NULL;
+    m->t_read = t_read;
+    m->len = len;
+    if (len) {
+        memcpy(m->data, data, len);
+    }
+    return m;
+}
+
+static void sp_rx_free(SpRxMsg *m)
+{
+    while (m) {
+        SpRxMsg *next = m->next;
+
+        g_free(m);
+        m = next;
+    }
+}
+
+/*
+ * The reader's messages to the main loop, which is woken; then, while too
+ * much waits, no more reading. false when the reader is to end.
+ */
+static bool sp_rx_queue(SpReader *r, SpRxMsg *first, SpRxMsg *last,
+                        size_t bytes, uint64_t wire, uint64_t plain)
+{
+    bool wake = false, go_on;
+
+    qemu_mutex_lock(&sp.rx_lock);
+    if (first) {
+        if (sp.rx_tail) {
+            sp.rx_tail->next = first;
+        } else {
+            sp.rx_head = first;
+        }
+        sp.rx_tail = last;
+        sp.rx_queued += bytes;
+        if (!sp.rx_woken) {
+            sp.rx_woken = wake = true;
+        }
+    }
+    sp.wire_rx += wire;
+    sp.rx_bytes += plain;
+    if (wake) {
+        event_notifier_set(&sp.rx_notify);
+    }
+    while (!r->stop && sp.rx_queued > SP_RX_QUEUE_MAX) {
+        qemu_cond_wait(&sp.rx_cond, &sp.rx_lock);
+    }
+    go_on = !r->stop;
+    qemu_mutex_unlock(&sp.rx_lock);
+    return go_on;
+}
+
+static void *sp_rx_thread(void *opaque)
+{
+    SpReader *r = opaque;
+    size_t cap = 1 << 18;
+    uint8_t *tmp = g_malloc(cap);
+    g_autoptr(GByteArray) raw = g_byte_array_new();
+    g_autoptr(GByteArray) plain = g_byte_array_new();
+    bool hello_in = false, z_on = false, end = false;
+#ifdef SPACEBOX_ZSTD
+    ZSTD_DCtx *zd = ZSTD_createDCtx();
+#endif
+
+    while (!end) {
+        ssize_t n = recv(r->fd, tmp, cap, 0);
+        int64_t t_read = g_get_monotonic_time();
+        SpRxMsg *first = NULL, *last = NULL;
+        size_t off = 0, bytes = 0, had;
+
+        if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
+            continue;
+        }
+        if (n > 0) {
+            g_byte_array_append(raw, tmp, n);
+        } else {
+            end = true;     /* closed, or an error: the main loop ends it */
+        }
+        if (!hello_in && raw->len >= sizeof(SpHdr)) {
+            /* the HELLO alone, handled before anything else is read */
+            first = last = sp_rx_msg(raw->data, sizeof(SpHdr), t_read);
+            g_byte_array_remove_range(raw, 0, sizeof(SpHdr));
+            hello_in = true;
+            qemu_mutex_lock(&sp.rx_lock);
+            r->hello_wait = true;
+            qemu_mutex_unlock(&sp.rx_lock);
+            if (!sp_rx_queue(r, first, last, sizeof(SpHdr), n > 0 ? n : 0,
+                             sizeof(SpHdr))) {
+                break;
+            }
+            n = 0;
+            first = last = NULL;
+            qemu_mutex_lock(&sp.rx_lock);
+            while (r->hello_wait && !r->stop) {
+                qemu_cond_wait(&sp.rx_cond, &sp.rx_lock);
+            }
+            qemu_mutex_unlock(&sp.rx_lock);
+            qemu_mutex_lock(&sp.tx_lock);
+            z_on = sp.z_on;
+            qemu_mutex_unlock(&sp.tx_lock);
+        }
+        had = plain->len;
+        if (hello_in && raw->len) {
+#ifdef SPACEBOX_ZSTD
+            if (z_on) {
+                int unpacked;
+
+                while ((unpacked = sp_z_unpack(zd, raw, plain)) > 0) {
+                }
+                if (unpacked < 0) {
+                    error_report("spacebox remote gpu: bad compressed data, closing");
+                    end = true;
+                }
+            } else
+#endif
+            {
+                g_byte_array_append(plain, raw->data, raw->len);
+                g_byte_array_set_size(raw, 0);
+            }
+        }
+        while (plain->len - off >= sizeof(SpHdr)) {
+            SpHdr h;
+            size_t total;
+            SpRxMsg *m;
+
+            memcpy(&h, plain->data + off, sizeof(h));
+            if (h.magic != SP_MAGIC) {
+                error_report("spacebox remote gpu: bad frame, closing");
+                end = true;
+                break;
+            }
+            total = sizeof(h) + (size_t)h.a_len + h.b_len;
+            if (plain->len - off < total) {
+                break;
+            }
+            m = sp_rx_msg(plain->data + off, total, t_read);
+            if (last) {
+                last->next = m;
+            } else {
+                first = m;
+            }
+            last = m;
+            bytes += total;
+            off += total;
+        }
+        if (off) {
+            g_byte_array_remove_range(plain, 0, off);
+        }
+        if (end) {
+            SpRxMsg *m = sp_rx_msg(NULL, 0, t_read);
+
+            if (last) {
+                last->next = m;
+            } else {
+                first = m;
+            }
+            last = m;
+        }
+        if (!sp_rx_queue(r, first, last, bytes, n > 0 ? n : 0,
+                         plain->len + off - had)) {
+            break;
+        }
+    }
+#ifdef SPACEBOX_ZSTD
+    ZSTD_freeDCtx(zd);
+#endif
+    g_free(tmp);
+    return NULL;
+}
+
+/* the reader of the connection fd */
+static void sp_rx_start(int fd)
+{
+    SpReader *r = g_new0(SpReader, 1);
+
+    r->fd = fd;
+    sp.reader = r;
+    qemu_socket_set_block(fd);  /* the reader waits in its recv */
+    qemu_thread_create(&r->thread, "spacebox-gpu-rx", sp_rx_thread, r,
+                       QEMU_THREAD_JOINABLE);
+}
+
+/* the reader ended, and what it queued dropped */
+static void sp_rx_stop(void)
+{
+    SpReader *r = sp.reader;
+    SpRxMsg *m;
+
+    if (!r) {
         return;
     }
-    while (got < (8u << 20)) {
-        ssize_t n = recv(sp.fd, tmp, sizeof(tmp), MSG_DONTWAIT);
+    qemu_mutex_lock(&sp.rx_lock);
+    r->stop = true;
+    qemu_cond_broadcast(&sp.rx_cond);
+    qemu_mutex_unlock(&sp.rx_lock);
+    shutdown(r->fd, SHUT_RDWR);     /* its recv returns */
+    qemu_thread_join(&r->thread);
+    g_free(r);
+    sp.reader = NULL;
+    qemu_mutex_lock(&sp.rx_lock);
+    m = sp.rx_head;
+    sp.rx_head = sp.rx_tail = NULL;
+    sp.rx_queued = 0;
+    sp.rx_woken = false;
+    qemu_mutex_unlock(&sp.rx_lock);
+    sp_rx_free(m);
+}
 
-        if (n > 0) {
-            g_byte_array_append(sp.rxw, tmp, n);
-            got += n;
-        } else if (n == 0) {
-            closed = true;
-            break;
-        } else if (errno == EINTR) {
-            continue;
-        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            break;
-        } else {
-            closed = true;
-            break;
-        }
+/* the main loop: the messages that the reader queued, in their order */
+static void sp_rx(void *opaque)
+{
+    SpRxMsg *m, *done;
+    uint64_t gen = sp.conn_gen;
+    bool closed = false;
+
+    if (sp.rx_busy) {
+        return;     /* the notifier stays set: called again after */
     }
-    sp.wire_rx += got;
-    sp_rx_now = g_get_monotonic_time();
+    event_notifier_test_and_clear(&sp.rx_notify);
+    qemu_mutex_lock(&sp.rx_lock);
+    m = sp.rx_head;
+    sp.rx_head = sp.rx_tail = NULL;
+    sp.rx_queued = 0;
+    sp.rx_woken = false;
+    qemu_cond_broadcast(&sp.rx_cond);
+    qemu_mutex_unlock(&sp.rx_lock);
 
     sp.rx_busy = true;
-  more:
-    if (!closed) {
-        size_t had = sp.rx->len;
-
-        unwrapped = sp_rx_unwrap();
-        if (unwrapped < 0) {
-            error_report("spacebox remote gpu: bad compressed data, closing");
-            closed = true;
-        } else {
-            sp.rx_bytes += sp.rx->len - had;
-        }
-    }
-    while (!closed && sp.rx->len - off >= sizeof(SpHdr)) {
+    while (m && !closed && sp.fd >= 0 && sp.conn_gen == gen) {
         SpHdr h;
-        size_t total;
+        int64_t run = g_get_monotonic_time(), d = run - m->t_read;
 
-        memcpy(&h, sp.rx->data + off, sizeof(h));
-        if (h.magic != SP_MAGIC) {
-            error_report("spacebox remote gpu: bad frame, closing");
+        done = m;
+        m = m->next;
+        done->next = NULL;
+        if (!done->len) {
             closed = true;
+            sp_rx_free(done);
             break;
         }
-        total = sizeof(h) + (size_t)h.a_len + h.b_len;
-        if (sp.rx->len - off < total) {
-            break;
-        }
-        off += total;
+        memcpy(&h, done->data, sizeof(h));
+        sp_rx_now = done->t_read;
+        sp_rx_run = run;
+        sp_rxq.n++;
+        sp_rxq.over12 += d > 12000;
+        sp_rxq.over25 += d > 25000;
+        sp_rxq.over50 += d > 50000;
+        sp_rxq.max = MAX(sp_rxq.max, d);
         if (h.type == SP_HELLO) {
             sp_hello(&h);
+            /* the reader goes on */
+            qemu_mutex_lock(&sp.rx_lock);
+            if (sp.reader) {
+                sp.reader->hello_wait = false;
+                qemu_cond_broadcast(&sp.rx_cond);
+            }
+            qemu_mutex_unlock(&sp.rx_lock);
             if (sp.refuse_now) {
                 sp.refuse_now = false;
                 closed = true;
-                break;
             }
+            sp_rx_free(done);
             continue;
         }
         if (!sp.hello_done) {
+            sp_rx_free(done);
             continue;
         }
         sp_acked(h.ack);
         if (h.id) {
             if (h.id <= sp.rx_id) {
+                sp_rx_free(done);
                 continue; /* resent, already handled */
             }
             if (h.id != sp.rx_id + 1) {
                 error_report("spacebox remote gpu: message %" PRIu64
                              " after %" PRIu64 ", closing", h.id, sp.rx_id);
                 closed = true;
+                sp_rx_free(done);
                 break;
             }
             sp.rx_id = h.id;
         }
         if (h.type != SP_ACK) {
-            uint8_t *a = sp.rx->data + off - total + sizeof(h);
+            uint8_t *a = done->data + sizeof(h);
 
-            sp_rx_delay(h.t_us);
+            sp_rx_delay(h.t_us, done->t_read);
             if (sp.mode == SP_REMOTE_SINK && h.type == SP_SPEC) {
                 if (sp.spec_wait) {
                     sp_sink_spec(sp.g, a, h.a_len);
@@ -1089,6 +1322,7 @@ static void sp_rx(void *opaque)
                 sp_dispatch(&h, a, a + h.a_len);
             }
         }
+        sp_rx_free(done);
         if (sp.bye) {
             closed = true;
             break;
@@ -1097,15 +1331,10 @@ static void sp_rx(void *opaque)
             sp_send_full(false, SP_ACK, 0, NULL, 0, NULL, 0, 0, 0, 0);
         }
     }
-    if (off) {
-        g_byte_array_remove_range(sp.rx, 0, off);
-        off = 0;
-    }
-    if (!closed && unwrapped > 0 && sp.fd >= 0) {
-        goto more;
-    }
+    sp_rx_free(m);
+    sp_rx_now = sp_rx_run = 0;
     sp.rx_busy = false;
-    if (closed) {
+    if (closed && sp.conn_gen == gen) {
         sp_disconnected();
     }
 }
@@ -1118,12 +1347,6 @@ static void sp_set_connected(int fd)
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
 #endif
     (void)yes;
-    g_byte_array_set_size(sp.rx, 0);
-    g_byte_array_set_size(sp.rxw, 0);
-    sp.rx_hello_in = false;
-#ifdef SPACEBOX_ZSTD
-    ZSTD_DCtx_reset(sp.z_d, ZSTD_reset_session_only);
-#endif
     qemu_mutex_lock(&sp.tx_lock);
     sp.fd = fd;
     sp.hello_done = false;
@@ -1131,7 +1354,6 @@ static void sp_set_connected(int fd)
     sp.z_on = false;
     sp.conn_gen++;
     qemu_mutex_unlock(&sp.tx_lock);
-    qemu_set_fd_handler(fd, sp_rx, NULL, NULL);
 
     /* HELLO goes out directly: the queue stays closed until the peer answers. */
     {
@@ -1153,6 +1375,7 @@ static void sp_set_connected(int fd)
             }
         }
     }
+    sp_rx_start(fd);
 }
 
 /* Open the queue: everything the peer does not have yet goes out (again). */
@@ -2933,7 +3156,8 @@ static void sp_sink_ctrl(VirtIOGPU *g, SpHdr *h, uint8_t *a, uint8_t *b)
         int64_t base = MIN(sp_rx_min, sp_rx_min_prev);
 
         cmd->sp_t_dev = h->t_us && base != INT64_MAX ? h->t_us + base : 0;
-        cmd->sp_t_rx = sp_rx_now;
+        cmd->sp_t_read = sp_rx_now;
+        cmd->sp_t_rx = sp_rx_run;
     }
 
     memcpy(&hdr, req, MIN((size_t)h->a_len, sizeof(hdr)));
@@ -3277,15 +3501,13 @@ static void sp_disconnected(void)
     if (fd < 0) {
         return;
     }
-    qemu_set_fd_handler(fd, NULL, NULL, NULL);
+    sp_rx_stop();
     qemu_mutex_lock(&sp.tx_lock);
     sp.fd = -1;
     sp.hello_done = false;
     sp.tx_enabled = false;
     qemu_mutex_unlock(&sp.tx_lock);
     close(fd);
-    g_byte_array_set_size(sp.rx, 0);
-    g_byte_array_set_size(sp.rxw, 0);
 
     if (sp.bye) {
         /* A detached sink is not connected again: the source's state now
@@ -3328,6 +3550,9 @@ static void sp_hello(SpHdr *h)
 
     if (sp.hello_done) {
         return;
+    }
+    if (sp.mode == SP_REMOTE_SINK) {
+        sp_sink_pace_reset();
     }
     qemu_mutex_lock(&sp.tx_lock);
     sp.z_on = sp.z_level && (h->flags & SP_F_ZSTD);
@@ -4062,12 +4287,17 @@ static void sp_dispatch(SpHdr *h, uint8_t *a, uint8_t *b)
 
 static void sp_stats(void *opaque)
 {
-    uint64_t wire_tx;
+    uint64_t wire_tx, wire_rx, rx_bytes;
 
     qemu_mutex_lock(&sp.tx_lock);
     wire_tx = sp.wire_tx;
     sp.wire_tx = 0;
     qemu_mutex_unlock(&sp.tx_lock);
+    qemu_mutex_lock(&sp.rx_lock);
+    wire_rx = sp.wire_rx;
+    rx_bytes = sp.rx_bytes;
+    sp.wire_rx = sp.rx_bytes = 0;
+    qemu_mutex_unlock(&sp.rx_lock);
     sp_flush_report(sp.mode == SP_REMOTE_SOURCE ? "source" : "sink");
     if (sp.mode == SP_REMOTE_SINK && !sp_late_timer &&
         getenv("SPACEBOX_GPU_REMOTE_DEBUG_LOOP")) {
@@ -4092,6 +4322,10 @@ static void sp_stats(void *opaque)
             sp.mode == SP_REMOTE_SOURCE ? "source" : "sink",
             sp_rxd.n, sp_rxd.over12, sp_rxd.over25, sp_rxd.over50, sp_rxd.max / 1000.0);
     memset(&sp_rxd, 0, sizeof(sp_rxd));
+    fprintf(stderr, "[SPACEBOX-REMOTE] %s messages run by the main loop=%u after their read by over 12 ms=%u over 25 ms=%u over 50 ms=%u longest_ms=%.1f\n",
+            sp.mode == SP_REMOTE_SOURCE ? "source" : "sink",
+            sp_rxq.n, sp_rxq.over12, sp_rxq.over25, sp_rxq.over50, sp_rxq.max / 1000.0);
+    memset(&sp_rxq, 0, sizeof(sp_rxq));
     if (sp.mode == SP_REMOTE_SINK) {
         fprintf(stderr, "[SPACEBOX-REMOTE] sink time running guest commands: total_ms=%.0f drawing_ms=%.0f (longest %.1f)"
                 " screen_update_ms=%.0f (longest %.1f) other longest %.1f\n",
@@ -4204,11 +4438,11 @@ static void sp_stats(void *opaque)
             sp.mode == SP_REMOTE_SOURCE ? "source" : "sink",
             sp.n_ctrl, sp.n_submit, sp.submit_bytes, sp.n_xfer, sp.xfer_bytes,
             sp.n_mem, sp.mem_bytes, sp.n_back, sp.back_bytes,
-            sp.tx_bytes, sp.rx_bytes, sp_tx_backlog(), sp.tx_unacked,
-            sp.n_reconnect, wire_tx, sp.wire_rx, sp.z_on);
+            sp.tx_bytes, rx_bytes, sp_tx_backlog(), sp.tx_unacked,
+            sp.n_reconnect, wire_tx, wire_rx, sp.z_on);
     sp.n_ctrl = sp.n_submit = sp.submit_bytes = sp.n_xfer = sp.xfer_bytes = 0;
     sp.n_mem = sp.mem_bytes = sp.n_back = sp.back_bytes = 0;
-    sp.tx_bytes = sp.rx_bytes = sp.wire_rx = 0;
+    sp.tx_bytes = 0;
     timer_mod(sp.stats_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 5000);
 }
 
@@ -4218,11 +4452,13 @@ void sp_remote_realize(VirtIOGPU *g, Error **errp)
         return;
     }
     sp.g = g;
-    sp.rx = g_byte_array_new();
-    sp.rxw = g_byte_array_new();
-#ifdef SPACEBOX_ZSTD
-    sp.z_d = ZSTD_createDCtx();
-#endif
+    qemu_mutex_init(&sp.rx_lock);
+    qemu_cond_init(&sp.rx_cond);
+    if (event_notifier_init(&sp.rx_notify, false) < 0) {
+        error_setg(errp, "spacebox remote gpu: no notifier for the link's reader");
+        return;
+    }
+    qemu_set_fd_handler(event_notifier_get_fd(&sp.rx_notify), sp_rx, NULL, NULL);
     qemu_mutex_init(&sp.tx_lock);
     qemu_cond_init(&sp.tx_cond);
     g_queue_init(&sp.tx_queue);

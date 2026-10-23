@@ -72,7 +72,7 @@ typedef struct SpRecPic {
     uint32_t codec;         /* 0: an upload */
     const char *fmt;
     uint32_t w, h;
-    int64_t t_dev, t_rx;    /* this clock (g_get_monotonic_time()), 0 = none */
+    int64_t t_dev, t_read, t_rx;    /* this clock (g_get_monotonic_time()), 0 = none */
     int64_t t_dec0, t_dec1, t_tex, t_draw;  /* CLOCK_MONOTONIC, 0 = none */
     int64_t made;           /* g_get_monotonic_time() of its ticket */
 } SpRecPic;
@@ -89,7 +89,7 @@ static struct {
     int64_t off;            /* CLOCK_MONOTONIC - g_get_monotonic_time() */
     GHashTable *pics;       /* ticket -> SpRecPic */
     QEMUTimer *timer;
-    int64_t cmd_dev, cmd_rx;    /* the command that runs */
+    int64_t cmd_dev, cmd_read, cmd_rx;  /* the command that runs */
     bool rect;
     int rx, ry, rw, rh;
     uint32_t vw, vh;
@@ -173,6 +173,7 @@ static void sp_rec_pic_line(SpRecPic *p, int64_t t_swap)
     sp_rec_time(s, "t_swap", t_swap);
     g_string_append_c(s, '}');
     sp_rec_put(s);
+    sp_rec_time(s, "t_read", p->t_read);
     rec.n_pics++;
     if (!t_swap) {
         rec.unshown++;
@@ -207,6 +208,7 @@ static void sp_rec_picture(void *opaque, uint64_t ticket, uint32_t codec,
     qemu_mutex_unlock(&rec.lock);
     rec.main_us += g_get_monotonic_time() - t0;
 }
+    p->t_read = rec.cmd_read;
 
 static void sp_rec_decoded(void *opaque, uint64_t ticket, uint32_t width,
                            uint32_t height, int64_t t_dec0, int64_t t_dec1,
@@ -260,6 +262,7 @@ void sp_record_flush(uint32_t resource_id, bool begin)
 {
     if (!begin) {
         spacebox_frame_ntickets = 0;
+    rec.cmd_read = cmd->sp_t_read;
     } else if (spacebox_video_record_on) {
         int64_t t0 = g_get_monotonic_time();
 

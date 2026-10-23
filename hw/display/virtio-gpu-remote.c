@@ -159,6 +159,8 @@ typedef struct SpHdr {
                            SP_PIECE, SP_RXB); the QEMU source does not */
 #define SP_HOLD_UNKNOWN (1ull << 32) /* in SP_HOLD's arg2: what the command
                            touches is not known */
+#define SP_HOLD_READS_UNKNOWN (1ull << 33) /* ... only what it reads is not known: it
+                           is taken as reading everything */
 
 /*
  * A compressed connection (both ends set SP_F_ZSTD in their HELLO): after the
@@ -1373,6 +1375,8 @@ typedef struct SpWait {
     SpRxMsg *msgs, *tail;   /* the command's messages, in their order */
     uint32_t ctx;           /* its GL context, 0 = none */
     bool unknown;           /* what it touches is not known */
+    bool reads_all;         /* what it writes is known, what it reads is not: it is
+                               taken as reading everything */
     bool stream;            /* a command stream: the renderer stops it (above) */
     bool all;               /* it touches everything (SP_EXPORT) */
     GArray *touch;          /* SpTouch, when known */
@@ -1385,6 +1389,7 @@ typedef struct SpWait {
     int64_t t_done;
     uint64_t passed, flushes;   /* commands, of them screen updates, that ran
                                    while its write came */
+    uint32_t type, first;       /* its command's type, and a stream's first command */
 } SpWait;
 
 static struct {
@@ -1519,6 +1524,10 @@ static bool sp_wait_blocks(const SpWait *f, uint32_t ctx, const GArray *t,
     for (guint i = 0; i < t->len; i++) {
         const SpTouch *x = &g_array_index(t, SpTouch, i);
 
+        if (f->reads_all && x->kind == SP_TOUCH_RES && x->write) {
+            return true;    /* it may read what this writes */
+        }
+
         for (guint j = 0; j < f->touch->len; j++) {
             const SpTouch *y = &g_array_index(f->touch, SpTouch, j);
 
@@ -1552,6 +1561,10 @@ static void sp_wait_hold(SpWait *e, int delta)
 {
     if (!e->touch || e->unknown || e->held == (delta > 0)) {
         return;
+    }
+    if (e->reads_all) {
+        /* resource 0: every resource, held for reading */
+        virgl_renderer_resource_hold(0, VIRGL_RESOURCE_HOLD_READ, delta);
     }
     for (guint i = 0; i < e->touch->len; i++) {
         const SpTouch *x = &g_array_index(e->touch, SpTouch, i);
@@ -1617,42 +1630,66 @@ static void sp_run_msgs(SpRxMsg *m)
     }
 }
 
+/*
+ * Run a waiting command. It comes before the commands that wait after it in
+ * the stream: what they hold in the renderer must not stop it, so their holds
+ * are let go while it runs (those of the commands before it stay).
+ */
 static void sp_wait_run(SpWait *e)
 {
     SpRxMsg *m = e->msgs;
+    SpWait *f, *after = QTAILQ_NEXT(e, next);
 
     QTAILQ_REMOVE(&sph.q, e, next);
     sph.n--;
     sp_wait_hold(e, -1);
+    for (f = after; f; f = QTAILQ_NEXT(f, next)) {
+        sp_wait_hold(f, -1);
+    }
     e->msgs = NULL;
     sph.running = true;
-    sph.at = QTAILQ_NEXT(e, next);
+    sph.at = after;
     sp_run_msgs(m);
     sph.running = false;
     sph.at = NULL;
+    for (f = after; f; f = QTAILQ_NEXT(f, next)) {
+        sp_wait_hold(f, 1);
+    }
     if (sph.log && e->t_done) {
         fprintf(stderr, "[SPACEBOX-REMOTE] sink write ctx=%u bytes=%" PRIu64
-                " notice_us=%" PRId64 " complete_us=%" PRId64 " run_us=%" PRId64
-                " passed=%" PRIu64 " screen_updates_passed=%" PRIu64 "\n",
-                e->ctx, e->wlen, e->t_notice, e->t_done, g_get_monotonic_time(),
-                e->passed, e->flushes);
+                " command=0x%x first=%u touches=%s notice_us=%" PRId64 " complete_us=%" PRId64
+                " run_us=%" PRId64 " passed=%" PRIu64 " screen_updates_passed=%" PRIu64 "\n",
+                e->ctx, e->wlen, e->type, e->first,
+                e->unknown ? "unknown" : e->reads_all ? "writes" : "known",
+                e->t_notice, e->t_done, g_get_monotonic_time(), e->passed, e->flushes);
     }
     sp_wait_free(e);
 }
 
-/* run what waits and need not wait any more, in order */
+/*
+ * Run what waits and need not wait any more, in order. A command stream that
+ * the renderer stops again leaves its rest at its place: that is no progress
+ * (it waits for what an earlier command holds), and the pass goes on after it.
+ */
 static void sp_hold_run(void)
 {
-    SpWait *e;
+    bool progress = true;
 
-again:
-    QTAILQ_FOREACH(e, &sph.q, next) {
-        if (e->w || sp_must_wait(e->ctx, e->unknown ? NULL : e->touch, e->stream,
-                                 e->all, e)) {
-            continue;
+    while (progress) {
+        SpWait *e = QTAILQ_FIRST(&sph.q);
+
+        progress = false;
+        while (e) {
+            SpWait *next = QTAILQ_NEXT(e, next);
+            uint64_t split = sph.st.split;
+
+            if (!e->w && !sp_must_wait(e->ctx, e->unknown || e->reads_all ? NULL : e->touch,
+                                       e->stream, e->all, e)) {
+                sp_wait_run(e);
+                progress |= sph.st.split == split;
+            }
+            e = next;
         }
-        sp_wait_run(e);
-        goto again;
     }
 }
 
@@ -1685,7 +1722,7 @@ static void sp_hold_cmd(const SpHdr *h, SpRxMsg *m)
     const uint8_t *a = m->data + sizeof(*h);
     GArray *t = g_array_new(false, false, sizeof(SpTouch));
     uint32_t ctx = 0;
-    bool unknown = false, stream = false, nothing = false, all = false;
+    bool unknown = false, reads_all = false, stream = false, nothing = false, all = false;
     SpRxMsg *grp = sph.grp;
     SpWait *e;
 
@@ -1699,6 +1736,7 @@ static void sp_hold_cmd(const SpHdr *h, SpRxMsg *m)
 
             memcpy(&nh, sph.notice->data, sizeof(nh));
             unknown = nh.arg2 & SP_HOLD_UNKNOWN;
+            reads_all = nh.arg2 & SP_HOLD_READS_UNKNOWN;
             if (!unknown) {
                 g_array_free(t, true);
                 t = sp_notice_touches(&nh, sph.notice->data + sizeof(nh));
@@ -1720,7 +1758,8 @@ static void sp_hold_cmd(const SpHdr *h, SpRxMsg *m)
     }
     sp_rx_free(sph.notice);
     sph.notice = NULL;
-    if (nothing || !sp_must_wait(ctx, unknown ? NULL : t, stream, all, NULL)) {
+    /* a stream whose reads are not known runs past what waits (the renderer stops it) */
+    if (nothing || !sp_must_wait(ctx, unknown || reads_all ? NULL : t, stream, all, NULL)) {
         g_array_free(t, true);
         sp_run_msgs(grp);
         return;
@@ -1731,6 +1770,7 @@ static void sp_hold_cmd(const SpHdr *h, SpRxMsg *m)
     }
     e->ctx = ctx;
     e->unknown = unknown;
+    e->reads_all = reads_all;
     e->stream = stream;
     e->all = all;
     if (unknown) {
@@ -1757,6 +1797,7 @@ static void sp_hold_write(const SpHdr *h, const uint8_t *a)
     e->wbuf = g_byte_array_sized_new(MIN(h->seq, 64u << 20));
     e->ctx = h->arg1;
     e->unknown = h->arg2 & SP_HOLD_UNKNOWN;
+    e->reads_all = h->arg2 & SP_HOLD_READS_UNKNOWN;
     if (!e->unknown) {
         e->touch = sp_notice_touches(h, a);
     }
@@ -1802,8 +1843,9 @@ static void sp_hold_piece(const SpHdr *h, const uint8_t *a)
         m = sp_rx_msg(e->wbuf->data + off, total, sp_rx_now);
         memcpy(m->data, &ih, sizeof(ih));
         if (ih.type == SP_CTRL) {
-            e->stream = ih.a_len >= 4 &&
-                ldl_le_p(m->data + sizeof(ih)) == VIRTIO_GPU_CMD_SUBMIT_3D;
+            e->type = sp_req_u32(m->data + sizeof(ih), ih.a_len, 0);
+            e->stream = e->type == VIRTIO_GPU_CMD_SUBMIT_3D;
+            e->first = e->stream ? sp_req_u32(m->data + sizeof(ih), ih.a_len, 32) & 0xff : 0;
         }
         sp_msg_append(&e->msgs, &e->tail, m);
         off += total;

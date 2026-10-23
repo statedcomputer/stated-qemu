@@ -216,8 +216,9 @@ static int64_t sp_rx_min = INT64_MAX, sp_rx_min_prev = INT64_MAX, sp_rx_min_t0;
 /* the message that the main loop handles: when the link's reader read it off
  * the socket (sp_rx_thread), and when the main loop took it */
 static int64_t sp_rx_now, sp_rx_run;
-/* statistics: from the reader's read of a message to the main loop's */
-static struct SpDelayStat sp_rxq;
+/* statistics: from the reader's read of a message to the main loop's, and
+ * (sink) from the read of a command to its answer */
+static struct SpDelayStat sp_rxq, sp_ansd;
 
 /* the lateness of a message read at now (its read time) */
 static void sp_rx_delay(int64_t t_us, int64_t now)
@@ -362,10 +363,10 @@ static void sp_sink_pace_frame(const SpHdr *h)
         sp_pace.allowance = 0;
         return;
     }
-    if (sp_pace.input_us < 0) {
     if (sp_pace.mode == 2 || (h->flags & SP_F_VIDEO)) {
         sp_pace.video_last = read;
     }
+    if (sp_pace.input_us < 0) {
         const char *i = getenv("SPACEBOX_PRESENT_INPUT_MS");
 
         sp_pace.input_us = (i ? MAX(atoi(i), 0) : 1500) * 1000;
@@ -2662,6 +2663,15 @@ void sp_sink_response(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd,
         cmd->sp_snap = NULL;
         return;
     }
+    if (cmd->sp_t_read) {
+        int64_t d = g_get_monotonic_time() - cmd->sp_t_read;
+
+        sp_ansd.n++;
+        sp_ansd.over12 += d > 12000;
+        sp_ansd.over25 += d > 25000;
+        sp_ansd.over50 += d > 50000;
+        sp_ansd.max = MAX(sp_ansd.max, d);
+    }
     sp_send(SP_RESP, cmd->sp_seq, resp, resp_len,
             ok ? cmd->sp_snap : NULL, ok ? cmd->sp_len : 0,
             0, cmd->sp_off, 0);
@@ -3193,12 +3203,12 @@ static void sp_sink_ctrl(VirtIOGPU *g, SpHdr *h, uint8_t *a, uint8_t *b)
     cmd->sp_expect = sp.next_expect;
     sp.next_expect = NULL;
     sp_state_attach(cmd, h->id);
+    cmd->sp_t_read = sp_rx_now;
     if (spacebox_video_record_on) {
         /* the source's time on this clock as the lateness takes it (sp_rx_delay) */
         int64_t base = MIN(sp_rx_min, sp_rx_min_prev);
 
         cmd->sp_t_dev = h->t_us && base != INT64_MAX ? h->t_us + base : 0;
-        cmd->sp_t_read = sp_rx_now;
         cmd->sp_t_rx = sp_rx_run;
     }
 
@@ -4380,6 +4390,11 @@ static void sp_stats(void *opaque)
             sp.mode == SP_REMOTE_SOURCE ? "source" : "sink",
             sp_rxq.n, sp_rxq.over12, sp_rxq.over25, sp_rxq.over50, sp_rxq.max / 1000.0);
     memset(&sp_rxq, 0, sizeof(sp_rxq));
+    if (sp.mode == SP_REMOTE_SINK) {
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink answers sent=%u after the read of their command by over 12 ms=%u over 25 ms=%u over 50 ms=%u longest_ms=%.1f\n",
+                sp_ansd.n, sp_ansd.over12, sp_ansd.over25, sp_ansd.over50, sp_ansd.max / 1000.0);
+        memset(&sp_ansd, 0, sizeof(sp_ansd));
+    }
     if (sp.mode == SP_REMOTE_SINK) {
         fprintf(stderr, "[SPACEBOX-REMOTE] sink time running guest commands: total_ms=%.0f drawing_ms=%.0f (longest %.1f)"
                 " screen_update_ms=%.0f (longest %.1f) other longest %.1f\n",

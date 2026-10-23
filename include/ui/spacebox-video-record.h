@@ -21,6 +21,9 @@ extern bool spacebox_video_record_on;
  */
 extern uint64_t spacebox_frame_tickets[SP_REC_TICKETS];
 extern unsigned spacebox_frame_ntickets;
+/* ... and the source's time and the read of the flush's message (the clock
+ * of g_get_monotonic_time(), 0 = not known) */
+extern int64_t spacebox_frame_flush_dev, spacebox_frame_flush_read;
 /* the test pause: the presenter shows nothing for this many ms after its
  * next swap, once (0 = none); the presenter takes it */
 extern int spacebox_present_pause_ms;
@@ -37,7 +40,8 @@ void spacebox_video_record_swap(uint64_t seq, int64_t t_swap, int code,
                                 unsigned n, uint64_t coalesced,
                                 int64_t read_us, int64_t t_show,
                                 int64_t t_call, int64_t t_vsync,
-                                int64_t t_out);
+                                int64_t t_out, int64_t t_due,
+                                int64_t t_flush_dev, int64_t t_flush_read);
 /* the test pause, from its start to its end */
 void spacebox_video_record_paused(int ms, int64_t t0, int64_t t1);
 

@@ -72,6 +72,7 @@
 bool spacebox_video_record_on;
 uint64_t spacebox_frame_tickets[SP_REC_TICKETS];
 unsigned spacebox_frame_ntickets;
+int64_t spacebox_frame_flush_dev, spacebox_frame_flush_read;
 int spacebox_present_pause_ms;
 
 typedef struct SpRecPic {
@@ -81,6 +82,8 @@ typedef struct SpRecPic {
     uint32_t w, h;
     int64_t t_dev, t_read, t_rx;    /* this clock (g_get_monotonic_time()), 0 = none */
     int64_t t_dec0, t_dec1, t_tex, t_draw;  /* CLOCK_MONOTONIC, 0 = none */
+    int64_t t_draw_dev, t_draw_read;    /* the first draw's message: its source's
+                                           time and its read (this clock) */
     int64_t made;           /* g_get_monotonic_time() of its ticket */
 } SpRecPic;
 
@@ -178,6 +181,8 @@ static void sp_rec_pic_line(SpRecPic *p, int64_t t_swap)
     sp_rec_mtime(s, "t_dec1", p->t_dec1);
     sp_rec_mtime(s, "t_tex", p->t_tex);
     sp_rec_mtime(s, "t_draw", p->t_draw);
+    sp_rec_time(s, "t_draw_dev", p->t_draw_dev);
+    sp_rec_time(s, "t_draw_read", p->t_draw_read);
     sp_rec_time(s, "t_swap", t_swap);
     g_string_append_c(s, '}');
     sp_rec_put(s);
@@ -246,6 +251,8 @@ static void sp_rec_drawn(void *opaque, uint64_t ticket, int64_t t)
     p = g_hash_table_lookup(rec.pics, &ticket);
     if (p && !p->t_draw) {
         p->t_draw = t;
+        p->t_draw_dev = rec.cmd_dev;
+        p->t_draw_read = rec.cmd_read;
     }
     qemu_mutex_unlock(&rec.lock);
     rec.main_us += g_get_monotonic_time() - t0;
@@ -270,7 +277,10 @@ void sp_record_flush(uint32_t resource_id, bool begin)
 {
     if (!begin) {
         spacebox_frame_ntickets = 0;
+        spacebox_frame_flush_dev = spacebox_frame_flush_read = 0;
     } else if (spacebox_video_record_on) {
+        spacebox_frame_flush_dev = rec.cmd_dev;
+        spacebox_frame_flush_read = rec.cmd_read;
         int64_t t0 = g_get_monotonic_time();
 
         spacebox_frame_ntickets = virgl_renderer_resource_video_tickets(resource_id,
@@ -313,7 +323,8 @@ void spacebox_video_record_swap(uint64_t seq, int64_t t_swap, int code,
                                 bool code_ok, const uint64_t *tickets,
                                 unsigned n, uint64_t coalesced, int64_t read_us,
                                 int64_t t_show, int64_t t_call, int64_t t_vsync,
-                                int64_t t_out)
+                                int64_t t_out, int64_t t_due, int64_t t_flush_dev,
+                                int64_t t_flush_read)
 {
     GString *s;
 
@@ -339,6 +350,9 @@ void spacebox_video_record_swap(uint64_t seq, int64_t t_swap, int code,
     sp_rec_time(s, "t_call_us", t_call);
     sp_rec_time(s, "t_vsync_us", t_vsync);
     sp_rec_time(s, "t_out_us", t_out);
+    sp_rec_time(s, "t_due_us", t_due);
+    sp_rec_time(s, "t_flush_dev", t_flush_dev);
+    sp_rec_time(s, "t_flush_read", t_flush_read);
     g_string_append_c(s, '}');
     sp_rec_put(s);
     for (unsigned i = 0; i < n; i++) {

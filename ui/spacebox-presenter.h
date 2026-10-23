@@ -29,6 +29,7 @@ typedef struct SpSlot {
      * shows, and the size of the picture it was made from (the scanout) */
     uint64_t tickets[SP_REC_TICKETS];
     unsigned ntickets;
+    int64_t flush_dev, flush_read;  /* its flush's message: sent, read */
     int src_w, src_h;
 } SpSlot;
 typedef struct SpPresenter {
@@ -409,7 +410,8 @@ static void *sp_present_thread(void *opaque)
         if (recording) {
             spacebox_video_record_swap(presented, swapped, code, code_ok, s->tickets,
                                        s->ntickets, coalesced, code_us, show_us,
-                                       swap_call, vsync_us, out_us);
+                                       swap_call, vsync_us, out_us, pick_due,
+                                       s->flush_dev, s->flush_read);
         }
         int pause_ms = qatomic_xchg(&spacebox_present_pause_ms, 0);
         if (pause_ms) {
@@ -501,6 +503,8 @@ static void sp_present_submit(struct sdl2_console *scon, SpSlot *s, int src_w, i
     s->ntickets = MIN(spacebox_frame_ntickets, SP_REC_TICKETS);
     memcpy(s->tickets, spacebox_frame_tickets, s->ntickets * sizeof(s->tickets[0]));
     spacebox_frame_ntickets = 0;
+    s->flush_dev = spacebox_frame_flush_dev;
+    s->flush_read = spacebox_frame_flush_read;
     s->src_w = src_w;
     s->src_h = src_h;
     qemu_mutex_lock(&p->lock);

@@ -54,9 +54,9 @@ enum {
                             "Large writes in pieces" in virtio-gpu-remote.c */
     SP_PIECE = 34,       /* source -> sink: a piece of such a write; arg0 its
                             notice's id, arg1 the offset of a in it */
-    SP_RXB = 35,         /* sink -> source, not resent: arg0 the bytes of the
-                            messages read on this connection after the source's
-                            HELLO (the source paces its pieces by it) */
+    SP_RXB = 35,         /* sink -> source, not resent: arg0 the bytes read
+                            on this connection after the source's HELLO, as on
+                            the wire (the source paces its pieces by it) */
 };
 
 #define SP_XFER_MAX (16u << 20)

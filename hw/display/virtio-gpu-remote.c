@@ -1132,11 +1132,11 @@ static bool sp_rx_queue(SpReader *r, SpRxMsg *first, SpRxMsg *last,
 }
 
 /*
- * The reader: what it has read of the source's messages on this connection,
- * after the source's HELLO (header, a and b), for a source that sends pieces
- * (SP_RXB, not resent): the source sends its pieces only while it has written
- * little more than that, so that they do not fill the network's buffers in
- * front of its small messages. Queued from this thread directly.
+ * The reader: what it has read on this connection after the source's HELLO,
+ * as on the wire (compressed: what took the link's time), for a source that
+ * sends pieces (SP_RXB, not resent): the source sends its pieces only while it
+ * has written little more than that, so that they do not fill the network's
+ * buffers in front of its small messages. Queued from this thread directly.
  */
 #define SP_RXB_STEP (16u << 10)
 
@@ -1177,7 +1177,7 @@ static void *sp_rx_thread(void *opaque)
     g_autoptr(GByteArray) raw = g_byte_array_new();
     g_autoptr(GByteArray) plain = g_byte_array_new();
     bool hello_in = false, z_on = false, end = false, pieces = false;
-    uint64_t read = 0, said = 0;
+    uint64_t wire = 0, said = 0;
 #ifdef SPACEBOX_ZSTD
     ZSTD_DCtx *zd = ZSTD_createDCtx();
 #endif
@@ -1193,6 +1193,7 @@ static void *sp_rx_thread(void *opaque)
         }
         if (n > 0) {
             g_byte_array_append(raw, tmp, n);
+            wire += n;
         } else {
             end = true;     /* closed, or an error: the main loop ends it */
         }
@@ -1267,10 +1268,9 @@ static void *sp_rx_thread(void *opaque)
         if (off) {
             g_byte_array_remove_range(plain, 0, off);
         }
-        read += bytes;
-        if (pieces && read - said >= SP_RXB_STEP) {
-            sp_rx_report(read);
-            said = read;
+        if (pieces && hello_in && wire - sizeof(SpHdr) - said >= SP_RXB_STEP) {
+            said = wire - sizeof(SpHdr);
+            sp_rx_report(said);
         }
         if (end) {
             SpRxMsg *m = sp_rx_msg(NULL, 0, t_read);

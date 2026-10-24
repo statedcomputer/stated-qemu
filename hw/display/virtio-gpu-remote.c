@@ -1462,8 +1462,6 @@ static bool sp_ctrl_touches(const uint8_t *req, size_t len, GArray *t,
     case VIRTIO_GPU_CMD_RESOURCE_UNREF:
     case VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING:
     case VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING:
-    case VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE:
-    case VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE:
     case VIRTIO_GPU_CMD_RESOURCE_CREATE_3D:
     case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB:
     case VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB:
@@ -1489,6 +1487,10 @@ static bool sp_ctrl_touches(const uint8_t *req, size_t len, GArray *t,
         return true;
     case VIRTIO_GPU_CMD_CTX_CREATE:
     case VIRTIO_GPU_CMD_CTX_DESTROY:
+    /* what a context reaches: no resource's contents (its context's order
+     * keeps it before the context's commands that use the resource) */
+    case VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE:
+    case VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE:
         return true;
     default:
         return false;
@@ -1507,53 +1509,72 @@ static GArray *sp_notice_touches(const SpHdr *h, const uint8_t *a)
     return t;
 }
 
-/* whether an earlier waiting command f holds back a command (its context, its
- * touches t if known, a stream, one that touches everything) */
-static bool sp_wait_blocks(const SpWait *f, uint32_t ctx, const GArray *t,
-                           bool stream, bool all)
+/* why an earlier waiting command f holds back a command (its context, its
+ * touches t if known, a stream, one that touches everything): 0 it does not;
+ * SP_WHY_*, with *res the resource of a conflict */
+enum { SP_WHY_NONE, SP_WHY_UNKNOWN, SP_WHY_CTX, SP_WHY_NOT_KNOWN, SP_WHY_READS_ALL, SP_WHY_TOUCH };
+
+static int sp_wait_blocks(const SpWait *f, uint32_t ctx, const GArray *t,
+                          bool stream, bool all, uint32_t *res)
 {
     if (f->unknown || f->all || all) {
-        return true;
+        return SP_WHY_UNKNOWN;
     }
     if (ctx && f->ctx == ctx) {
-        return true;
+        return SP_WHY_CTX;
     }
     if (!t) {
-        return !stream;
+        return stream ? SP_WHY_NONE : SP_WHY_NOT_KNOWN;
     }
     for (guint i = 0; i < t->len; i++) {
         const SpTouch *x = &g_array_index(t, SpTouch, i);
 
-        if (f->reads_all && x->kind == SP_TOUCH_RES && x->write) {
-            return true;    /* it may read what this writes */
+        /* it may read what this writes, if its context reaches it */
+        if (f->reads_all && x->kind == SP_TOUCH_RES && x->write &&
+            virgl_renderer_ctx_resource_attached(f->ctx, x->id)) {
+            *res = x->id;
+            return SP_WHY_READS_ALL;
         }
 
         for (guint j = 0; j < f->touch->len; j++) {
             const SpTouch *y = &g_array_index(f->touch, SpTouch, j);
 
             if (x->kind == y->kind && x->id == y->id && (x->write || y->write)) {
-                return true;
+                *res = x->kind == SP_TOUCH_RES ? x->id : 0;
+                return SP_WHY_TOUCH;
             }
         }
     }
-    return false;
+    return SP_WHY_NONE;
+}
+
+/* the first waiting command before upto that a command waits for, or NULL;
+ * *why and *res as sp_wait_blocks */
+static SpWait *sp_must_wait_for(uint32_t ctx, const GArray *t, bool stream, bool all,
+                                const SpWait *upto, int *why, uint32_t *res)
+{
+    SpWait *f;
+
+    QTAILQ_FOREACH(f, &sph.q, next) {
+        if (f == upto) {
+            break;
+        }
+        *why = sp_wait_blocks(f, ctx, t, stream, all, res);
+        if (*why) {
+            return f;
+        }
+    }
+    return NULL;
 }
 
 /* whether a command waits for one of the waiting commands before upto */
 static bool sp_must_wait(uint32_t ctx, const GArray *t, bool stream, bool all,
                          const SpWait *upto)
 {
-    const SpWait *f;
+    int why;
+    uint32_t res;
 
-    QTAILQ_FOREACH(f, &sph.q, next) {
-        if (f == upto) {
-            break;
-        }
-        if (sp_wait_blocks(f, ctx, t, stream, all)) {
-            return true;
-        }
-    }
-    return false;
+    return sp_must_wait_for(ctx, t, stream, all, upto, &why, &res);
 }
 
 /* the renderer holds (1) or lets go of (-1) what a waiting command touches */
@@ -1563,8 +1584,8 @@ static void sp_wait_hold(SpWait *e, int delta)
         return;
     }
     if (e->reads_all) {
-        /* resource 0: every resource, held for reading */
-        virgl_renderer_resource_hold(0, VIRGL_RESOURCE_HOLD_READ, delta);
+        /* what its context reaches, held for reading */
+        virgl_renderer_ctx_hold_reads(e->ctx, delta);
     }
     for (guint i = 0; i < e->touch->len; i++) {
         const SpTouch *x = &g_array_index(e->touch, SpTouch, i);
@@ -1724,7 +1745,9 @@ static void sp_hold_cmd(const SpHdr *h, SpRxMsg *m)
     uint32_t ctx = 0;
     bool unknown = false, reads_all = false, stream = false, nothing = false, all = false;
     SpRxMsg *grp = sph.grp;
-    SpWait *e;
+    SpWait *e, *f = NULL;
+    int why = SP_WHY_NONE;
+    uint32_t why_res = 0;
 
     sph.grp = sph.grp_tail = NULL;
     switch (h->type) {
@@ -1759,10 +1782,28 @@ static void sp_hold_cmd(const SpHdr *h, SpRxMsg *m)
     sp_rx_free(sph.notice);
     sph.notice = NULL;
     /* a stream whose reads are not known runs past what waits (the renderer stops it) */
-    if (nothing || !sp_must_wait(ctx, unknown || reads_all ? NULL : t, stream, all, NULL)) {
+    if (!nothing) {
+        f = sp_must_wait_for(ctx, unknown || reads_all ? NULL : t, stream, all, NULL,
+                             &why, &why_res);
+    }
+    if (nothing || !f) {
         g_array_free(t, true);
         sp_run_msgs(grp);
         return;
+    }
+    if (sph.log) {
+        static const char *const whys[] = {
+            "", "it waits for one whose touches are not known", "of its context",
+            "its touches are not known", "it writes what one may read", "it touches what one touches",
+        };
+
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink waits: %s 0x%x ctx=%u resource=%u: %s"
+                " (the waiting ctx=%u command=0x%x write=%" PRIu64 "%s)\n",
+                h->type == SP_CTRL ? "command" : "message",
+                h->type == SP_CTRL ? sp_req_u32(a, h->a_len, 0) : h->type, ctx,
+                why == SP_WHY_TOUCH || why == SP_WHY_READS_ALL ? why_res :
+                t->len ? g_array_index(t, SpTouch, 0).id : 0,
+                whys[why], f->ctx, f->type, f->w, f->stream && f->unknown ? ", a stream's rest" : "");
     }
     e = g_new0(SpWait, 1);
     e->msgs = grp;
@@ -1773,6 +1814,7 @@ static void sp_hold_cmd(const SpHdr *h, SpRxMsg *m)
     e->reads_all = reads_all;
     e->stream = stream;
     e->all = all;
+    e->type = h->type == SP_CTRL ? sp_req_u32(a, h->a_len, 0) : 0;
     if (unknown) {
         g_array_free(t, true);
     } else {
@@ -1909,6 +1951,7 @@ static void sp_hold_rest(struct virtio_gpu_ctrl_command *cmd, const uint8_t *res
     e->ctx = le32_to_cpu(cs.hdr.ctx_id);
     e->unknown = true;
     e->stream = true;
+    e->type = VIRTIO_GPU_CMD_SUBMIT_3D;
     if (sph.running && sph.at) {
         QTAILQ_INSERT_BEFORE(sph.at, e, next);
     } else {
@@ -1943,6 +1986,14 @@ bool sp_sink_submit_held(struct virtio_gpu_ctrl_command *cmd)
     memcpy(req, &cs, sizeof(cs));
     if (ret != VIRGL_SUBMIT_HELD) {
         return false;
+    }
+    if (sph.log) {
+        uint32_t hdr, res;
+
+        virgl_renderer_held_where(&hdr, &res);
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink stream stopped: ctx=%u at dword %d of %u,"
+                " command %u object %u resource=%u\n", le32_to_cpu(cs.hdr.ctx_id), done,
+                size / 4, hdr & 0xff, (hdr >> 8) & 0xff, res);
     }
     sp_hold_rest(cmd, req + sizeof(cs) + (size_t)done * 4, size / 4 - done);
     return true;

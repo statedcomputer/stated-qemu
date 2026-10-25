@@ -287,7 +287,9 @@ static int64_t sp_aud_delay_us; /* sink: how much later sound is played, 0 = sil
  * desktop comes out as updates 1, 2 or 3 refreshes apart. While pacing, the
  * presenter also does not show a frame sooner after the previous one than the
  * usual spacing of recent updates (their median, in whole refreshes), which
- * turns "1 then 3" into "2 then 2".
+ * turns "1 then 3" into "2 then 2". Of two updates a refresh apart with the
+ * next one a spacing after the first ("1 then 1": the page's other drawing
+ * beside the video frames), the later one replaces the earlier one.
  */
 int64_t spacebox_frame_due_us;
 int64_t spacebox_frame_gap_us;  /* usual spacing of recent updates, 0 = not a steady stream */

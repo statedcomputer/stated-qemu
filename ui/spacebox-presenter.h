@@ -32,6 +32,8 @@ typedef struct SpSlot {
     unsigned ntickets;
     int64_t flush_dev, flush_read;  /* its flush's message: sent, read */
     int src_w, src_h;
+    int64_t show_due;   /* due, or the due of the frame it replaces (sp_pair_updates) */
+    bool superseded;    /* replaced by the next frame (sp_pair_updates) */
 } SpSlot;
 typedef struct SpPresenter {
     SDL_Window *window;
@@ -43,7 +45,7 @@ typedef struct SpPresenter {
     CGDirectDisplayID display;  /* the display the link follows: the window's */
     int64_t display_checked;
     bool stop;
-    uint64_t tick, sequence, presented, discarded, busy;
+    uint64_t tick, sequence, presented, discarded, busy, superseded;
     /* the last tick of the display link (host time, mach_absolute_time):
      * the refresh it came at and the refresh it prepares for */
     uint64_t tick_now_host, tick_out_host;
@@ -193,6 +195,53 @@ static int sp_present_code(SpSlot *s, bool *ok, int64_t *read_us)
     return code;
 }
 
+/*
+ * Two paced frames of a stream one refresh apart, where the frame after them
+ * comes within the stream's usual spacing (and half a refresh) of the first,
+ * are a frame of the stream and an update of the page's other drawing (an
+ * animation of the page that plays the video, in its own rhythm), in either
+ * order. The later one replaces the earlier one at the earlier one's time:
+ * it was drawn later, so it shows the newer video frame and everything else.
+ * Shown as two frames, the update took the place of a frame of the stream in
+ * the spacing below and held the next video frame back by a refresh: 25 ms
+ * where 16.7 ms was due, 2 to 4% of a real YouTube video's frames at 60/s
+ * (the video task, turn G4c). A frame that the guest sent a refresh early,
+ * with the next one two spacings after the first, is not replaced (the
+ * spacing below holds it). Sets show_due and superseded of the ready slots.
+ */
+static void sp_pair_updates(SpPresenter *p, int64_t refresh_us)
+{
+    SpSlot *ord[SP_SLOTS];
+    int n = 0;
+
+    for (int i = 0; i < SP_SLOTS; i++) {
+        SpSlot *s = &p->slots[i];
+
+        if (s->state != SP_READY) {
+            continue;
+        }
+        s->show_due = s->due;
+        s->superseded = false;
+        int k = n++;
+        while (k > 0 && ord[k - 1]->sequence > s->sequence) {
+            ord[k] = ord[k - 1];
+            k--;
+        }
+        ord[k] = s;
+    }
+    for (int i = 0; i + 2 < n; i++) {
+        SpSlot *f = ord[i], *g = ord[i + 1], *h = ord[i + 2];
+
+        if (f->due && f->gap && g->due && g->gap && h->due &&
+            g->due > f->due && g->due - f->due < f->gap - refresh_us / 2 &&
+            h->due - f->due < f->gap + refresh_us / 2) {
+            f->superseded = true;
+            g->show_due = f->show_due;
+            i++;    /* the frame that replaced one does not pair again */
+        }
+    }
+}
+
 static bool sp_has_ready(SpPresenter *p)
 {
     for (int i = 0; i < SP_SLOTS; i++) if (p->slots[i].state == SP_READY) return true;
@@ -260,10 +309,11 @@ static void *sp_present_thread(void *opaque)
         int pick = -1, oldest = -1, newest = -1, n_due = 0;
         bool stream = true;
         int64_t pick_now = g_get_monotonic_time(), next_due = 0;
+        sp_pair_updates(p, refresh_us);
         for (int i = 0; i < SP_SLOTS; i++) {
             SpSlot *s = &p->slots[i];
-            if (s->state != SP_READY || !sp_fence_done(s->ready)) continue;
-            int64_t due = s->due ? s->due + phase_adj : 0;
+            if (s->state != SP_READY || s->superseded || !sp_fence_done(s->ready)) continue;
+            int64_t due = s->show_due ? s->show_due + phase_adj : 0;
             if (due > pick_now) {
                 if (!next_due || due < next_due) next_due = due;
                 continue;
@@ -305,7 +355,7 @@ static void *sp_present_thread(void *opaque)
             }
             qemu_mutex_unlock(&p->lock); continue;
         }
-        int64_t pick_due = p->slots[pick].due ? p->slots[pick].due + phase_adj : 0;
+        int64_t pick_due = p->slots[pick].show_due ? p->slots[pick].show_due + phase_adj : 0;
         bool pick_waited = waited_for_due && pick_due;
         waited_for_due = false;
         SpSlot *s = &p->slots[pick];
@@ -316,6 +366,7 @@ static void *sp_present_thread(void *opaque)
                 p->slots[i].sequence < s->sequence) {
                 p->slots[i].state = SP_FREE;
                 p->discarded++;
+                p->superseded += p->slots[i].superseded;
             }
         }
         qemu_mutex_unlock(&p->lock);
@@ -395,14 +446,15 @@ static void *sp_present_thread(void *opaque)
         int64_t now = g_get_monotonic_time();
         if (stats_us && now - last_stats > stats_us) {
             fprintf(stderr, "[SPACEBOX-PRESENT-STATS] us=%lld submitted=%llu presented=%llu coalesced=%llu busy=%llu"
-                    " refresh_us=%lld held1=%llu held2=%llu held3=%llu held4=%llu held5=%llu held6plus=%llu held_max_ms=%.1f\n",
+                    " refresh_us=%lld held1=%llu held2=%llu held3=%llu held4=%llu held5=%llu held6plus=%llu held_max_ms=%.1f"
+                    " superseded=%llu\n",
                     (long long)now, (unsigned long long)p->sequence,
                     (unsigned long long)p->presented, (unsigned long long)p->discarded,
                     (unsigned long long)p->busy, (long long)refresh_us,
                     (unsigned long long)held[1], (unsigned long long)held[2],
                     (unsigned long long)held[3], (unsigned long long)held[4],
                     (unsigned long long)held[5], (unsigned long long)held[6],
-                    held_max / 1000.0);
+                    held_max / 1000.0, (unsigned long long)p->superseded);
             memset(held, 0, sizeof(held));
             held_max = 0;
             last_stats = now;
@@ -514,6 +566,7 @@ static void sp_present_submit(struct sdl2_console *scon, SpSlot *s, int src_w, i
     s->submitted = g_get_monotonic_time();
     s->due = spacebox_frame_due_us;
     s->gap = spacebox_frame_gap_us;
+    s->superseded = false;
     spacebox_frame_due_us = 0;
     spacebox_frame_gap_us = 0;
     s->state = SP_READY;

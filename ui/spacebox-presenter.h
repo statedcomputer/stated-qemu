@@ -46,6 +46,7 @@ typedef struct SpPresenter {
     int64_t display_checked;
     bool stop;
     uint64_t tick, sequence, presented, discarded, busy, superseded;
+    int64_t shown_due;  /* the show_due of the frame on screen, 0 = none */
     /* the last tick of the display link (host time, mach_absolute_time):
      * the refresh it came at and the refresh it prepares for */
     uint64_t tick_now_host, tick_out_host;
@@ -200,14 +201,17 @@ static int sp_present_code(SpSlot *s, bool *ok, int64_t *read_us)
  * comes within the stream's usual spacing (and half a refresh) of the first,
  * are a frame of the stream and an update of the page's other drawing (an
  * animation of the page that plays the video, in its own rhythm), in either
- * order. The later one replaces the earlier one at the earlier one's time:
- * it was drawn later, so it shows the newer video frame and everything else.
+ * order, the first of them on time (within the spacing of the frame before
+ * it). The later one replaces the earlier one at the earlier one's time: it
+ * was drawn later, so it shows the newer video frame and everything else.
  * Shown as two frames, the update took the place of a frame of the stream in
  * the spacing below and held the next video frame back by a refresh: 25 ms
  * where 16.7 ms was due, 2 to 4% of a real YouTube video's frames at 60/s
  * (the video task, turn G4c). A frame that the guest sent a refresh early,
  * with the next one two spacings after the first, is not replaced (the
- * spacing below holds it). Sets show_due and superseded of the ready slots.
+ * spacing below holds it), nor is a late one that the next ones follow a
+ * refresh apart to catch up (each of them is a video frame). Sets show_due
+ * and superseded of the ready slots.
  */
 static void sp_pair_updates(SpPresenter *p, int64_t refresh_us)
 {
@@ -229,16 +233,21 @@ static void sp_pair_updates(SpPresenter *p, int64_t refresh_us)
         }
         ord[k] = s;
     }
-    for (int i = 0; i + 2 < n; i++) {
-        SpSlot *f = ord[i], *g = ord[i + 1], *h = ord[i + 2];
+    int64_t prev = p->shown_due;    /* the frame before the next one */
 
-        if (f->due && f->gap && g->due && g->gap && h->due &&
+    for (int i = 0; i < n; i++) {
+        SpSlot *f = ord[i], *g = i + 1 < n ? ord[i + 1] : NULL, *h = i + 2 < n ? ord[i + 2] : NULL;
+
+        if (h && f->due && f->gap && g->due && g->gap && h->due &&
+            (!prev || f->due - prev < f->gap + refresh_us / 2) &&
             g->due > f->due && g->due - f->due < f->gap - refresh_us / 2 &&
             h->due - f->due < f->gap + refresh_us / 2) {
             f->superseded = true;
             g->show_due = f->show_due;
             i++;    /* the frame that replaced one does not pair again */
+            f = g;
         }
+        prev = f->show_due;
     }
 }
 
@@ -360,6 +369,7 @@ static void *sp_present_thread(void *opaque)
         waited_for_due = false;
         SpSlot *s = &p->slots[pick];
         s->state = SP_READING;
+        p->shown_due = s->show_due;
         if (s->ready) { glDeleteSync(s->ready); s->ready = NULL; }
         for (int i = 0; i < SP_SLOTS; i++) {
             if (i != pick && p->slots[i].state == SP_READY &&

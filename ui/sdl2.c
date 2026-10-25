@@ -35,8 +35,16 @@
 #include "qemu/log.h"
 #include "qemu-main.h"
 
-#ifdef CONFIG_DARWIN
+#if defined(CONFIG_DARWIN) || defined(CONFIG_WIN32)
 void spacebox_scroll_tick(SDL_Window *window);
+#endif
+#ifdef CONFIG_WIN32
+/* ui/spacebox-scroll-win.c: true when the wheel event went to the guest's
+ * scroll agent */
+bool spacebox_scroll_wheel(const SDL_MouseWheelEvent *wev);
+#ifdef CONFIG_OPENGL
+#include <epoxy/wgl.h>
+#endif
 #endif
 
 static int sdl2_num_outputs;
@@ -91,6 +99,97 @@ static int spacebox_pixel_scale(void)
 #endif
 }
 
+#ifdef CONFIG_WIN32
+/*
+ * Windows: with SPACEBOX_RETINA_SCALE set (any value) the process is per-
+ * monitor DPI aware and SDL scales by the monitor's DPI, as macOS does for a
+ * Retina display: the window's size is in points (pixels at 96 per inch),
+ * its drawable in physical pixels, and the guest gets the drawable's size.
+ * The scale is the drawable's width over the window's (1.5 at 150%), read
+ * again at each change of the window; before there is a window, the scale of
+ * the main display.
+ */
+static double spacebox_win_scale = 1;
+
+static bool spacebox_win_dpi(void)
+{
+    return getenv("SPACEBOX_RETINA_SCALE") != NULL;
+}
+
+static int spacebox_points(int pixels)
+{
+    return (int)lround(pixels / spacebox_win_scale);
+}
+
+/*
+ * Keys of a Windows keyboard that SDL drops or Windows takes:
+ * - Print Screen: Windows 11 opens its screen capture with it, and SDL's own
+ *   hook of a grabbed keyboard (the Windows keys, Alt, Ctrl, Tab, Esc) does
+ *   not take it; while the keyboard is grabbed this hook does, for the guest.
+ * - Han/Eng and Hanja of a Korean keyboard (scan codes 0x72 and 0x71, 0xf2
+ *   and 0xf1 with the break bit): SDL 2 has no scan code for them and drops
+ *   them; they become SDL's LANG1 and LANG2 (QEMU's lang1 and lang2, the
+ *   guest's KEY_HANGEUL and KEY_HANJA). The keys have no break code, so each
+ *   press is a press and a release at once, as Linux's own keyboard driver
+ *   makes them. (A layout that makes the right Alt and Ctrl these keys gives
+ *   the scan codes of Alt and Ctrl, which SDL has: the guest gets those keys.)
+ */
+static HHOOK spacebox_print_hook_handle;
+
+static void spacebox_win_key(SDL_Scancode code, bool down)
+{
+    SDL_Event ev = {0};
+    SDL_Window *focus = SDL_GetKeyboardFocus();
+
+    ev.type = down ? SDL_KEYDOWN : SDL_KEYUP;
+    ev.key.windowID = focus ? SDL_GetWindowID(focus) : 0;
+    ev.key.state = down ? SDL_PRESSED : SDL_RELEASED;
+    ev.key.keysym.scancode = code;
+    ev.key.keysym.sym = SDL_GetKeyFromScancode(code);
+    SDL_PushEvent(&ev);
+}
+
+static LRESULT CALLBACK spacebox_print_proc(int code, WPARAM wp, LPARAM lp)
+{
+    KBDLLHOOKSTRUCT *k = (KBDLLHOOKSTRUCT *)lp;
+
+    if (code == HC_ACTION && k->vkCode == VK_SNAPSHOT && SDL_GetKeyboardFocus()) {
+        spacebox_win_key(SDL_SCANCODE_PRINTSCREEN, wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN);
+        return 1;
+    }
+    return CallNextHookEx(NULL, code, wp, lp);
+}
+
+static void spacebox_win_print_hook(bool on)
+{
+    if (on && !spacebox_print_hook_handle) {
+        spacebox_print_hook_handle = SetWindowsHookExW(WH_KEYBOARD_LL, spacebox_print_proc,
+                                                       GetModuleHandleW(NULL), 0);
+    } else if (!on && spacebox_print_hook_handle) {
+        UnhookWindowsHookEx(spacebox_print_hook_handle);
+        spacebox_print_hook_handle = NULL;
+    }
+}
+
+static void SDLCALL spacebox_win_message(void *data, void *hwnd, unsigned int msg,
+                                         Uint64 wp, Sint64 lp)
+{
+    int sc = (lp >> 16) & 0xff;
+
+    if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && (sc & 0x7f) >= 0x71 && (sc & 0x7f) <= 0x72) {
+        SDL_Scancode code = (sc & 0x7f) == 0x72 ? SDL_SCANCODE_LANG1 : SDL_SCANCODE_LANG2;
+
+        spacebox_win_key(code, true);
+        spacebox_win_key(code, false);
+    }
+}
+#else
+static int spacebox_points(int pixels)
+{
+    return pixels / spacebox_pixel_scale();
+}
+#endif
+
 static void spacebox_update_ui_info(struct sdl2_console *scon)
 {
     if (!scon->real_window || !dpy_ui_info_supported(scon->dcl.con)) return;
@@ -100,6 +199,24 @@ static void spacebox_update_ui_info(struct sdl2_console *scon)
     SDL_GetWindowSize(scon->real_window, &width, &height);
     info.width = width * spacebox_pixel_scale();
     info.height = height * spacebox_pixel_scale();
+#ifdef CONFIG_WIN32
+    if (spacebox_win_dpi()) {
+        int pw, ph;
+
+        /* the window's size in physical pixels */
+        SDL_GL_GetDrawableSize(scon->real_window, &pw, &ph);
+        if (pw > 0 && ph > 0 && width > 0) {
+            spacebox_win_scale = (double)pw / width;
+            info.width = pw;
+            info.height = ph;
+        }
+        if (spacebox_win_scale > 1.01) {
+            /* the density for the guest's compositor: the Mac's 220 per inch at 2x */
+            info.width_mm = info.width * 254 / 10 / (110 * spacebox_win_scale);
+            info.height_mm = info.height * 254 / 10 / (110 * spacebox_win_scale);
+        }
+    }
+#endif
     if (spacebox_pixel_scale() == 2) {
         /*
          * Tell the guest how dense the pixels are (220 per inch) through the
@@ -151,10 +268,26 @@ void sdl2_window_create(struct sdl2_console *scon)
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
     }
 #endif
+#ifdef CONFIG_WIN32
+    if (spacebox_win_dpi()) {
+        float ddpi;
+
+        flags |= SDL_WINDOW_ALLOW_HIGHDPI;
+        if (spacebox_win_scale == 1 && !SDL_GetDisplayDPI(0, &ddpi, NULL, NULL) && ddpi > 0) {
+            spacebox_win_scale = ddpi / 96.0;
+        }
+    }
+    if (scon->opengl && scon->opts->gl != DISPLAY_GL_MODE_ES) {
+        /* a core context of 4.x, as the Mac's core profile (4.1 there) */
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+    }
+#endif
     scon->real_window = SDL_CreateWindow("", SDL_WINDOWPOS_UNDEFINED,
                                          SDL_WINDOWPOS_UNDEFINED,
-                                         surface_width(scon->surface) / spacebox_pixel_scale(),
-                                         surface_height(scon->surface) / spacebox_pixel_scale(),
+                                         spacebox_points(surface_width(scon->surface)),
+                                         spacebox_points(surface_height(scon->surface)),
                                          flags);
     /*
      * Spacebox: SDL turns text input on by itself on desktop platforms. With it
@@ -178,6 +311,21 @@ void sdl2_window_create(struct sdl2_console *scon)
         SDL_SetHint(SDL_HINT_RENDER_BATCHING, "1");
 
         scon->winctx = SDL_GL_CreateContext(scon->real_window);
+#ifdef CONFIG_WIN32
+        if (scon->winctx) {
+            int profile = 0, major = 0, minor = 0;
+
+            SDL_GL_GetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, &profile);
+            SDL_GL_GetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, &major);
+            SDL_GL_GetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, &minor);
+            fprintf(stderr, "[SPACEBOX-GL] window context: %s, %s, %s; profile %s, asked %d.%d\n",
+                    (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER),
+                    (const char *)glGetString(GL_VERSION),
+                    profile == SDL_GL_CONTEXT_PROFILE_CORE ? "core" : "not core", major, minor);
+        } else {
+            fprintf(stderr, "[SPACEBOX-GL] no window context: %s\n", SDL_GetError());
+        }
+#endif
         const char *interval = getenv("SPACEBOX_SWAP_INTERVAL");
         int requested = interval ? atoi(interval) : 1;
         int rc = SDL_GL_SetSwapInterval(requested);
@@ -192,7 +340,11 @@ void sdl2_window_create(struct sdl2_console *scon)
         /* The SDL renderer is only used by sdl2-2D, when OpenGL is disabled */
         scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1, 0);
     }
+#ifdef CONFIG_WIN32
+    if (spacebox_win_dpi()) {
+#else
     if (spacebox_pixel_scale() == 2) {
+#endif
         int w, h, pw, ph;
         SDL_SetWindowPosition(scon->real_window, 100, 100);
         SDL_GetWindowSize(scon->real_window, &w, &h);
@@ -232,8 +384,8 @@ void sdl2_window_resize(struct sdl2_console *scon)
     }
 
     SDL_SetWindowSize(scon->real_window,
-                      surface_width(scon->surface) / spacebox_pixel_scale(),
-                      surface_height(scon->surface) / spacebox_pixel_scale());
+                      spacebox_points(surface_width(scon->surface)),
+                      spacebox_points(surface_height(scon->surface)));
     spacebox_update_ui_info(scon);
 }
 
@@ -361,6 +513,11 @@ static void sdl_grab_start(struct sdl2_console *scon)
     /* An absolute tablet needs no pointer confinement. */
     SDL_SetWindowGrab(scon->real_window,
         (qemu_input_is_absolute(scon->dcl.con) || absolute_enabled) ? SDL_FALSE : SDL_TRUE);
+#ifdef CONFIG_WIN32
+    /* the Windows keys, Alt+Tab and Print Screen go to the guest while grabbed */
+    SDL_SetWindowKeyboardGrab(scon->real_window, SDL_TRUE);
+    spacebox_win_print_hook(true);
+#endif
     gui_grab = 1;
     sdl_update_caption(scon);
 }
@@ -368,6 +525,10 @@ static void sdl_grab_start(struct sdl2_console *scon)
 static void sdl_grab_end(struct sdl2_console *scon)
 {
     SDL_SetWindowGrab(scon->real_window, SDL_FALSE);
+#ifdef CONFIG_WIN32
+    SDL_SetWindowKeyboardGrab(scon->real_window, SDL_FALSE);
+    spacebox_win_print_hook(false);
+#endif
     gui_grab = 0;
     sdl_show_cursor(scon);
     sdl_update_caption(scon);
@@ -676,6 +837,12 @@ static void handle_mousewheel(SDL_Event *ev)
     struct sdl2_console *scon = get_scon_from_window(ev->wheel.windowID);
     SDL_MouseWheelEvent *wev = &ev->wheel;
     InputButton btn;
+#ifdef CONFIG_WIN32
+    /* as the Mac's scroll events, which go to the agent before SDL has them */
+    if (scon && qemu_console_is_graphic(scon->dcl.con) && spacebox_scroll_wheel(wev)) {
+        return;
+    }
+#endif
     const char *trace=getenv("SPACEBOX_SCROLL_TRACE");
     if (trace) { FILE *f=fopen(trace,"a"); if(f) { fprintf(f,"{\"stage\":\"sdl\",\"host_us\":%lld,\"x\":%d,\"y\":%d,\"precise_x\":%.9g,\"precise_y\":%.9g,\"direction\":%u}\n",(long long)g_get_monotonic_time(),wev->x,wev->y,wev->preciseX,wev->preciseY,wev->direction); fclose(f); } }
 
@@ -804,7 +971,7 @@ void sdl2_poll_events(struct sdl2_console *scon)
             sdl_update_caption(scon);
         }
     }
-#ifdef CONFIG_DARWIN
+#if defined(CONFIG_DARWIN) || defined(CONFIG_WIN32)
     spacebox_scroll_tick(scon->real_window);
 #endif
     while (SDL_PollEvent(ev)) {
@@ -1001,6 +1168,15 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
         SDL_LogSetAllPriority(SDL_LOG_PRIORITY_VERBOSE);
     }
 
+#ifdef CONFIG_WIN32
+    if (spacebox_win_dpi()) {
+        SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+        SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "1");
+    }
+#endif
+#ifdef CONFIG_WIN32
+    SDL_SetWindowsMessageHook(spacebox_win_message, NULL);
+#endif
     if (SDL_Init(SDL_INIT_VIDEO)) {
         fprintf(stderr, "Could not initialize SDL(%s) - exiting\n",
                 SDL_GetError());
@@ -1138,4 +1314,36 @@ type_init(register_sdl1);
 
 #ifdef CONFIG_OPENGL
 module_dep("ui-opengl");
+#endif
+
+#if defined(CONFIG_WIN32) && defined(CONFIG_OPENGL)
+/* include/ui/sdl2.h: SDL's calls that make a context current, told to epoxy */
+#undef SDL_GL_MakeCurrent
+#undef SDL_GL_CreateContext
+static __thread SDL_GLContext spacebox_gl_current;
+
+int sdl2_win_gl_make_current(SDL_Window *window, SDL_GLContext ctx)
+{
+    int r = SDL_GL_MakeCurrent(window, ctx);
+
+    if (!r) {
+        if (ctx && ctx != spacebox_gl_current) {
+            epoxy_handle_external_wglMakeCurrent();
+        }
+        spacebox_gl_current = ctx;
+    }
+    return r;
+}
+
+SDL_GLContext sdl2_win_gl_create_context(SDL_Window *window)
+{
+    SDL_GLContext ctx = SDL_GL_CreateContext(window);
+
+    if (ctx) {
+        /* SDL made it current */
+        epoxy_handle_external_wglMakeCurrent();
+        spacebox_gl_current = ctx;
+    }
+    return ctx;
+}
 #endif

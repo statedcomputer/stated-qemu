@@ -26,6 +26,19 @@
 # include "ui/egl-helpers.h"
 #endif
 
+#if defined(CONFIG_WIN32) && defined(CONFIG_OPENGL)
+/*
+ * Spacebox: libepoxy resolves GL per WGL context on Windows. A context that
+ * SDL makes current (not epoxy's own wglMakeCurrent) is told to it, so that
+ * what QEMU and the renderer then call on that thread goes to that context's
+ * functions (ui/sdl2.c).
+ */
+int sdl2_win_gl_make_current(SDL_Window *window, SDL_GLContext ctx);
+SDL_GLContext sdl2_win_gl_create_context(SDL_Window *window);
+#define SDL_GL_MakeCurrent sdl2_win_gl_make_current
+#define SDL_GL_CreateContext sdl2_win_gl_create_context
+#endif
+
 struct sdl2_console {
     DisplayGLCtx dgc;
     DisplayChangeListener dcl;

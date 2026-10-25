@@ -104,7 +104,9 @@ static int spacebox_pixel_scale(void)
  * Windows: with SPACEBOX_RETINA_SCALE set (any value) the process is per-
  * monitor DPI aware and SDL scales by the monitor's DPI, as macOS does for a
  * Retina display: the window's size is in points (pixels at 96 per inch),
- * its drawable in physical pixels, and the guest gets the drawable's size.
+ * its drawable in physical pixels, and the guest gets the drawable's size;
+ * at 100% the guest gets what the Mac's sink gives it on a display without
+ * Retina, twice the points (spacebox_update_ui_info).
  * The scale is the drawable's width over the window's (1.5 at 150%), read
  * again at each change of the window; before there is a window, the scale of
  * the main display.
@@ -118,9 +120,16 @@ static bool spacebox_win_dpi(void)
     return getenv("SPACEBOX_RETINA_SCALE") != NULL;
 }
 
+/* the guest's pixels for a point: the monitor's scale, or the Mac's 2 at 100%
+ * (spacebox_update_ui_info) */
+static double spacebox_win_guest_scale(void)
+{
+    return spacebox_win_scale > 1.01 ? spacebox_win_scale : 2.0;
+}
+
 static int spacebox_points(int pixels)
 {
-    return (int)lround(pixels / spacebox_win_scale);
+    return (int)lround(pixels / (spacebox_win_dpi() ? spacebox_win_guest_scale() : 1.0));
 }
 
 /*
@@ -216,6 +225,20 @@ static void spacebox_update_ui_info(struct sdl2_console *scon)
             /* the density for the guest's compositor: the Mac's 220 per inch at 2x */
             info.width_mm = info.width * 254 / 10 / (110 * spacebox_win_scale);
             info.height_mm = info.height * 254 / 10 / (110 * spacebox_win_scale);
+        } else {
+            /*
+             * A display at 100%: what the Mac's sink gives the guest on a
+             * display without Retina (spacebox_pixel_scale: twice the
+             * window's points, 220 per inch), shown scaled to the window
+             * (whose size in points is then half the guest's surface:
+             * spacebox_points). The guest's desktop keeps the scale 2 (its
+             * agent), so with the window's own pixels it would have half the
+             * window's points.
+             */
+            info.width = width * spacebox_win_guest_scale();
+            info.height = height * spacebox_win_guest_scale();
+            info.width_mm = info.width * 254 / 10 / 220;
+            info.height_mm = info.height * 254 / 10 / 220;
         }
     }
 #endif

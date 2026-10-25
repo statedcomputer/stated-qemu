@@ -110,6 +110,8 @@ static int spacebox_pixel_scale(void)
  * the main display.
  */
 static double spacebox_win_scale = 1;
+/* the keyboard is grabbed (spacebox_win_kbd_grab) */
+static bool spacebox_kbd_grab, spacebox_kbd_saved;
 
 static bool spacebox_win_dpi(void)
 {
@@ -412,9 +414,15 @@ static void sdl_update_caption(struct sdl2_console *scon)
     unsigned gen;
     const char *gpu = spacebox_gpu_caption(&gen);
 
+#ifdef CONFIG_WIN32
+    bool grabbed = gui_grab || spacebox_kbd_grab;
+#else
+    bool grabbed = gui_grab;
+#endif
+
     if (!runstate_is_running()) {
         status = " [Stopped]";
-    } else if (gui_grab) {
+    } else if (grabbed) {
         if (alt_grab) {
 #ifdef CONFIG_DARWIN
             status = " - Press ⌃⌥⇧G to exit grab";
@@ -513,11 +521,6 @@ static void sdl_grab_start(struct sdl2_console *scon)
     /* An absolute tablet needs no pointer confinement. */
     SDL_SetWindowGrab(scon->real_window,
         (qemu_input_is_absolute(scon->dcl.con) || absolute_enabled) ? SDL_FALSE : SDL_TRUE);
-#ifdef CONFIG_WIN32
-    /* the Windows keys, Alt+Tab and Print Screen go to the guest while grabbed */
-    SDL_SetWindowKeyboardGrab(scon->real_window, SDL_TRUE);
-    spacebox_win_print_hook(true);
-#endif
     gui_grab = 1;
     sdl_update_caption(scon);
 }
@@ -525,14 +528,28 @@ static void sdl_grab_start(struct sdl2_console *scon)
 static void sdl_grab_end(struct sdl2_console *scon)
 {
     SDL_SetWindowGrab(scon->real_window, SDL_FALSE);
-#ifdef CONFIG_WIN32
-    SDL_SetWindowKeyboardGrab(scon->real_window, SDL_FALSE);
-    spacebox_win_print_hook(false);
-#endif
     gui_grab = 0;
     sdl_show_cursor(scon);
     sdl_update_caption(scon);
 }
+
+#ifdef CONFIG_WIN32
+/*
+ * The keyboard is grabbed, so that the Windows keys, Alt+Tab and Print Screen
+ * go to the guest, by the hotkey Ctrl+Alt+G and in full screen, and released
+ * by the hotkey again, at the end of full screen and when the window loses
+ * the focus. It is not grabbed by the pointer's entering the window, which
+ * on an absolute tablet starts QEMU's grab (absolute_mouse_grab): the user's
+ * Alt+Tab and Windows keys stay the user's then.
+ */
+static void spacebox_win_kbd_grab(struct sdl2_console *scon, bool on)
+{
+    spacebox_kbd_grab = on;
+    SDL_SetWindowKeyboardGrab(scon->real_window, on ? SDL_TRUE : SDL_FALSE);
+    spacebox_win_print_hook(on);
+    sdl_update_caption(scon);
+}
+#endif
 
 static void absolute_mouse_grab(struct sdl2_console *scon)
 {
@@ -607,10 +624,17 @@ static void toggle_full_screen(struct sdl2_console *scon)
                                 SDL_WINDOW_FULLSCREEN_DESKTOP);
         gui_saved_grab = gui_grab;
         sdl_grab_start(scon);
+#ifdef CONFIG_WIN32
+        spacebox_kbd_saved = spacebox_kbd_grab;
+        spacebox_win_kbd_grab(scon, true);
+#endif
     } else {
         if (!gui_saved_grab) {
             sdl_grab_end(scon);
         }
+#ifdef CONFIG_WIN32
+        spacebox_win_kbd_grab(scon, spacebox_kbd_saved);
+#endif
         SDL_SetWindowFullscreen(scon->real_window, 0);
     }
     sdl2_redraw(scon);
@@ -696,6 +720,11 @@ static void handle_keydown(SDL_Event *ev)
             break;
         case SDL_SCANCODE_G:
             scon->gui_keysym = true;
+#ifdef CONFIG_WIN32
+            if (!gui_fullscreen) {
+                spacebox_win_kbd_grab(scon, !spacebox_kbd_grab);
+            }
+#endif
             if (!gui_grab) {
                 sdl_grab_start(scon);
             } else if (!gui_fullscreen) {
@@ -912,6 +941,11 @@ static void handle_windowevent(SDL_Event *ev)
         if (gui_grab && !gui_fullscreen) {
             sdl_grab_end(scon);
         }
+#ifdef CONFIG_WIN32
+        if (spacebox_kbd_grab && !gui_fullscreen) {
+            spacebox_win_kbd_grab(scon, false);
+        }
+#endif
         break;
     case SDL_WINDOWEVENT_RESTORED:
         update_displaychangelistener(&scon->dcl, GUI_REFRESH_INTERVAL_DEFAULT);
@@ -1187,6 +1221,10 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
 #endif
 #ifdef CONFIG_DARWIN
     /* Keep macOS application switching available with the absolute tablet. */
+    SDL_SetHint(SDL_HINT_GRAB_KEYBOARD, "0");
+#elif defined(CONFIG_WIN32)
+    /* The keyboard is grabbed apart from the pointer (spacebox_win_kbd_grab):
+     * with this hint each release of the pointer released it too. */
     SDL_SetHint(SDL_HINT_GRAB_KEYBOARD, "0");
 #else
     SDL_SetHint(SDL_HINT_GRAB_KEYBOARD, "1");

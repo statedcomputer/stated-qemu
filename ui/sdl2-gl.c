@@ -59,7 +59,7 @@ static void sdl2_gl_render_surface(struct sdl2_console *scon)
     sdl2_set_scanout_mode(scon, false);
 
     SDL_GL_GetDrawableSize(scon->real_window, &ww, &wh);
-#ifdef CONFIG_DARWIN
+#ifdef SPACEBOX_PRESENTER
     if (scon->presenter) {
         SpSlot *slot = sp_present_acquire(scon, ww, wh);
         if (!slot) return;
@@ -261,7 +261,7 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
     SDL_GL_MakeCurrent(scon->real_window, scon->renderctx ? scon->renderctx : scon->winctx);
 
     SDL_GL_GetDrawableSize(scon->real_window, &ww, &wh);
-#ifdef CONFIG_DARWIN
+#ifdef SPACEBOX_PRESENTER
     if (scon->presenter) {
         SpSlot *slot = sp_present_acquire(scon, ww, wh);
         if (!slot) return;

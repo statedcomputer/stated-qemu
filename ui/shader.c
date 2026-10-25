@@ -155,8 +155,8 @@ QemuGLShader *qemu_gl_init_shader(void)
     const char *header = epoxy_is_desktop_gl() ? "#version 140\n" : "#version 300 es\n";
     char vert_src[256];
     char frag_src[256];
-    char *vert_src_body = stpcpy(vert_src, header);
-    char *frag_src_body = stpcpy(frag_src, header);
+    char *vert_src_body = g_stpcpy(vert_src, header);
+    char *frag_src_body = g_stpcpy(frag_src, header);
 
     strcpy(vert_src_body, texture_blit_vert_src);
     strcpy(frag_src_body, texture_blit_frag_src);

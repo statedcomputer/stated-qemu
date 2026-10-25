@@ -13,6 +13,8 @@
  *
  * SPACEBOX_GPU_REMOTE_SOURCE=<unix socket>  connect to a sink (retries)
  * SPACEBOX_GPU_REMOTE_SINK=<unix socket>    listen for one source
+ *                                           (either: HOST:PORT for TCP instead,
+ *                                           see sp_addr_is_tcp())
  * SPACEBOX_GPU_REMOTE_STATS=1               print traffic counters every 5 s
  * SPACEBOX_GPU_REMOTE_FENCE_WINDOW=<n>      source: answer up to n fenced commands
  *                                           before the sink has finished them
@@ -88,8 +90,10 @@
 #include <zstd.h>
 #endif
 
+#ifndef _WIN32
 #include <sys/socket.h>
 #include <sys/un.h>
+#endif
 
 #define SP_MAGIC 0x32475053u /* "SPG2" */
 #define SP_RESP_CAP_MAX (4u << 20)
@@ -2161,6 +2165,107 @@ static void sp_rx(void *opaque)
     }
 }
 
+#ifdef _WIN32
+/* the notifier is an event object on Windows, not a file descriptor */
+static void sp_rx_notified(EventNotifier *e)
+{
+    sp_rx(NULL);
+}
+#endif
+
+/*
+ * The address of a socket of the link (SPACEBOX_GPU_REMOTE_SINK, _SOURCE,
+ * _AUDIO, and SPACEBOX_SCROLL_SOCKET in ui/): a Unix socket's path, or
+ * HOST:PORT for TCP, a value with no '/' or '\\' that ends in ':' and digits.
+ * On Windows the local end of the SSH forward to the lab can be TCP on
+ * 127.0.0.1 (screen/windows/ of the spacebox repository); a path there is a
+ * Unix socket too (AF_UNIX, afunix.h).
+ */
+bool sp_addr_is_tcp(const char *a)
+{
+    const char *c = strrchr(a, ':');
+
+    if (!c || c == a || !c[1] || strpbrk(a, "/\\")) {
+        return false;
+    }
+    for (c++; *c; c++) {
+        if (!g_ascii_isdigit(*c)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* A stream of the link on TCP has no Nagle delay, as a Unix socket has none. */
+void sp_sock_tune(int fd)
+{
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof(ss);
+
+    if (getsockname(fd, (struct sockaddr *)&ss, &len) == 0 &&
+        (ss.ss_family == AF_INET || ss.ss_family == AF_INET6)) {
+        socket_set_nodelay(fd);
+    }
+}
+
+/* A socket listening on the address (a Unix socket's path is unlinked
+ * first); -1 with errno set when it cannot listen. */
+int sp_sock_listen(const char *a)
+{
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    int fd, e;
+
+    if (sp_addr_is_tcp(a)) {
+        Error *err = NULL;
+        SocketAddress *sa = socket_parse(a, &err);
+
+        fd = sa ? socket_listen(sa, 1, &err) : -1;
+        qapi_free_SocketAddress(sa);
+        if (fd < 0) {
+            error_report_err(err);
+            errno = EADDRNOTAVAIL;
+        }
+        return fd;
+    }
+    g_strlcpy(addr.sun_path, a, sizeof(addr.sun_path));
+    unlink(a);
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0 || bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
+        listen(fd, 1) < 0) {
+        e = errno;
+        if (fd >= 0) {
+            close(fd);
+        }
+        errno = e;
+        return -1;
+    }
+    return fd;
+}
+
+/* A stream connected to the address (blocking), or -1. */
+int sp_sock_connect(const char *a)
+{
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    int fd;
+
+    if (sp_addr_is_tcp(a)) {
+        SocketAddress *sa = socket_parse(a, NULL);
+
+        fd = sa ? socket_connect(sa, NULL) : -1;
+        qapi_free_SocketAddress(sa);
+        return fd;
+    }
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    g_strlcpy(addr.sun_path, a, sizeof(addr.sun_path));
+    if (fd < 0 || connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        return -1;
+    }
+    return fd;
+}
+
 static void sp_set_connected(int fd)
 {
     int yes = 1;
@@ -2169,6 +2274,7 @@ static void sp_set_connected(int fd)
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
 #endif
     (void)yes;
+    sp_sock_tune(fd);
     qemu_mutex_lock(&sp.tx_lock);
     sp.fd = fd;
     sp.hello_done = false;
@@ -3260,7 +3366,6 @@ static void sp_source_input(SpHdr *h, uint8_t *a)
 static void sp_source_connect(void *opaque)
 {
     VirtIOGPU *g = sp.g;
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
     int fd;
 
     if (sp.fd >= 0) {
@@ -3268,12 +3373,8 @@ static void sp_source_connect(void *opaque)
         sp_source_handle_ctrl(g, g->ctrl_vq);
         return;
     }
-    fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    g_strlcpy(addr.sun_path, sp.path, sizeof(addr.sun_path));
-    if (fd < 0 || connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        if (fd >= 0) {
-            close(fd);
-        }
+    fd = sp_sock_connect(sp.path);
+    if (fd < 0) {
         timer_mod(sp.retry, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 250);
         return;
     }
@@ -4186,6 +4287,56 @@ bool spacebox_sink_close(void)
  * loop reads. A signal that comes while the sink already waits for the bye is
  * logged and changes nothing: SP_CLOSE_WAIT_MS bounds the wait.
  */
+#ifdef _WIN32
+/*
+ * Windows has no signals for this: a console's Ctrl+C and Ctrl+Break, the
+ * close of its console, the logoff and the shutdown come to a handler that
+ * the system calls on a thread of its own. QEMU's (os-win32.c) ends the
+ * process at once; this one, set later and so called first, hands the event
+ * to the main loop by a bottom half, which closes as a signal does. For the
+ * close, the logoff and the shutdown the system ends the process when the
+ * handler returns (at most 5 s after the event), so the handler waits up to
+ * 4.5 s for the bye first. (The stop script on Windows closes the window
+ * instead: WM_CLOSE, ui/sdl2.c.)
+ */
+static QEMUBH *sp_sig_bh;
+static int sp_sig_event;
+
+static void sp_sink_signal_read(void *opaque)
+{
+    int ev = qatomic_read(&sp_sig_event);
+
+    if (sp.closing) {
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink got console event %d while it "
+                "waits for the bye: no change\n", ev);
+        return;
+    }
+    fprintf(stderr, "[SPACEBOX-REMOTE] sink got console event %d: closing as "
+            "its window would\n", ev);
+    spacebox_sink_close();
+}
+
+static BOOL WINAPI sp_sink_console_event(DWORD ev)
+{
+    qatomic_set(&sp_sig_event, (int)ev);
+    qemu_bh_schedule(sp_sig_bh);
+    if (ev == CTRL_C_EVENT || ev == CTRL_BREAK_EVENT) {
+        return TRUE;
+    }
+    Sleep(4500);
+    return TRUE;
+}
+
+/* From the main loop: QEMU sets its handlers after the devices are made. */
+static void sp_sink_signals_install(void *opaque)
+{
+    sp_sig_bh = qemu_bh_new(sp_sink_signal_read, NULL);
+    if (!SetConsoleCtrlHandler(sp_sink_console_event, TRUE)) {
+        error_report("spacebox remote gpu: no handler for console events; "
+                     "Ctrl+C ends the sink without a detach");
+    }
+}
+#else
 static int sp_sig_fd[2] = { -1, -1 };
 
 static void sp_sink_signal(int sig)
@@ -4237,6 +4388,7 @@ static void sp_sink_signals_install(void *opaque)
         sigaction(sigs[i], &act, NULL);
     }
 }
+#endif
 
 static void sp_input_event(DeviceState *dev, QemuConsole *src, InputEvent *evt)
 {
@@ -4359,7 +4511,9 @@ static void sp_disconnected(void)
             qemu_set_fd_handler(sp.listen_fd, NULL, NULL, NULL);
             close(sp.listen_fd);
             sp.listen_fd = -1;
-            unlink(sp.path);
+            if (!sp_addr_is_tcp(sp.path)) {
+                unlink(sp.path);
+            }
         }
         fprintf(stderr, "[SPACEBOX-REMOTE] sink detached: the source said bye; "
                 "connection closed, not listening, exiting\n");
@@ -4636,7 +4790,6 @@ static void sp_ach_close(void)
 
 static bool sp_ach_source_ready(void)
 {
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
     int64_t now = g_get_monotonic_time();
     int fd;
 
@@ -4653,15 +4806,11 @@ static bool sp_ach_source_ready(void)
         return false;
     }
     sp_ach.last_try = now;
-    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    fd = sp_sock_connect(sp_ach.path);
     if (fd < 0) {
         return false;
     }
-    g_strlcpy(addr.sun_path, sp_ach.path, sizeof(addr.sun_path));
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(fd);
-        return false;
-    }
+    sp_sock_tune(fd);
     qemu_socket_set_nonblock(fd);
 #ifdef SO_NOSIGPIPE
     {
@@ -4684,18 +4833,27 @@ void spacebox_remote_audio_out(int freq, int channels, const void *buf, size_t l
             .magic = SP_MAGIC, .type = SP_AUDIO, .a_len = len,
             .arg0 = freq, .arg1 = channels, .t_us = g_get_monotonic_time(),
         };
+        ssize_t n;
+#ifdef _WIN32
+        /* no sendmsg: the header and the sound in one send, as one write */
+        g_autofree uint8_t *one = g_malloc(sizeof(h) + len);
+
+        memcpy(one, &h, sizeof(h));
+        memcpy(one + sizeof(h), buf, len);
+        n = send(sp_ach.fd, one, sizeof(h) + len, 0);
+#else
         struct iovec iov[2] = {
             { .iov_base = &h, .iov_len = sizeof(h) },
             { .iov_base = (void *)buf, .iov_len = len },
         };
         struct msghdr m = { .msg_iov = iov, .msg_iovlen = 2 };
-        ssize_t n;
         int flags = 0;
 
 #ifdef MSG_NOSIGNAL
         flags |= MSG_NOSIGNAL;
 #endif
         n = sendmsg(sp_ach.fd, &m, flags);
+#endif
         if (n == (ssize_t)(sizeof(h) + len)) {
             sp_ach.sent++;
             return;
@@ -4974,6 +5132,7 @@ static void sp_ach_sink_accept(void *opaque)
         return;
     }
     sp_ach_close();     /* the newer connection wins */
+    sp_sock_tune(fd);
     qemu_socket_set_nonblock(fd);
     sp_ach.fd = fd;
     qemu_set_fd_handler(fd, sp_ach_sink_rx, NULL, NULL);
@@ -4981,19 +5140,14 @@ static void sp_ach_sink_accept(void *opaque)
 
 static void sp_ach_sink_listen(void)
 {
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
     const char *path = getenv("SPACEBOX_GPU_REMOTE_AUDIO");
 
     if (!path || !*path) {
         return;
     }
     sp_ach.rx = g_byte_array_new();
-    g_strlcpy(addr.sun_path, path, sizeof(addr.sun_path));
-    unlink(path);
-    sp_ach.listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sp_ach.listen_fd < 0 ||
-        bind(sp_ach.listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
-        listen(sp_ach.listen_fd, 1) < 0) {
+    sp_ach.listen_fd = sp_sock_listen(path);
+    if (sp_ach.listen_fd < 0) {
         warn_report("spacebox remote gpu: cannot listen for sound on %s", path);
         return;
     }
@@ -5319,7 +5473,11 @@ void sp_remote_realize(VirtIOGPU *g, Error **errp)
         error_setg(errp, "spacebox remote gpu: no notifier for the link's reader");
         return;
     }
+#ifdef _WIN32
+    event_notifier_set_handler(&sp.rx_notify, sp_rx_notified);
+#else
     qemu_set_fd_handler(event_notifier_get_fd(&sp.rx_notify), sp_rx, NULL, NULL);
+#endif
     qemu_mutex_init(&sp.tx_lock);
     qemu_cond_init(&sp.tx_cond);
     g_queue_init(&sp.tx_queue);
@@ -5345,7 +5503,6 @@ void sp_remote_realize(VirtIOGPU *g, Error **errp)
         sp.retry = timer_new_ms(QEMU_CLOCK_REALTIME, sp_source_connect, NULL);
         timer_mod(sp.retry, qemu_clock_get_ms(QEMU_CLOCK_REALTIME));
     } else {
-        struct sockaddr_un addr = { .sun_family = AF_UNIX };
         const char *prof = getenv("SPACEBOX_GPU_REMOTE_PROFILE");
 
         if (prof && *prof && !sp_profile_load(prof, errp)) {
@@ -5355,12 +5512,8 @@ void sp_remote_realize(VirtIOGPU *g, Error **errp)
                                           NULL, g_free);
         sp.watch = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                          NULL, g_free);
-        g_strlcpy(addr.sun_path, sp.path, sizeof(addr.sun_path));
-        unlink(sp.path);
-        sp.listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (sp.listen_fd < 0 ||
-            bind(sp.listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
-            listen(sp.listen_fd, 1) < 0) {
+        sp.listen_fd = sp_sock_listen(sp.path);
+        if (sp.listen_fd < 0) {
             error_setg_errno(errp, errno, "spacebox remote gpu: cannot listen "
                              "on %s", sp.path);
             return;

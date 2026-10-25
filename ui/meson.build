@@ -125,6 +125,10 @@ if sdl.found()
     sdl_ss.add(dependency('appleframeworks', modules: ['CoreVideo', 'CoreGraphics', 'AppKit']))
     sdl_ss.add(files('spacebox-scroll.m'))
   endif
+  if host_os == 'windows'
+    # spacebox: the presenter's display timing (DXGI, the DWM)
+    sdl_ss.add(cc.find_library('dxgi'), cc.find_library('dwmapi'))
+  endif
   sdl_ss.add(sdl, sdl_image, pixman, glib, files(
     'sdl2-2d.c',
     'sdl2-input.c',

@@ -29,7 +29,11 @@
  *         stop, the controls, the test pause
  * Every time is CLOCK_MONOTONIC in microseconds (this clock is
  * g_get_monotonic_time(), which on macOS does not count sleep: the
- * difference is taken at the record's start).
+ * difference is taken at the record's start). On Windows CLOCK_MONOTONIC is
+ * the QueryPerformanceCounter's (as winpthreads' clock_gettime, which
+ * virglrenderer reads there), and each swap line has the counter's own
+ * values at the swap's call and return (qpc_call, qpc_ret; qpc_hz in the
+ * record's start), the clock of PresentMon's events.
  *
  * Tickets come from virglrenderer (virgl_renderer_video_record): a picture's
  * ticket follows it into what the draws that read it write, so the scanout
@@ -109,6 +113,19 @@ static struct {
     int64_t read_us, read_max, main_us;
 } rec;
 
+#ifdef _WIN32
+/* as winpthreads' clock_gettime(CLOCK_MONOTONIC), to the microsecond */
+static int64_t sp_rec_mono(void)
+{
+    LARGE_INTEGER f, c;
+    int64_t ns;
+
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    ns = ((c.QuadPart % f.QuadPart) * 1000000000 + (f.QuadPart >> 1)) / f.QuadPart;
+    return (int64_t)(c.QuadPart / f.QuadPart) * 1000000 + ns / 1000;
+}
+#else
 static int64_t sp_rec_mono(void)
 {
     struct timespec ts;
@@ -116,6 +133,7 @@ static int64_t sp_rec_mono(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
+#endif
 
 /* a time of this clock as CLOCK_MONOTONIC, or null */
 static void sp_rec_time(GString *s, const char *key, int64_t g)
@@ -324,7 +342,8 @@ void spacebox_video_record_swap(uint64_t seq, int64_t t_swap, int code,
                                 unsigned n, uint64_t coalesced, int64_t read_us,
                                 int64_t t_show, int64_t t_call, int64_t t_vsync,
                                 int64_t t_out, int64_t t_due, int64_t t_flush_dev,
-                                int64_t t_flush_read)
+                                int64_t t_flush_read, int64_t qpc_call,
+                                int64_t qpc_ret)
 {
     GString *s;
 
@@ -353,6 +372,10 @@ void spacebox_video_record_swap(uint64_t seq, int64_t t_swap, int code,
     sp_rec_time(s, "t_due_us", t_due);
     sp_rec_time(s, "t_flush_dev", t_flush_dev);
     sp_rec_time(s, "t_flush_read", t_flush_read);
+    if (qpc_call || qpc_ret) {
+        g_string_append_printf(s, ",\"qpc_call\":%" PRId64 ",\"qpc_ret\":%" PRId64,
+                               qpc_call, qpc_ret);
+    }
     g_string_append_c(s, '}');
     sp_rec_put(s);
     for (unsigned i = 0; i < n; i++) {
@@ -470,13 +493,26 @@ static char *sp_rec_build(void)
             exe = g_strdup(buf);
         }
     }
+#elif defined(_WIN32)
+    {
+        wchar_t buf[4096];
+        DWORD n = GetModuleFileNameW(NULL, buf, G_N_ELEMENTS(buf));
+
+        if (n && n < G_N_ELEMENTS(buf)) {
+            exe = g_utf16_to_utf8(buf, n, NULL, NULL, NULL);
+        }
+    }
 #else
     exe = g_file_read_link("/proc/self/exe", NULL);
 #endif
     if (!exe) {
         return NULL;
     }
+#ifdef _WIN32
+    real = g_canonicalize_filename(exe, NULL);
+#else
     real = realpath(exe, NULL);
+#endif
     dir = g_path_get_dirname(real ? real : exe);
     name = g_path_get_basename(dir);
     return strcmp(name, "qemu-build") ? NULL : g_path_get_dirname(dir);
@@ -512,6 +548,16 @@ static void sp_rec_start(const char *path)
 
         build = g_strdup_printf(",\"sink_build\":\"%s\"", qb);
     }
+#ifdef _WIN32
+    {
+        LARGE_INTEGER hz;
+        g_autofree char *b2 = build;
+
+        QueryPerformanceFrequency(&hz);
+        build = g_strdup_printf("%s,\"qpc_hz\":%" PRId64, b2 ? b2 : "",
+                                (int64_t)hz.QuadPart);
+    }
+#endif
     more = g_strdup_printf(",\"path\":\"%s\",\"clock\":\"CLOCK_MONOTONIC\","
                            "\"video_rect\":%s,\"video_size\":%s,\"version\":1%s",
                            qpath, rect, size, build ? build : "");

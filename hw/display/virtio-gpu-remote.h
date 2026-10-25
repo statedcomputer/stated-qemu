@@ -90,6 +90,13 @@ void sp_sink_gpu(bool on);
  * handed over, at a transition (at: what happens) */
 void sp_video_pending_log(const char *at);
 
+/* the sockets of the link: a Unix socket's path or HOST:PORT (TCP); also
+ * the scroll socket of ui/spacebox-scroll-win.c */
+bool sp_addr_is_tcp(const char *a);
+int sp_sock_listen(const char *a);
+int sp_sock_connect(const char *a);
+void sp_sock_tune(int fd);
+
 /* virtio-gpu-remote-record.c: the record of video frames */
 void sp_record_realize(void);
 bool sp_record_control(const char *text);

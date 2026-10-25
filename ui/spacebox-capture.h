@@ -1,5 +1,11 @@
 /* Optional measurement hook. Captures this client's GL back buffer only,
  * never the macOS desktop or other applications. Disabled without env paths.
+ * On Windows the presenter (the client's way of showing frames: sink_cmd.py)
+ * captures the guest's picture at the guest's own size (its frame as it is
+ * shown, before it is scaled to the window: spacebox_capture_client_from), so
+ * that a check compares it with the guest's pixels one to one; at a display
+ * scale of 100% the window shows that picture at half its size (ui/sdl2.c).
+ * On the Mac the window's back buffer is that size already (Retina).
  *
  * The request file is looked at every 100 ms, at a frame shown. Empty, it asks
  * for one picture of the next frame (SPACEBOX_CAPTURE_PPM). "series DIR N MS
@@ -9,7 +15,9 @@
  * screen changes or the window needs it). */
 #include "ui/spacebox-hook.h"
 
-static void spacebox_capture_write(const char *path, int width, int height)
+/* the picture of read framebuffer fb (0: the window's back buffer), width x
+ * height from its origin, written top row first */
+static void spacebox_capture_write(const char *path, GLuint fb, int width, int height)
 {
     GLint read_fb, read_buffer, alignment, row_length, pack_buffer;
     GLenum before, after;
@@ -22,8 +30,8 @@ static void spacebox_capture_write(const char *path, int width, int height)
     glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
     glGetIntegerv(GL_PACK_ROW_LENGTH, &row_length);
     glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack_buffer);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-    glReadBuffer(GL_BACK);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fb);
+    glReadBuffer(fb ? GL_COLOR_ATTACHMENT0 : GL_BACK);
     glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glPixelStorei(GL_PACK_ROW_LENGTH, 0);
@@ -48,7 +56,7 @@ static void spacebox_capture_write(const char *path, int width, int height)
             width, height, before, after, !!f, path);
 }
 
-static void spacebox_capture_client(int width, int height)
+static void spacebox_capture_client_from(GLuint fb, int width, int height)
 {
     static int64_t last_check;
     static struct {
@@ -92,7 +100,7 @@ static void spacebox_capture_client(int width, int height)
         }
     }
     if (one) {
-        spacebox_capture_write(output, width, height);
+        spacebox_capture_write(output, fb, width, height);
     }
     if (series.dir) {
         if (series.left <= 0 || now > series.until) {
@@ -105,7 +113,13 @@ static void spacebox_capture_client(int width, int height)
 
             series.last = now;
             series.left--;
-            spacebox_capture_write(path, width, height);
+            spacebox_capture_write(path, fb, width, height);
         }
     }
+}
+
+/* the window's back buffer, width x height */
+static void spacebox_capture_client(int width, int height)
+{
+    spacebox_capture_client_from(0, width, height);
 }

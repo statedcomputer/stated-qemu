@@ -43,6 +43,9 @@ typedef struct SpSlot {
     unsigned ntickets;
     int64_t flush_dev, flush_read;  /* its flush's message: sent, read */
     int src_w, src_h;
+#ifdef CONFIG_WIN32
+    int win_w, win_h;   /* the window's drawable it is shown in */
+#endif
     int64_t show_due;   /* due, or the due of the frame it replaces (sp_pair_updates) */
     bool superseded;    /* replaced by the next frame (sp_pair_updates) */
 } SpSlot;
@@ -667,12 +670,27 @@ static void *sp_present_thread(void *opaque)
         int code = recording ? sp_present_code(s, &code_ok, &code_us) : -1;
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         glDrawBuffer(GL_BACK);
+#ifdef CONFIG_WIN32
+        /*
+         * The slot holds the guest's picture at its own size (sdl2-gl.c),
+         * scaled to the window here; the capture hook takes the picture
+         * before it is scaled (spacebox-capture.h).
+         */
+        int win_w = s->win_w, win_h = s->win_h;
+        glViewport(0, 0, win_w, win_h);
+        glDisable(GL_SCISSOR_TEST);
+        glBlitFramebuffer(0, 0, s->fb.width, s->fb.height, 0, 0, win_w, win_h,
+                          GL_COLOR_BUFFER_BIT,
+                          win_w == s->fb.width && win_h == s->fb.height ? GL_NEAREST : GL_LINEAR);
+        spacebox_capture_client_from(readfb, s->fb.width, s->fb.height);
+#else
         glViewport(0, 0, s->fb.width, s->fb.height);
         glDisable(GL_SCISSOR_TEST);
         glBlitFramebuffer(0, 0, s->fb.width, s->fb.height,
                           0, 0, s->fb.width, s->fb.height,
                           GL_COLOR_BUFFER_BIT, GL_NEAREST);
         spacebox_capture_client(s->fb.width, s->fb.height);
+#endif
         uint8_t probe_px[4] = { 0 };
         if (probe) {
             /* test aid: the colour at the centre of each frame shown */
@@ -688,7 +706,11 @@ static void *sp_present_thread(void *opaque)
             out_host = p->tick_out_host;
             qemu_mutex_unlock(&p->lock);
         }
+#ifdef CONFIG_WIN32
+        spacebox_swap(p->window, win_w, win_h);
+#else
         spacebox_swap(p->window, s->fb.width, s->fb.height);
+#endif
         int64_t swapped = g_get_monotonic_time();
         qpc_ret = sp_present_qpc();
         if (recording) {
@@ -856,6 +878,9 @@ static void sp_present_submit(struct sdl2_console *scon, SpSlot *s, int src_w, i
     s->flush_read = spacebox_frame_flush_read;
     s->src_w = src_w;
     s->src_h = src_h;
+#ifdef CONFIG_WIN32
+    SDL_GL_GetDrawableSize(p->window, &s->win_w, &s->win_h);
+#endif
     qemu_mutex_lock(&p->lock);
     s->ready = fence;
     s->sequence = ++p->sequence;

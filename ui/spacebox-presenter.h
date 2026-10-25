@@ -555,6 +555,9 @@ static void *sp_present_thread(void *opaque)
         }
     }
     sp_present_thread_priority();
+#ifdef CONFIG_WIN32
+    sdl2_win_gl_on_window();    /* the window's device context is this thread's */
+#endif
     if (SDL_GL_MakeCurrent(p->window, p->output)) {
         fprintf(stderr, "[SPACEBOX-PRESENT-ERROR] make_current: %s\n", SDL_GetError());
         return NULL;
@@ -768,10 +771,18 @@ void sdl2_gl_present_init(struct sdl2_console *scon)
 {
     const char *mode = getenv("SPACEBOX_PRESENT_MODE");
     if (!mode || strcmp(mode, "thread")) return;
+#ifdef CONFIG_WIN32
+    if (!sdl2_win_gl_offscreen_open(scon->real_window)) {
+        return;     /* no presenter: the window's frames from this thread */
+    }
+#endif
     SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
     scon->renderctx = SDL_GL_CreateContext(scon->real_window);
     if (!scon->renderctx) {
         fprintf(stderr, "[SPACEBOX-PRESENT-ERROR] producer context: %s\n", SDL_GetError());
+#ifdef CONFIG_WIN32
+        sdl2_win_gl_offscreen_close();
+#endif
         SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
         return;
     }
@@ -783,6 +794,9 @@ void sdl2_gl_present_init(struct sdl2_console *scon)
     qemu_cond_init(&p->wake);
     if (!sp_display_open(p)) {
         SDL_GL_DeleteContext(scon->renderctx); scon->renderctx = NULL;
+#ifdef CONFIG_WIN32
+        sdl2_win_gl_offscreen_close();
+#endif
         SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
         qemu_cond_destroy(&p->wake); qemu_mutex_destroy(&p->lock); g_free(p);
         return;
@@ -865,6 +879,9 @@ void sdl2_gl_present_destroy(struct sdl2_console *scon)
         egl_fb_destroy(&p->slots[i].fb);
     }
     sp_display_release(p);
+#ifdef CONFIG_WIN32
+    sdl2_win_gl_offscreen_close();
+#endif
     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
     SDL_GL_DeleteContext(scon->renderctx); scon->renderctx = NULL;
     qemu_cond_destroy(&p->wake); qemu_mutex_destroy(&p->lock);

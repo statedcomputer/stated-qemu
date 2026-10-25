@@ -37,6 +37,14 @@ int sdl2_win_gl_make_current(SDL_Window *window, SDL_GLContext ctx);
 SDL_GLContext sdl2_win_gl_create_context(SDL_Window *window);
 #define SDL_GL_MakeCurrent sdl2_win_gl_make_current
 #define SDL_GL_CreateContext sdl2_win_gl_create_context
+/*
+ * While the presenter runs, the window's device context is its thread's alone:
+ * the contexts of every other thread are made current (and made) on a hidden
+ * window of the same pixel format (ui/sdl2.c).
+ */
+bool sdl2_win_gl_offscreen_open(SDL_Window *window);
+void sdl2_win_gl_offscreen_close(void);
+void sdl2_win_gl_on_window(void);
 #endif
 
 struct sdl2_console {

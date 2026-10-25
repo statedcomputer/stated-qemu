@@ -1404,9 +1404,60 @@ static void spacebox_gl_tell_epoxy(void)
     }
 }
 
+/*
+ * The window's device context belongs to the presenter's thread while the
+ * presenter runs (ui/spacebox-presenter.h). WGL binds a context to the device
+ * context it is made current on, and the sink's thread changes its current
+ * context many times a frame (the renderer's contexts); bound to the window's
+ * device context while the presenter's thread swapped that window's buffers,
+ * the sink crashed inside NVIDIA's GL driver (nvoglv64.dll, on its own thread
+ * or the sink's) within a few plays of 3840 x 2160 video, and not in 12 such
+ * plays with the presenter off (turn G5a). CGL has no such binding on the
+ * Mac. So every other thread makes its contexts current, and makes them, on a
+ * hidden window of the window's pixel format; a GL context may be current on
+ * any drawable of its pixel format. Contexts made before the hidden window
+ * stay usable on it.
+ */
+static SDL_Window *spacebox_gl_offscreen;
+static __thread bool spacebox_gl_on_window;
+
+static SDL_Window *spacebox_gl_drawable(SDL_Window *window)
+{
+    return spacebox_gl_offscreen && !spacebox_gl_on_window ? spacebox_gl_offscreen : window;
+}
+
+bool sdl2_win_gl_offscreen_open(SDL_Window *window)
+{
+    /* SDL gives an OpenGL window the pixel format of the attributes now set,
+     * those the window was made with */
+    spacebox_gl_offscreen = SDL_CreateWindow("", 0, 0, 1, 1,
+                                             SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+    if (!spacebox_gl_offscreen) {
+        fprintf(stderr, "[SPACEBOX-GL] no hidden window for the sink's contexts: %s\n",
+                SDL_GetError());
+    }
+    return spacebox_gl_offscreen != NULL;
+}
+
+void sdl2_win_gl_offscreen_close(void)
+{
+    SDL_Window *w = spacebox_gl_offscreen;
+
+    spacebox_gl_offscreen = NULL;
+    if (w) {
+        SDL_GL_MakeCurrent(w, NULL);
+        SDL_DestroyWindow(w);
+    }
+}
+
+void sdl2_win_gl_on_window(void)
+{
+    spacebox_gl_on_window = true;
+}
+
 int sdl2_win_gl_make_current(SDL_Window *window, SDL_GLContext ctx)
 {
-    int r = SDL_GL_MakeCurrent(window, ctx);
+    int r = SDL_GL_MakeCurrent(spacebox_gl_drawable(window), ctx);
 
     if (!r && ctx) {
         spacebox_gl_tell_epoxy();
@@ -1416,7 +1467,7 @@ int sdl2_win_gl_make_current(SDL_Window *window, SDL_GLContext ctx)
 
 SDL_GLContext sdl2_win_gl_create_context(SDL_Window *window)
 {
-    SDL_GLContext ctx = SDL_GL_CreateContext(window);
+    SDL_GLContext ctx = SDL_GL_CreateContext(spacebox_gl_drawable(window));
 
     if (ctx) {
         /* SDL made it current */

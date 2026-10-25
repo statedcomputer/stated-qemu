@@ -1355,20 +1355,38 @@ module_dep("ui-opengl");
 #endif
 
 #if defined(CONFIG_WIN32) && defined(CONFIG_OPENGL)
-/* include/ui/sdl2.h: SDL's calls that make a context current, told to epoxy */
+/*
+ * include/ui/sdl2.h: SDL's calls that make a context current, told to epoxy
+ * at each new context and, on a thread, at the first context made current
+ * there. epoxy's function pointers of WGL may in principle differ from
+ * context to context, and telling it resets every pointer, to be looked up
+ * again (wglGetProcAddress) at its next call. Every context of the sink is
+ * made by SDL on its window, with one pixel format of one driver, so the
+ * pointers are the same in all of them; telling epoxy at each change of the
+ * current context (the renderer changes contexts many times a frame) made
+ * the guest's drawing about 10 times slower on BF2's NVIDIA GL (the frames
+ * of hard-case: 1.3 s against 0.12 to 0.18 s for 120, the same 60 hashes
+ * either way). A new context is still told: without that the sink called a
+ * null pointer at its start.
+ */
 #undef SDL_GL_MakeCurrent
 #undef SDL_GL_CreateContext
-static __thread SDL_GLContext spacebox_gl_current;
+static __thread bool spacebox_gl_told;
+
+static void spacebox_gl_tell_epoxy(void)
+{
+    if (!spacebox_gl_told) {
+        epoxy_handle_external_wglMakeCurrent();
+        spacebox_gl_told = true;
+    }
+}
 
 int sdl2_win_gl_make_current(SDL_Window *window, SDL_GLContext ctx)
 {
     int r = SDL_GL_MakeCurrent(window, ctx);
 
-    if (!r) {
-        if (ctx && ctx != spacebox_gl_current) {
-            epoxy_handle_external_wglMakeCurrent();
-        }
-        spacebox_gl_current = ctx;
+    if (!r && ctx) {
+        spacebox_gl_tell_epoxy();
     }
     return r;
 }
@@ -1380,7 +1398,7 @@ SDL_GLContext sdl2_win_gl_create_context(SDL_Window *window)
     if (ctx) {
         /* SDL made it current */
         epoxy_handle_external_wglMakeCurrent();
-        spacebox_gl_current = ctx;
+        spacebox_gl_told = true;
     }
     return ctx;
 }

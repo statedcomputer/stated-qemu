@@ -1420,6 +1420,14 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
     }
 
     atexit(sdl_cleanup);
+#if defined(CONFIG_WIN32) && defined(CONFIG_OPENGL)
+    /*
+     * The presenter's hidden window goes before SDL's own quit (registered
+     * later, so run earlier): left to sdl_cleanup with the sink's context
+     * current on it, the sink crashed inside SDL2.dll as it ended (turn G5a).
+     */
+    atexit(sdl2_win_gl_offscreen_close);
+#endif
 
     /* SDL's event polling (in dpy_refresh) must happen on the main thread. */
     qemu_main = NULL;

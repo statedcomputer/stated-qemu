@@ -338,11 +338,17 @@ static void sp_present_follow_window(SpPresenter *p)
     }
 }
 
-/* the DWM's refresh, 0 = not known */
+/* the nominal refresh of the window's display (its active mode, as the Mac's
+ * display link's nominal one), else the DWM's, which it measures: 16.9 to
+ * 20.5 ms on BF2's 59.94 Hz display while the sink started; 0 = not known */
 static int64_t sp_display_refresh_us(SpPresenter *p)
 {
     DWM_TIMING_INFO ti = { .cbSize = sizeof(ti) };
+    unsigned mhz = sdl2_win_refresh_mhz(p->monitor);
 
+    if (mhz) {
+        return (1000000000LL + mhz / 2) / mhz;
+    }
     if (SUCCEEDED(DwmGetCompositionTimingInfo(NULL, &ti)) && ti.qpcRefreshPeriod) {
         return sp_qpc_us(ti.qpcRefreshPeriod);
     }

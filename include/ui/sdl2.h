@@ -42,6 +42,8 @@ SDL_GLContext sdl2_win_gl_create_context(SDL_Window *window);
  * the contexts of every other thread are made current (and made) on a hidden
  * window of the same pixel format (ui/sdl2.c).
  */
+/* the active mode's refresh of the monitor (HMONITOR) in mHz, 0 = not known */
+unsigned sdl2_win_refresh_mhz(void *monitor);
 bool sdl2_win_gl_offscreen_open(SDL_Window *window);
 void sdl2_win_gl_offscreen_close(void);
 void sdl2_win_gl_on_window(void);

@@ -120,6 +120,62 @@ static bool spacebox_win_dpi(void)
     return getenv("SPACEBOX_RETINA_SCALE") != NULL;
 }
 
+/*
+ * The refresh of a monitor in mHz, as its active mode has it (a fraction:
+ * 59.94 Hz is 59940/1000 on BF2's display), from Windows' display
+ * configuration; 0 when not known. SDL gives whole Hertz, and Windows' 59 for
+ * 59.94: told 59 Hz, the guest's compositor drew at 59 a second and a video of
+ * 60 frames a second lost about one frame each second (turn G5a). The Mac's
+ * sink tells the guest its display's own refresh in the same way.
+ */
+unsigned sdl2_win_refresh_mhz(void *monitor)
+{
+    MONITORINFOEXW mi = { .cbSize = sizeof(mi) };
+    UINT32 np = 0, nm = 0;
+    DISPLAYCONFIG_PATH_INFO *paths;
+    DISPLAYCONFIG_MODE_INFO *modes;
+    unsigned mhz = 0;
+
+    if (!monitor || !GetMonitorInfoW(monitor, (MONITORINFO *)&mi) ||
+        GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS) {
+        return 0;
+    }
+    paths = g_new0(DISPLAYCONFIG_PATH_INFO, np);
+    modes = g_new0(DISPLAYCONFIG_MODE_INFO, nm);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths, &nm, modes, NULL) == ERROR_SUCCESS) {
+        for (UINT32 i = 0; i < np && !mhz; i++) {
+            DISPLAYCONFIG_SOURCE_DEVICE_NAME src = {
+                .header = {
+                    .type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                    .size = sizeof(src),
+                    .adapterId = paths[i].sourceInfo.adapterId,
+                    .id = paths[i].sourceInfo.id,
+                },
+            };
+            DISPLAYCONFIG_RATIONAL r = paths[i].targetInfo.refreshRate;
+
+            if (DisplayConfigGetDeviceInfo(&src.header) == ERROR_SUCCESS &&
+                !wcscmp(src.viewGdiDeviceName, mi.szDevice) && r.Denominator) {
+                mhz = (unsigned)(((uint64_t)r.Numerator * 1000 + r.Denominator / 2) / r.Denominator);
+            }
+        }
+    }
+    g_free(paths);
+    g_free(modes);
+    return mhz;
+}
+
+static unsigned spacebox_win_window_refresh_mhz(SDL_Window *window)
+{
+    SDL_SysWMinfo wm;
+
+    SDL_VERSION(&wm.version);
+    if (!SDL_GetWindowWMInfo(window, &wm) || wm.subsystem != SDL_SYSWM_WINDOWS) {
+        return 0;
+    }
+    return sdl2_win_refresh_mhz(MonitorFromWindow(wm.info.win.window, MONITOR_DEFAULTTONEAREST));
+}
+
 /* the guest's pixels for a point: the monitor's scale, or the Mac's 2 at 100%
  * (spacebox_update_ui_info) */
 static double spacebox_win_guest_scale(void)
@@ -255,6 +311,15 @@ static void spacebox_update_ui_info(struct sdl2_console *scon)
     if (SDL_GetCurrentDisplayMode(SDL_GetWindowDisplayIndex(scon->real_window), &dm) == 0 && dm.refresh_rate > 0) {
         info.refresh_rate = dm.refresh_rate * 1000;
     }
+#ifdef CONFIG_WIN32
+    {
+        unsigned mhz = spacebox_win_window_refresh_mhz(scon->real_window);
+
+        if (mhz) {
+            info.refresh_rate = mhz;
+        }
+    }
+#endif
     dpy_set_ui_info(scon->dcl.con, &info, true);
     fprintf(stderr, "[SPACEBOX-DISPLAY-INFO] pixels=%ux%u refresh_mhz=%u\n",
             info.width, info.height, info.refresh_rate);

@@ -47,6 +47,8 @@ static void sp_log(const SpScroll *e, const char *origin)
     if (!path) return;
     if (!sp_trace) { sp_trace = fopen(path, "a"); if (sp_trace) setvbuf(sp_trace,NULL,_IOLBF,0); }
     if (sp_trace) fprintf(sp_trace,"{\"stage\":\"native\",\"id\":%llu,\"host_us\":%lld,\"origin\":\"%s\",\"x\":%.9g,\"y\":%.9g,\"delta_x\":%.9g,\"delta_y\":%.9g,\"precise\":%d,\"phase\":%lu,\"momentum\":%lu,\"inverted\":%d}\n",(unsigned long long)++sp_event_id,(long long)g_get_monotonic_time(),origin,e->sx,e->sy,e->dx,e->dy,e->precise,e->phase,e->momentum,e->inverted);
+    /* Windows' C library buffers a line-buffered file fully: each line is flushed */
+    if (sp_trace) fflush(sp_trace);
 }
 static int sp_fd=-1;
 static bool sp_ready;
@@ -95,22 +97,15 @@ static int sp_connect_start(const char *path)
     return fd;
 }
 
-/* 1: connected, 0: not yet, -1: refused */
+/* 1: connected, 0: not yet (or refused) */
 static int sp_connected(int fd)
 {
-    SOCKET s = (SOCKET)_get_osfhandle(fd);
-    fd_set w, e;
-    struct timeval tv = { 0, 0 };
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof(ss);
 
-    FD_ZERO(&w);
-    FD_ZERO(&e);
-    FD_SET(s, &w);
-    FD_SET(s, &e);
-    if (select(0, NULL, &w, &e, &tv) == SOCKET_ERROR || FD_ISSET(s, &e)) {
-        return -1;
-    }
-    return FD_ISSET(s, &w) ? 1 : 0;
+    return getpeername(fd, (struct sockaddr *)&ss, &len) == 0;
 }
+
 /* The source carries the channel in the stream: PING on each new connection
  * and every second; any SP_SCROLL back is the agent's answer. */
 static void sp_stream_poll(uint64_t conn)
@@ -151,8 +146,8 @@ static void sp_bridge_poll(void)
     if (sp_connecting) {
         int c = sp_connected(sp_fd);
 
-        if (c < 0) { close(sp_fd);sp_fd=-1;sp_connecting=false;return; }
         if (c == 0) {
+            /* refused, or not yet: tried again after the retry's time */
             if (g_get_monotonic_time()>=sp_retry) { close(sp_fd);sp_fd=-1;sp_connecting=false; }
             return;
         }

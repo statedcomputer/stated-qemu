@@ -50,6 +50,7 @@
 #include "hw/virtio/virtio.h"
 #include "hw/virtio/virtio-gpu.h"
 #include "ui/console.h"
+#include "ui/spacebox-hook.h"
 #include "virtio-gpu-remote.h"
 #include "virtio-gpu-remote-formats.h"
 
@@ -2634,10 +2635,9 @@ static void sp_control_tick(void *opaque)
         sp_imports_log();
     }
     timer_mod(sps.control_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 100);
-    if (!sps.control || !g_file_get_contents(sps.control, &text, NULL, NULL)) {
+    if (!sps.control || !spacebox_hook_take(sps.control, &text)) {
         return;
     }
-    unlink(sps.control);
     g_strstrip(text);
     if (strchr(text, '\n')) {
         *strchr(text, '\n') = 0;

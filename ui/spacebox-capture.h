@@ -7,6 +7,8 @@
  * seconds, each as DIR/f-<wall clock in microseconds when it was read>.ppm, so
  * that a test sees when the picture changed (a frame is shown only when the
  * screen changes or the window needs it). */
+#include "ui/spacebox-hook.h"
+
 static void spacebox_capture_write(const char *path, int width, int height)
 {
     GLint read_fb, read_buffer, alignment, row_length, pack_buffer;
@@ -68,13 +70,12 @@ static void spacebox_capture_client(int width, int height)
     now = g_get_monotonic_time();
     if (now - last_check >= 100000) {
         last_check = now;
-        if (!access(request, F_OK)) {
-            g_autofree char *text = NULL;
+        g_autofree char *text = NULL;
+
+        if (!access(request, F_OK) && spacebox_hook_take(request, &text)) {
             char dir[1024];
             int n, ms, secs;
 
-            g_file_get_contents(request, &text, NULL, NULL);
-            unlink(request);
             if (text && sscanf(text, "series %1023s %d %d %d", dir, &n, &ms, &secs) == 4) {
                 /* the frame shown now is the series' first */
                 g_free(series.dir);

@@ -1779,6 +1779,23 @@ static void sp_wait_run(SpWait *e)
         sp_wait_hold(f, -1);
     }
     e->msgs = NULL;
+#ifdef CONFIG_WIN32
+    /*
+     * The record: a command held here 20 ms or more, from its first message's
+     * read (the Windows client's G5e: a main-loop wait that the main loop did
+     * not cause)
+     */
+    if (m && g_get_monotonic_time() - m->t_read >= 20000) {
+        char what[64];
+
+        if (e->wlen) {
+            snprintf(what, sizeof(what), "held for its write of %" PRIu64 " bytes", e->wlen);
+        } else {
+            snprintf(what, sizeof(what), "held behind an earlier command");
+        }
+        sp_record_busy(what, m->t_read, g_get_monotonic_time());
+    }
+#endif
     sph.running = true;
     sph.at = after;
     sp_run_msgs(m);

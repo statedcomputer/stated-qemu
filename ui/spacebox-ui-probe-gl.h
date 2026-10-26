@@ -68,6 +68,17 @@ static void sp_probe_slots_of(unsigned c[SP_PROBE_SLOT_STATES], int64_t *oldest)
     *oldest = o ? now - o : 0;
 }
 
+/* whether a readback waits for its fence (only the presenter's thread touches the ring) */
+static bool sp_probe_pending(void)
+{
+    for (int i = 0; i < SP_PROBE_RING; i++) {
+        if (sp_probe_ring[i].shot) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* the readbacks whose fence is done (all: waited for) are handed over */
 static void sp_probe_harvest(bool all)
 {

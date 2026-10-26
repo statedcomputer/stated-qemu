@@ -729,7 +729,20 @@ static void *sp_present_thread(void *opaque)
     glGenFramebuffers(1, &readfb);
     for (;;) {
         qemu_mutex_lock(&p->lock);
-        while (!p->stop && (native ? !sp_has_ready(p) : p->tick == seen)) qemu_cond_wait(&p->wake, &p->lock);
+        while (!p->stop && (native ? !sp_has_ready(p) : p->tick == seen)) {
+            if (!sp_probe_pending()) {
+                qemu_cond_wait(&p->wake, &p->lock);
+                continue;
+            }
+            /* the UI evals' probe: the readback of the last swap before an idle time is handed over now, not at
+             * the next swap (which may never come): every 2 ms while one waits */
+            qemu_mutex_unlock(&p->lock);
+            sp_probe_harvest(false);
+            qemu_mutex_lock(&p->lock);
+            if (sp_probe_pending()) {
+                qemu_cond_timedwait(&p->wake, &p->lock, 2);
+            }
+        }
         if (p->stop) { qemu_mutex_unlock(&p->lock); break; }
         seen = p->tick;
         qemu_mutex_unlock(&p->lock);

@@ -447,7 +447,10 @@ static void sp_sink_pace_frame(const SpHdr *h)
      * see. On Windows a video's start takes the lateness of its own updates
      * from this one on, the allowance stays at SP_WIN_VIDEO_US at least while
      * the video plays, which covered those, and it rises a refresh a frame
-     * (below): 9 frames held a refresh more at the start.
+     * (below): 9 frames held a refresh more at the start. It takes their
+     * spacing too: the usual spacing of the page's updates before the video
+     * (100 ms or more) held its first frames that long apart in the presenter,
+     * a stall of 133 to 150 ms at a 2160p60 play's start (G5c).
      */
     if (qatomic_read(&spacebox_present_refresh_us) > 0) {
         if (starting) {
@@ -455,6 +458,8 @@ static void sp_sink_pace_frame(const SpHdr *h)
             memset(sp_pace.late_sec, 0, sizeof(sp_pace.late_sec));
             sp_pace.late_sec[sec % 10] = sec;
             sp_pace.late_max[sec % 10] = late;
+            sp_pace.gap_n = sp_pace.gap_pos = 0;
+            sp_pace.usual_gap = 0;
         }
         starting = false;
         target = MAX(target, SP_WIN_VIDEO_US);

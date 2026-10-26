@@ -2153,6 +2153,10 @@ static int sp_sink_admit(SpRxMsg *m)
     }
 }
 
+#ifdef CONFIG_WIN32
+static int64_t sp_rx_last_end;  /* when the main loop last ran the messages */
+#endif
+
 /* the main loop: the messages that the reader queued, in their order */
 static void sp_rx(void *opaque)
 {
@@ -2173,6 +2177,19 @@ static void sp_rx(void *opaque)
     qemu_mutex_unlock(&sp.rx_lock);
 
     sp.rx_busy = true;
+#ifdef CONFIG_WIN32
+    /*
+     * The record: a message read while the main loop ran something else than
+     * the link's messages, 20 ms or more of it (the Windows client's G5e)
+     */
+    if (m && sp_rx_last_end) {
+        int64_t now = g_get_monotonic_time(), from = MAX(m->t_read, sp_rx_last_end);
+
+        if (now - from >= 20000) {
+            sp_record_busy("main loop elsewhere", from, now);
+        }
+    }
+#endif
     while (m && !closed && sp.fd >= 0 && sp.conn_gen == gen) {
         SpHdr h;
         int64_t run = g_get_monotonic_time(), d = run - m->t_read;
@@ -2265,6 +2282,9 @@ static void sp_rx(void *opaque)
     sp_rx_free(m);
     sp_rx_now = sp_rx_run = 0;
     sp.rx_busy = false;
+#ifdef CONFIG_WIN32
+    sp_rx_last_end = g_get_monotonic_time();
+#endif
     if (closed && sp.conn_gen == gen) {
         sp_disconnected();
     }
@@ -5280,6 +5300,14 @@ static void sp_dispatch(SpHdr *h, uint8_t *a, uint8_t *b)
             sp_state_ctrl_seen();
             sp_sink_ctrl(g, h, a, b);
             d = g_get_monotonic_time() - t0;
+#ifdef CONFIG_WIN32
+            if (d >= 10000) {
+                char what[32];
+
+                snprintf(what, sizeof(what), "command 0x%04x", type);
+                sp_record_busy(what, t0, t0 + d);
+            }
+#endif
             sp_busy.total += d;
             if (type == VIRTIO_GPU_CMD_SUBMIT_3D) {
                 sp_busy.submit += d;

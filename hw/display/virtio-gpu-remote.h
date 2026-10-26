@@ -101,6 +101,10 @@ void sp_sock_tune(int fd);
 void sp_record_realize(void);
 bool sp_record_control(const char *text);
 void sp_record_cmd(struct virtio_gpu_ctrl_command *cmd);
+#ifdef CONFIG_WIN32
+/* a stretch of the main loop (this clock) that held the link's messages */
+void sp_record_busy(const char *what, int64_t t0, int64_t t1);
+#endif
 
 /* called by ui/sdl2.c, which declares them itself */
 void spacebox_gpu_toggle(void);

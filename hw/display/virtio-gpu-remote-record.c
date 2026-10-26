@@ -276,10 +276,51 @@ static void sp_rec_drawn(void *opaque, uint64_t ticket, int64_t t)
     rec.main_us += g_get_monotonic_time() - t0;
 }
 
+#ifdef CONFIG_WIN32
+/*
+ * Windows: a guest command that held the main loop 10 ms or more (as
+ * virglrenderer names it), with the part of it that waited for video
+ * pictures, and the message it came in: what the main loop ran while the
+ * link's messages waited (the Windows client's G5e; screen/README.md)
+ */
+static void sp_rec_slow(void *opaque, const char *what, int64_t t0, int64_t t1,
+                        int64_t waited_us)
+{
+    GString *s = g_string_new("{\"k\":\"slow\"");
+
+    g_string_append_printf(s, ",\"what\":\"%s\"", what);
+    sp_rec_mtime(s, "t0", t0);
+    sp_rec_mtime(s, "t1", t1);
+    g_string_append_printf(s, ",\"waited_ms\":%.1f", waited_us / 1000.0);
+    sp_rec_time(s, "t_dev", rec.cmd_dev);
+    sp_rec_time(s, "t_read", rec.cmd_read);
+    g_string_append_c(s, '}');
+    sp_rec_put(s);
+}
+
+void sp_record_busy(const char *what, int64_t t0, int64_t t1)
+{
+    GString *s;
+
+    if (!spacebox_video_record_on) {
+        return;
+    }
+    s = g_string_new("{\"k\":\"busy\"");
+    g_string_append_printf(s, ",\"what\":\"%s\"", what);
+    sp_rec_time(s, "t0", t0);
+    sp_rec_time(s, "t1", t1);
+    g_string_append_c(s, '}');
+    sp_rec_put(s);
+}
+#endif
+
 static const struct virgl_renderer_video_record sp_rec_cbs = {
     .picture = sp_rec_picture,
     .decoded = sp_rec_decoded,
     .drawn = sp_rec_drawn,
+#ifdef CONFIG_WIN32
+    .slow = sp_rec_slow,
+#endif
 };
 
 /* ---- the sink's hooks ----------------------------------------------------- */

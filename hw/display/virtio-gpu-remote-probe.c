@@ -100,6 +100,10 @@ static struct {
     uint64_t dropped;
     bool stuck_armed, stuck_holding;
     int delay_input_ms; /* the input goes to the source this much later, 0 = at once */
+    int delay_input_every;      /* > 1: only every so many key-downs (the first, then each EVERY-th), with their
+                                 * key-ups, so that one run holds both delayed and undelayed keys */
+    int delay_input_n;          /* the key-downs since the fault was set */
+    bool delay_input_held[256]; /* by qcode: whether its key-down was held (its key-up follows it) */
 } pr = { .drop_up = -1 };
 
 #ifdef _WIN32
@@ -466,6 +470,7 @@ static void sp_pr_faults_off(void)
     pr.drop_n = 0;
     pr.drop_up = -1;
     pr.delay_input_ms = 0;
+    pr.delay_input_every = 0;
     pr.stuck_armed = false;
     if (pr.stuck_holding) {
         pr.stuck_holding = false;
@@ -657,12 +662,19 @@ static void sp_pr_fault(const char *text)
         pr.stuck_armed = true;
     } else if (!strncmp(text, "late-enqueue ", 13) && sp_pr_ints(text + 13, v, 1, 1, 2000)) {
         qatomic_set(&spacebox_ui_fault_late_ms, v[0]);
-    } else if (!strncmp(text, "delay-input ", 12) && sp_pr_ints(text + 12, v, 1, 0, 1000)) {
+    } else if (!strncmp(text, "delay-input ", 12) && (sp_pr_ints(text + 12, v, 1, 0, 1000) ||
+                                                       sp_pr_ints(text + 12, v, 2, 0, 1000))) {
+        /* delay-input MS [EVERY]: a comparison of two runs carries each run's own phase of the guest's frames
+         * against the client's refresh (up to a refresh); with EVERY the delayed and the undelayed keys are in one
+         * run, at random input times, and their difference is the hold alone */
         pr.delay_input_ms = v[0];
+        pr.delay_input_every = sp_pr_ints(text + 12, v, 2, 0, 1000) ? v[1] : 0;
+        pr.delay_input_n = 0;
+        memset(pr.delay_input_held, 0, sizeof(pr.delay_input_held));
     } else {
         fprintf(stderr, "[SPACEBOX-UI-PROBE] ui-fault: off, delay MS, freeze MS, "
                 "drop-key N, corrupt-after-read W H AMP N, hold-slot, stuck-rx, "
-                "late-enqueue MS, delay-input MS\n");
+                "late-enqueue MS, delay-input MS [EVERY]\n");
         return;
     }
     spacebox_ui_probe_fault("set", more);
@@ -720,9 +732,22 @@ bool sp_probe_drop_key(int qcode, bool down)
     return false;
 }
 
-int sp_probe_input_delay_ms(void)
+int sp_probe_input_delay_ms(const char *kind, int a, int b)
 {
-    return pr.delay_input_ms;
+    int ms = pr.delay_input_ms;
+    bool held;
+
+    if (!ms || pr.delay_input_every <= 1 || !kind || strcmp(kind, "key")) {
+        return ms;
+    }
+    if (!b) {           /* a key-up follows its key-down */
+        return a >= 0 && a < 256 && pr.delay_input_held[a] ? ms : 0;
+    }
+    held = pr.delay_input_n++ % pr.delay_input_every == 0;
+    if (a >= 0 && a < 256) {
+        pr.delay_input_held[a] = held;
+    }
+    return held ? ms : 0;
 }
 
 void sp_probe_input_held(const char *kind, int a, int b, int64_t hold_us)

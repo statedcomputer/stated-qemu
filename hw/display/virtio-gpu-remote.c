@@ -4576,7 +4576,7 @@ static void sp_late_in_run(void *opaque)
 static bool sp_input_late(uint32_t type, const void *a, size_t len, const char *kind,
                           int x, int y)
 {
-    int ms = sp_probe_input_delay_ms();
+    int ms = sp_probe_input_delay_ms(kind, x, y);
     int64_t now = g_get_monotonic_time();
     SpLateIn *l, *tail = g_queue_peek_tail(&sp_late_in);
 

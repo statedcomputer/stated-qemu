@@ -109,7 +109,7 @@ bool sp_probe_rx_hold(bool is_flush);
 /* the fault delay-input: how much later the input goes to the source (ms, 0 =
  * at once), and the line of an event it held (kind "key", "button" or
  * "scroll"; a, b: the key's qcode and down, the button and down) */
-int sp_probe_input_delay_ms(void);
+int sp_probe_input_delay_ms(const char *kind, int a, int b);
 void sp_probe_input_held(const char *kind, int a, int b, int64_t hold_us);
 
 /* virtio-gpu-remote.c, for the probe's queue line: the reader's messages that

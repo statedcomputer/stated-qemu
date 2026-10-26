@@ -311,6 +311,7 @@ int64_t spacebox_frame_gap_us;  /* usual spacing of recent updates, 0 = not a st
  * not, and a video's start does not raise it to its maximum.
  */
 int64_t spacebox_present_refresh_us;
+#define SP_WIN_VIDEO_US 150000  /* the least allowance while a video plays */
 #endif
 /*
  * When the user last pressed a key, clicked or scrolled (this machine's clock;
@@ -433,13 +434,20 @@ static void sp_sink_pace_frame(const SpHdr *h)
     }
 #ifdef CONFIG_WIN32
     /*
-     * A display of a video's rate (BF2: 59.95 Hz) shows any rise of the
-     * allowance as a frame held a refresh more, past the judder bound: rising
-     * to its maximum at a video's start, and to the lateness of the page's
-     * loading before it (its large transfers), held 21 frames so (1.1% of a
-     * 30/s clip of 64 s). On Windows a video's start takes the lateness of the
-     * video's own updates, from this one on; a later update than the
-     * allowance raises it at once (below).
+     * A display of a video's rate (BF2: 59.95 Hz) shows each refresh of a rise
+     * of the allowance as a frame held a refresh more, past the judder bound,
+     * and a frame a little late as one held a refresh more, where the Mac's
+     * (120 Hz) shows it within the bound. By PresentMon's record on BF2:
+     * rising to the lateness of the page's loading before a video (its large
+     * transfers, 366 ms) held 22 frames so (1.1% of a 30/s clip of 64 s); the
+     * guest's own updates come late in a video's first half second, up to 133
+     * ms at 3840x2160; and an update waits in this sink after its read for a
+     * large write of the link before it (a 30/s video of 3840x2160: every
+     * eighth frame, up to 170 ms), which the lateness by the read does not
+     * see. On Windows a video's start takes the lateness of its own updates
+     * from this one on, the allowance stays at SP_WIN_VIDEO_US at least while
+     * the video plays, which covered those, and it rises a refresh a frame
+     * (below): 9 frames held a refresh more at the start.
      */
     if (qatomic_read(&spacebox_present_refresh_us) > 0) {
         if (starting) {
@@ -447,9 +455,9 @@ static void sp_sink_pace_frame(const SpHdr *h)
             memset(sp_pace.late_sec, 0, sizeof(sp_pace.late_sec));
             sp_pace.late_sec[sec % 10] = sec;
             sp_pace.late_max[sec % 10] = late;
-            target = late;
         }
         starting = false;
+        target = MAX(target, SP_WIN_VIDEO_US);
     }
 #endif
     target = MIN(starting ? sp_pace.max_us : target, sp_pace.max_us);
@@ -490,7 +498,13 @@ static void sp_sink_pace_frame(const SpHdr *h)
         sp_pace.allowance = MIN(late, cap);
     }
     if (target > sp_pace.allowance) {
+#ifdef CONFIG_WIN32
+        int64_t r = qatomic_read(&spacebox_present_refresh_us);
+
+        sp_pace.allowance += MIN(target - sp_pace.allowance, r > 0 ? r : gap / 3);
+#else
         sp_pace.allowance += MIN(target - sp_pace.allowance, gap / 3);
+#endif
     } else {
         int64_t fall = (sp_pace.allowance - target) / 64;
 

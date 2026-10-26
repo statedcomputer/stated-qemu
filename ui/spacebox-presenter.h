@@ -233,6 +233,36 @@ static int64_t sp_present_qpc(void)
     return c.QuadPart;
 }
 
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+/*
+ * The presenter's short waits (for a frame's time, away from the DWM's
+ * composition): a timed wait of a condition sleeps by the system's timer,
+ * which on BF2 woke the presenter up to 15 ms late in spite of QEMU's
+ * timeBeginPeriod, past the refresh that it waited for (a 30/s video held
+ * frames a refresh more: 3.7% judder). A high-resolution waitable timer keeps
+ * to the time.
+ */
+static void sp_present_sleep_us(int64_t us)
+{
+    static __thread HANDLE timer;
+    LARGE_INTEGER due = { .QuadPart = -us * 10 };
+
+    if (us <= 0) {
+        return;
+    }
+    if (!timer) {
+        timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    }
+    if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) {
+        WaitForSingleObject(timer, INFINITE);
+    } else {
+        g_usleep(us);
+    }
+}
+
 static int64_t sp_present_host_us(uint64_t host)
 {
     static int64_t off;     /* g_get_monotonic_time() - the host time in us */
@@ -473,6 +503,78 @@ static int sp_present_code(SpSlot *s, bool *ok, int64_t *read_us)
     return code;
 }
 
+#ifdef CONFIG_WIN32
+/*
+ * Windows: the record's read of the frame code (sp_present_code) is started
+ * into a pixel buffer before the swap and finished after it. Read at once,
+ * it waited for the GPU between the pick and the swap: 2.1 ms on average and
+ * up to 8.6 ms on BF2 (0.4 ms on the Mac), which moved the swap itself.
+ */
+static GLuint sp_code_pbo;
+static int sp_code_width;
+static int64_t sp_code_us;
+
+static bool sp_present_code_start(SpSlot *s)
+{
+    int x, y, w, h;
+    int64_t t0 = g_get_monotonic_time();
+
+    sp_code_width = 0;
+    if (!spacebox_video_rect(&x, &y, &w, &h) || !s->src_w || !s->src_h) {
+        return false;
+    }
+    double sx = (double)s->fb.width / s->src_w, sy = (double)s->fb.height / s->src_h;
+    int left = (int)(x * sx), width = (int)(w * sx);
+    double cell = w / (double)SP_CODE_CELLS;
+
+    if (width < SP_CODE_CELLS || left < 0 || left + width > s->fb.width ||
+        (y + cell) * sy > s->fb.height) {
+        return false;
+    }
+    if (!sp_code_pbo) {
+        glGenBuffers(1, &sp_code_pbo);
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, sp_code_pbo);
+    glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)width * 4 * 3, NULL, GL_STREAM_READ);
+    for (int k = 0; k < 3; k++) {
+        int row = (int)((y + cell * (3 + k) / 8) * sy);
+
+        glReadPixels(left, s->fb.height - 1 - row, width, 1, GL_RGBA, GL_UNSIGNED_BYTE,
+                     (void *)(uintptr_t)((size_t)k * width * 4));
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    sp_code_width = width;
+    sp_code_us = g_get_monotonic_time() - t0;
+    return true;
+}
+
+static int sp_present_code_finish(bool *ok, int64_t *read_us)
+{
+    const uint8_t *rows[3];
+    int64_t t0 = g_get_monotonic_time();
+    int code = -1;
+
+    *ok = false;
+    *read_us = -1;
+    if (!sp_code_width) {
+        return -1;
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, sp_code_pbo);
+    const uint8_t *m = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)sp_code_width * 4 * 3,
+                                        GL_MAP_READ_BIT);
+    if (m) {
+        for (int k = 0; k < 3; k++) {
+            rows[k] = m + (size_t)k * sp_code_width * 4;
+        }
+        code = spacebox_frame_code_read(rows, 3, sp_code_width, ok);
+        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    *read_us = sp_code_us + g_get_monotonic_time() - t0;
+    return code;
+}
+#endif
+
 /*
  * Two paced frames of a stream one refresh apart, where the frame after them
  * comes within the stream's usual spacing (and half a refresh) of the first,
@@ -608,7 +710,16 @@ static void *sp_present_thread(void *opaque)
                 continue;
             }
             n_due++;
+#ifdef CONFIG_WIN32
+            /*
+             * Frames with a time whose spacing is not known yet (the first 16
+             * of a video) are shown in order too: at one swap a refresh (below)
+             * the newest one would hide those before it.
+             */
+            if (!s->due) stream = false;
+#else
             if (!s->due || !s->gap) stream = false;
+#endif
             if (oldest < 0 || s->sequence < p->slots[oldest].sequence) oldest = i;
             if (newest < 0 || s->sequence > p->slots[newest].sequence) newest = i;
         }
@@ -638,6 +749,14 @@ static void *sp_present_thread(void *opaque)
         if (pick < 0) {
             if (next_due) {
                 waited_for_due = n_due == 0;
+#ifdef CONFIG_WIN32
+                if (next_due - pick_now < 25000) {
+                    /* a frame's time is near: kept to it (new frames wait as long) */
+                    qemu_mutex_unlock(&p->lock);
+                    sp_present_sleep_us(next_due - pick_now);
+                    continue;
+                }
+#endif
                 qemu_cond_timedwait(&p->wake, &p->lock, (int)MAX((next_due - pick_now + 500) / 1000, 1));
             } else if (native) {
                 qemu_cond_timedwait(&p->wake, &p->lock, 1);
@@ -667,7 +786,12 @@ static void *sp_present_thread(void *opaque)
         glReadBuffer(GL_COLOR_ATTACHMENT0);
         bool recording = qatomic_read(&spacebox_video_record_on), code_ok = false;
         int64_t code_us = -1;
+#ifdef CONFIG_WIN32
+        bool code_started = recording && sp_present_code_start(s);
+        int code = -1;
+#else
         int code = recording ? sp_present_code(s, &code_ok, &code_us) : -1;
+#endif
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         glDrawBuffer(GL_BACK);
 #ifdef CONFIG_WIN32
@@ -707,12 +831,55 @@ static void *sp_present_thread(void *opaque)
             qemu_mutex_unlock(&p->lock);
         }
 #ifdef CONFIG_WIN32
+        {
+            /*
+             * A present close before the DWM's composition (2 ms after a
+             * vertical blank on BF2) may come after it and be hidden by the
+             * next frame, and one just after it waits a refresh more: none
+             * from 3 ms before a blank to 4 ms after it (the composition
+             * began 0.5 to 2.5 ms after the blank, and a present 1.7 ms
+             * before one missed it).
+             */
+            int64_t blank, t = g_get_monotonic_time(), at = 0;
+
+            qemu_mutex_lock(&p->lock);
+            blank = p->tick_now_host ? sp_present_host_us(p->tick_now_host) : 0;
+            qemu_mutex_unlock(&p->lock);
+            if (blank && t > blank) {
+                /* the last blank by the refresh: the waiter's may be late */
+                blank += (t - blank) / refresh_us * refresh_us;
+            }
+            if (blank && t - blank < 4000) {
+                at = blank + 4000;
+            } else if (blank && t - blank > refresh_us - 3000) {
+                at = blank + refresh_us + 4000;
+            }
+            if (at > t) {
+                sp_present_sleep_us(at - t);
+                swap_call = g_get_monotonic_time();
+                qpc_call = sp_present_qpc();
+            }
+        }
         spacebox_swap(p->window, win_w, win_h);
+        /*
+         * Here the swap returns at once and the DWM shows the window's last
+         * present at its next composition (2 ms after a vertical blank on
+         * BF2), at the blank after that. Waiting for that composition, as
+         * the Mac's swap waits for its refresh, gives the presenter's times
+         * and its phase (above) their meaning, and no second frame reaches
+         * the DWM before it has taken this one.
+         */
+        DwmFlush();
 #else
         spacebox_swap(p->window, s->fb.width, s->fb.height);
 #endif
         int64_t swapped = g_get_monotonic_time();
         qpc_ret = sp_present_qpc();
+#ifdef CONFIG_WIN32
+        if (code_started) {
+            code = sp_present_code_finish(&code_ok, &code_us);
+        }
+#endif
         if (recording) {
             show_us = sp_present_show_time(now_host, out_host, swap_call, refresh_us,
                                            &vsync_us, &out_us);

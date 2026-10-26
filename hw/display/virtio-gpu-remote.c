@@ -4609,9 +4609,12 @@ static bool sp_input_late(uint32_t type, const void *a, size_t len, const char *
         } else {
             due = MAX(now, sp_late_held_down_due + 1);
         }
-        if (due <= now) {
+        if (due <= now && !tail) {
             return false;
         }
+        /* while anything waits (also an event whose time has come, its timer late), this one goes in its place in
+         * the queue, never past what is due before it: a key-up sent at once while its own key-down still waited
+         * reached the guest first and lost the key (BF2, 2026-10-26: "ss" typed, one s shown) */
         l = g_malloc(sizeof(*l) + len);
         l->t_in = now;
         l->due = due;
@@ -4625,7 +4628,9 @@ static bool sp_input_late(uint32_t type, const void *a, size_t len, const char *
         if (!sp_late_in_timer) {
             sp_late_in_timer = timer_new_us(QEMU_CLOCK_REALTIME, sp_late_in_run, NULL);
         }
-        if (g_queue_peek_head(&sp_late_in) == l) {
+        if (due <= now) {
+            sp_late_in_run(NULL);           /* what is due now goes now, in its order */
+        } else if (g_queue_peek_head(&sp_late_in) == l) {
             timer_mod(sp_late_in_timer, qemu_clock_get_us(QEMU_CLOCK_REALTIME) + (l->due - now));
         }
         return true;

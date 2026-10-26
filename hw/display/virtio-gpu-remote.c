@@ -80,6 +80,7 @@
 #include "audio/audio.h"
 #include "virtio-gpu-remote-formats.h"
 #include "virtio-gpu-remote.h"
+#include "ui/spacebox-ui-probe.h"
 #include "ui/spacebox-video-record.h"
 #include "system/runstate.h"
 
@@ -2131,6 +2132,54 @@ static int sp_sink_admit(SpRxMsg *m)
 }
 
 /* the main loop: the messages that the reader queued, in their order */
+/* messages taken off the queue go back to its head (the fault stuck-rx) */
+static void sp_rx_requeue(SpRxMsg *first)
+{
+    SpRxMsg *last = first;
+    size_t bytes = first->len;
+
+    while (last->next) {
+        last = last->next;
+        bytes += last->len;
+    }
+    qemu_mutex_lock(&sp.rx_lock);
+    last->next = sp.rx_head;
+    sp.rx_head = first;
+    if (!sp.rx_tail) {
+        sp.rx_tail = last;
+    }
+    sp.rx_queued += bytes;
+    qemu_mutex_unlock(&sp.rx_lock);
+}
+
+void sp_rx_kick(void)
+{
+    qemu_mutex_lock(&sp.rx_lock);
+    sp.rx_woken = true;
+    event_notifier_set(&sp.rx_notify);
+    qemu_mutex_unlock(&sp.rx_lock);
+}
+
+void sp_probe_sink_queue(SpProbeQueue *q)
+{
+    memset(q, 0, sizeof(*q));
+    qemu_mutex_lock(&sp.rx_lock);
+    q->rx_bytes = sp.rx_queued;
+    for (SpRxMsg *m = sp.rx_head; m && q->rx_msgs < 1000000; m = m->next) {
+        if (!q->rx_oldest) {
+            q->rx_oldest = m->t_read;
+        }
+        q->rx_msgs++;
+    }
+    qemu_mutex_unlock(&sp.rx_lock);
+    q->waiting = sph.n;
+    q->incomplete = sph.incomplete;
+    qemu_mutex_lock(&sp.tx_lock);
+    q->tx_backlog = sp.tx_backlog;
+    qemu_mutex_unlock(&sp.tx_lock);
+    q->base = MIN(sp_rx_min, sp_rx_min_prev);
+}
+
 static void sp_rx(void *opaque)
 {
     SpRxMsg *m, *done;
@@ -2139,6 +2188,11 @@ static void sp_rx(void *opaque)
 
     if (sp.rx_busy) {
         return;     /* the notifier stays set: called again after */
+    }
+    if (sp.mode == SP_REMOTE_SINK && sp_probe_rx_stuck()) {
+        /* the UI evals' fault stuck-rx: the messages wait (sp_rx_kick) */
+        event_notifier_test_and_clear(&sp.rx_notify);
+        return;
     }
     event_notifier_test_and_clear(&sp.rx_notify);
     qemu_mutex_lock(&sp.rx_lock);
@@ -2163,6 +2217,15 @@ static void sp_rx(void *opaque)
             break;
         }
         memcpy(&h, done->data, sizeof(h));
+        if (sp.mode == SP_REMOTE_SINK && sp.hello_done && h.type == SP_CTRL &&
+            sp_probe_rx_hold(h.a_len >= 4 && ldl_le_p(done->data + sizeof(h)) ==
+                             VIRTIO_GPU_CMD_RESOURCE_FLUSH)) {
+            /* the UI evals' fault stuck-rx: this flush and what follows wait */
+            done->next = m;
+            sp_rx_requeue(done);
+            m = NULL;
+            break;
+        }
         sp_rx_now = done->t_read;
         sp_rx_run = run;
         sp_rxq.n++;
@@ -4167,7 +4230,7 @@ static void sp_sink_ctrl(VirtIOGPU *g, SpHdr *h, uint8_t *a, uint8_t *b)
     sp.next_expect = NULL;
     sp_state_attach(cmd, h->id);
     cmd->sp_t_read = sp_rx_now;
-    if (spacebox_video_record_on) {
+    if (spacebox_video_record_on || spacebox_ui_probe_on) {
         /* the source's time on this clock as the lateness takes it (sp_rx_delay) */
         int64_t base = MIN(sp_rx_min, sp_rx_min_prev);
 
@@ -4472,22 +4535,95 @@ static void sp_sink_signals_install(void *opaque)
 }
 #endif
 
+/*
+ * The UI evals' fault delay-input (virtio-gpu-remote-probe.c): the input and
+ * the scroll channel's lines go to the source that much later, in their order
+ * (a message that comes while earlier ones wait waits behind them, also when
+ * the fault has ended). Each key, button and scroll event's hold is logged.
+ */
+typedef struct SpLateIn {
+    int64_t due, t_in;      /* g_get_monotonic_time() */
+    uint32_t type;
+    const char *kind;       /* the line's, or NULL: none */
+    int a, b;
+    size_t len;
+    uint8_t data[];
+} SpLateIn;
+static GQueue sp_late_in = G_QUEUE_INIT;
+static QEMUTimer *sp_late_in_timer;
+
+static void sp_late_in_run(void *opaque)
+{
+    int64_t now = g_get_monotonic_time();
+    SpLateIn *l;
+
+    while ((l = g_queue_peek_head(&sp_late_in)) && l->due <= now) {
+        g_queue_pop_head(&sp_late_in);
+        if (sp.fd >= 0 && sp.hello_done) {
+            sp_send(l->type, 0, l->data, l->len, NULL, 0, 0, 0, 0);
+            if (l->kind) {
+                sp_probe_input_held(l->kind, l->a, l->b, now - l->t_in);
+            }
+        }
+        g_free(l);
+    }
+    if (l) {
+        timer_mod(sp_late_in_timer, qemu_clock_get_us(QEMU_CLOCK_REALTIME) + (l->due - now));
+    }
+}
+
+/* true when the message waits for the fault delay-input (it is sent later) */
+static bool sp_input_late(uint32_t type, const void *a, size_t len, const char *kind,
+                          int x, int y)
+{
+    int ms = sp_probe_input_delay_ms();
+    int64_t now = g_get_monotonic_time();
+    SpLateIn *l, *tail = g_queue_peek_tail(&sp_late_in);
+
+    if (!ms && !tail) {
+        return false;
+    }
+    l = g_malloc(sizeof(*l) + len);
+    l->t_in = now;
+    l->due = MAX(now + (int64_t)ms * 1000, tail ? tail->due : 0);
+    l->type = type;
+    l->kind = kind;
+    l->a = x;
+    l->b = y;
+    l->len = len;
+    memcpy(l->data, a, len);
+    g_queue_push_tail(&sp_late_in, l);
+    if (!sp_late_in_timer) {
+        sp_late_in_timer = timer_new_us(QEMU_CLOCK_REALTIME, sp_late_in_run, NULL);
+    }
+    if (!tail) {
+        timer_mod(sp_late_in_timer, qemu_clock_get_us(QEMU_CLOCK_REALTIME) + (l->due - now));
+    }
+    return true;
+}
+
 static void sp_input_event(DeviceState *dev, QemuConsole *src, InputEvent *evt)
 {
     SpInput m = { 0 };
+    const char *kind = NULL;
 
     switch (evt->type) {
     case INPUT_EVENT_KIND_KEY:
         m.kind = 1;
         m.a = qemu_input_key_value_to_qcode(evt->u.key.data->key);
         m.b = evt->u.key.data->down;
+        if (sp_probe_drop_key(m.a, m.b)) {
+            return;     /* the UI evals' fault drop-key */
+        }
         spacebox_last_input_us = g_get_monotonic_time();
+        kind = "key";
         break;
     case INPUT_EVENT_KIND_BTN:
         m.kind = 2;
         m.a = evt->u.btn.data->button;
         m.b = evt->u.btn.data->down;
         spacebox_last_input_us = g_get_monotonic_time();
+        kind = "button";
         break;
     case INPUT_EVENT_KIND_REL:
         m.kind = 3;
@@ -4505,7 +4641,9 @@ static void sp_input_event(DeviceState *dev, QemuConsole *src, InputEvent *evt)
     if (sp.fd < 0 || !sp.hello_done) {
         return; /* not kept for later: old input would only confuse */
     }
-    sp_send(SP_INPUT, 0, &m, sizeof(m), NULL, 0, 0, 0, 0);
+    if (!sp_input_late(SP_INPUT, &m, sizeof(m), kind, (int)m.a, (int)m.b)) {
+        sp_send(SP_INPUT, 0, &m, sizeof(m), NULL, 0, 0, 0, 0);
+    }
 }
 
 static void sp_input_sync(DeviceState *dev)
@@ -4515,7 +4653,9 @@ static void sp_input_sync(DeviceState *dev)
     if (sp.fd < 0 || !sp.hello_done) {
         return;
     }
-    sp_send(SP_INPUT, 0, &m, sizeof(m), NULL, 0, 0, 0, 0);
+    if (!sp_input_late(SP_INPUT, &m, sizeof(m), NULL, 0, 0)) {
+        sp_send(SP_INPUT, 0, &m, sizeof(m), NULL, 0, 0, 0, 0);
+    }
 }
 
 /*
@@ -4542,7 +4682,13 @@ bool spacebox_remote_scroll_send(const void *buf, size_t len)
     if (!sp.peer_scroll || sp.fd < 0 || !sp.hello_done) {
         return false; /* not kept for later, like the input */
     }
-    sp_send(SP_SCROLL, 0, buf, len, NULL, 0, 0, 0, 0);
+    /* a scroll event's line waits for the fault delay-input (logged with its
+     * number, the line's first field); the PING does not */
+    if ((len >= 4 && !memcmp(buf, "PING", 4)) ||
+        !sp_input_late(SP_SCROLL, buf, len, "scroll",
+                       (int)strtoul((const char *)buf, NULL, 10), 0)) {
+        sp_send(SP_SCROLL, 0, buf, len, NULL, 0, 0, 0, 0);
+    }
     return true;
 }
 
@@ -5604,6 +5750,7 @@ void sp_remote_realize(VirtIOGPU *g, Error **errp)
         sp_ach_sink_listen();
         sp_state_realize(g);
         sp_record_realize();
+        sp_probe_realize();
         sp.input = qemu_input_handler_register(DEVICE(g), &sp_input_handler);
         qemu_input_handler_activate(sp.input);
         aio_bh_schedule_oneshot(qemu_get_aio_context(),

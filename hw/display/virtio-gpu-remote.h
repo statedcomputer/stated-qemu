@@ -97,6 +97,38 @@ int sp_sock_listen(const char *a);
 int sp_sock_connect(const char *a);
 void sp_sock_tune(int fd);
 
+/* virtio-gpu-remote-probe.c: the UI evals' probe (include/ui/spacebox-ui-probe.h) */
+void sp_probe_realize(void);
+bool sp_probe_control(const char *text);
+/* the sink's input: true when the fault drop-key drops this key event */
+bool sp_probe_drop_key(int qcode, bool down);
+/* the fault stuck-rx: the reader's messages wait (true while it holds them);
+ * true when this message (a guest flush when is_flush) is the one it holds */
+bool sp_probe_rx_stuck(void);
+bool sp_probe_rx_hold(bool is_flush);
+/* the fault delay-input: how much later the input goes to the source (ms, 0 =
+ * at once), and the line of an event it held (kind "key", "button" or
+ * "scroll"; a, b: the key's qcode and down, the button and down) */
+int sp_probe_input_delay_ms(void);
+void sp_probe_input_held(const char *kind, int a, int b, int64_t hold_us);
+
+/* virtio-gpu-remote.c, for the probe's queue line: the reader's messages that
+ * wait for the main loop (their bytes, their number, the oldest one's read on
+ * g_get_monotonic_time(), 0 = none), the commands that wait for a write in
+ * pieces and the writes not complete, this sink's send backlog, and the base
+ * of the lateness (a source's time + base is this clock; INT64_MAX = none) */
+typedef struct SpProbeQueue {
+    size_t rx_bytes;
+    unsigned rx_msgs;
+    int64_t rx_oldest;
+    unsigned waiting, incomplete;
+    size_t tx_backlog;
+    int64_t base;
+} SpProbeQueue;
+void sp_probe_sink_queue(SpProbeQueue *q);
+/* the main loop runs the reader's messages (again, after stuck-rx) */
+void sp_rx_kick(void);
+
 /* virtio-gpu-remote-record.c: the record of video frames */
 void sp_record_realize(void);
 bool sp_record_control(const char *text);

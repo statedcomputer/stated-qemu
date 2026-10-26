@@ -2663,6 +2663,8 @@ static void sp_control_tick(void *opaque)
                 "stalls %u ms\n", sps.export_stall_ms);
     } else if (sp_record_control(text)) {
         /* the record of video frames (virtio-gpu-remote-record.c) */
+    } else if (sp_probe_control(text)) {
+        /* the UI evals' probe (virtio-gpu-remote-probe.c) */
     } else {
         fprintf(stderr, "[SPACEBOX-REMOTE] sink control: unknown command\n");
     }

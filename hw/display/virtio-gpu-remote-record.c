@@ -62,6 +62,7 @@
 #include "qemu/timer.h"
 #include "hw/virtio/virtio-gpu.h"
 #include "ui/spacebox-video-record.h"
+#include "ui/spacebox-ui-probe.h"
 #include "virtio-gpu-remote.h"
 
 #include <virglrenderer.h>
@@ -296,15 +297,18 @@ void sp_record_flush(uint32_t resource_id, bool begin)
     if (!begin) {
         spacebox_frame_ntickets = 0;
         spacebox_frame_flush_dev = spacebox_frame_flush_read = spacebox_frame_flush_rx = 0;
-    } else if (spacebox_video_record_on) {
+    } else if (spacebox_video_record_on || spacebox_ui_probe_on) {
+        /* the flush's times go with the frame also to the UI evals' probe */
         spacebox_frame_flush_dev = rec.cmd_dev;
         spacebox_frame_flush_read = rec.cmd_read;
         spacebox_frame_flush_rx = rec.cmd_rx;
-        int64_t t0 = g_get_monotonic_time();
+        if (spacebox_video_record_on) {
+            int64_t t0 = g_get_monotonic_time();
 
-        spacebox_frame_ntickets = virgl_renderer_resource_video_tickets(resource_id,
-                                    spacebox_frame_tickets, SP_REC_TICKETS);
-        rec.main_us += g_get_monotonic_time() - t0;
+            spacebox_frame_ntickets = virgl_renderer_resource_video_tickets(resource_id,
+                                        spacebox_frame_tickets, SP_REC_TICKETS);
+            rec.main_us += g_get_monotonic_time() - t0;
+        }
     }
 }
 

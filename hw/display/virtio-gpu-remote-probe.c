@@ -732,6 +732,11 @@ bool sp_probe_drop_key(int qcode, bool down)
     return false;
 }
 
+int sp_probe_input_every(void)
+{
+    return pr.delay_input_ms ? pr.delay_input_every : 0;
+}
+
 int sp_probe_input_delay_ms(const char *kind, int a, int b)
 {
     int ms = pr.delay_input_ms;

@@ -4551,6 +4551,15 @@ typedef struct SpLateIn {
 } SpLateIn;
 static GQueue sp_late_in = G_QUEUE_INIT;
 static QEMUTimer *sp_late_in_timer;
+/* delay-input MS EVERY: the due time of each key's last key-down (by qcode) and of the latest held key-down */
+static int64_t sp_late_down_due[256], sp_late_held_down_due;
+
+static gint sp_late_in_cmp(gconstpointer a, gconstpointer b, gpointer opaque)
+{
+    const SpLateIn *x = a, *y = b;
+
+    return x->due < y->due ? -1 : x->due > y->due;     /* equal: the later one after (g_queue_insert_sorted) */
+}
 
 static void sp_late_in_run(void *opaque)
 {
@@ -4577,15 +4586,56 @@ static bool sp_input_late(uint32_t type, const void *a, size_t len, const char *
                           int x, int y)
 {
     int ms = sp_probe_input_delay_ms(kind, x, y);
+    int every = sp_probe_input_every();
     int64_t now = g_get_monotonic_time();
     SpLateIn *l, *tail = g_queue_peek_tail(&sp_late_in);
+    int64_t due = now + (int64_t)ms * 1000;
 
+    if (every > 1) {
+        /* only some keys are held: each event keeps only the order that matters, so that an undelayed key does not
+         * wait behind a held key's key-up. A key-down goes after every held key-down before it (the typed order); a
+         * key-up goes after its own key-down and is not held otherwise; anything else goes when it comes, after
+         * the held key-downs. Typing that stays further apart than the hold keeps every key's order. */
+        if (kind && !strcmp(kind, "key") && x >= 0 && x < 256) {
+            if (y) {
+                due = MAX(due, sp_late_held_down_due + 1);
+                if (ms) {
+                    sp_late_held_down_due = due;
+                }
+                sp_late_down_due[x] = due;
+            } else {
+                due = MAX(now, sp_late_down_due[x] + 1);
+            }
+        } else {
+            due = MAX(now, sp_late_held_down_due + 1);
+        }
+        if (due <= now) {
+            return false;
+        }
+        l = g_malloc(sizeof(*l) + len);
+        l->t_in = now;
+        l->due = due;
+        l->type = type;
+        l->kind = kind;
+        l->a = x;
+        l->b = y;
+        l->len = len;
+        memcpy(l->data, a, len);
+        g_queue_insert_sorted(&sp_late_in, l, sp_late_in_cmp, NULL);
+        if (!sp_late_in_timer) {
+            sp_late_in_timer = timer_new_us(QEMU_CLOCK_REALTIME, sp_late_in_run, NULL);
+        }
+        if (g_queue_peek_head(&sp_late_in) == l) {
+            timer_mod(sp_late_in_timer, qemu_clock_get_us(QEMU_CLOCK_REALTIME) + (l->due - now));
+        }
+        return true;
+    }
     if (!ms && !tail) {
         return false;
     }
     l = g_malloc(sizeof(*l) + len);
     l->t_in = now;
-    l->due = MAX(now + (int64_t)ms * 1000, tail ? tail->due : 0);
+    l->due = MAX(due, tail ? tail->due : 0);
     l->type = type;
     l->kind = kind;
     l->a = x;

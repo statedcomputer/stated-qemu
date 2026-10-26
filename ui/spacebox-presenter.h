@@ -28,6 +28,9 @@
 /* hw/display/virtio-gpu-remote.c: when to show the frame being submitted, 0 = at once */
 extern int64_t spacebox_frame_due_us;
 extern int64_t spacebox_frame_gap_us;
+#ifdef CONFIG_WIN32
+extern int64_t spacebox_present_refresh_us;
+#endif
 enum SpSlotState { SP_FREE, SP_WRITING, SP_READY, SP_READING, SP_DISPLAYED };
 typedef struct SpSlot {
     egl_fb fb;
@@ -665,6 +668,9 @@ static void *sp_present_thread(void *opaque)
             refresh_us = nominal;
         }
     }
+#ifdef CONFIG_WIN32
+    qatomic_set(&spacebox_present_refresh_us, refresh_us);   /* the pacing's (virtio-gpu-remote.c) */
+#endif
     sp_present_thread_priority();
 #ifdef CONFIG_WIN32
     sdl2_win_gl_on_window();    /* the window's device context is this thread's */

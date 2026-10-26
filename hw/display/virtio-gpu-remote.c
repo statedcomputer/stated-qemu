@@ -297,6 +297,21 @@ static int64_t sp_aud_delay_us; /* sink: how much later sound is played, 0 = sil
  */
 int64_t spacebox_frame_due_us;
 int64_t spacebox_frame_gap_us;  /* usual spacing of recent updates, 0 = not a steady stream */
+#ifdef CONFIG_WIN32
+/*
+ * Windows: the refresh of the window's display (the presenter's, 0 = not known
+ * yet). The Mac's display (120 Hz) can show a frame half a 60/s video's
+ * spacing early or late; BF2's (59.95 Hz) is no faster than such a video, so
+ * the allowance's changes show there: a fall that brings frames sooner than a
+ * refresh apart leaves the presenter behind, and it drops frames to catch up
+ * (18 of a 60/s clip as the allowance of its start came down: PresentMon's
+ * record on BF2), and a rise holds frames a refresh more (below). So on
+ * Windows the allowance falls only by the slack that the stream's spacing
+ * leaves beyond a refresh a frame, which a 30/s video has and a 60/s one has
+ * not, and a video's start does not raise it to its maximum.
+ */
+int64_t spacebox_present_refresh_us;
+#endif
 /*
  * When the user last pressed a key, clicked or scrolled (this machine's clock;
  * set here and by ui/spacebox-scroll.m). Pacing holds every frame back, the
@@ -326,6 +341,9 @@ static struct {
     int64_t gap[32];    /* source-clock spacing of recent screen updates */
     unsigned gap_n, gap_pos;
     int64_t last_t_us;
+#ifdef CONFIG_WIN32
+    int64_t slack;      /* the stream's spacing beyond a refresh a frame, summed */
+#endif
 } sp_pace = { .mode = -1, .input_us = -1 };
 
 static int sp_cmp_i64(const void *a, const void *b)
@@ -360,8 +378,21 @@ static void sp_sink_pace_frame(const SpHdr *h)
         sp_pace.gap[sp_pace.gap_pos] = h->t_us - sp_pace.last_t_us;
         sp_pace.gap_pos = (sp_pace.gap_pos + 1) % G_N_ELEMENTS(sp_pace.gap);
         sp_pace.gap_n = MIN(sp_pace.gap_n + 1, G_N_ELEMENTS(sp_pace.gap));
+#ifdef CONFIG_WIN32
+        {
+            int64_t r = qatomic_read(&spacebox_present_refresh_us);
+
+            if (r > 0) {
+                sp_pace.slack += h->t_us - sp_pace.last_t_us - r;
+                sp_pace.slack = MAX(MIN(sp_pace.slack, G_USEC_PER_SEC), -G_USEC_PER_SEC);
+            }
+        }
+#endif
     } else {
         sp_pace.gap_n = sp_pace.gap_pos = 0; /* a pause: not a steady stream */
+#ifdef CONFIG_WIN32
+        sp_pace.slack = 0;
+#endif
     }
     sp_pace.last_t_us = h->t_us;
     late = MAX(read - h->t_us - base, 0);
@@ -400,6 +431,27 @@ static void sp_sink_pace_frame(const SpHdr *h)
             target = MAX(target, sp_pace.late_max[i]);
         }
     }
+#ifdef CONFIG_WIN32
+    /*
+     * A display of a video's rate (BF2: 59.95 Hz) shows any rise of the
+     * allowance as a frame held a refresh more, past the judder bound: rising
+     * to its maximum at a video's start, and to the lateness of the page's
+     * loading before it (its large transfers), held 21 frames so (1.1% of a
+     * 30/s clip of 64 s). On Windows a video's start takes the lateness of the
+     * video's own updates, from this one on; a later update than the
+     * allowance raises it at once (below).
+     */
+    if (qatomic_read(&spacebox_present_refresh_us) > 0) {
+        if (starting) {
+            memset(sp_pace.late_max, 0, sizeof(sp_pace.late_max));
+            memset(sp_pace.late_sec, 0, sizeof(sp_pace.late_sec));
+            sp_pace.late_sec[sec % 10] = sec;
+            sp_pace.late_max[sec % 10] = late;
+            target = late;
+        }
+        starting = false;
+    }
+#endif
     target = MIN(starting ? sp_pace.max_us : target, sp_pace.max_us);
     if (sp_aud_delay_us) {
         /*
@@ -440,7 +492,15 @@ static void sp_sink_pace_frame(const SpHdr *h)
     if (target > sp_pace.allowance) {
         sp_pace.allowance += MIN(target - sp_pace.allowance, gap / 3);
     } else {
-        sp_pace.allowance -= (sp_pace.allowance - target) / 64;
+        int64_t fall = (sp_pace.allowance - target) / 64;
+
+#ifdef CONFIG_WIN32
+        if (qatomic_read(&spacebox_present_refresh_us) > 0) {
+            fall = MIN(fall, MAX(sp_pace.slack, 0));
+            sp_pace.slack -= fall;
+        }
+#endif
+        sp_pace.allowance -= fall;
     }
     spacebox_frame_gap_us = 0;
     if (sp_pace.gap_n >= 16) {
@@ -473,6 +533,9 @@ static void sp_sink_pace_reset(void)
     sp_pace.usual_gap = 0;
     sp_pace.gap_n = sp_pace.gap_pos = 0;
     sp_pace.last_t_us = 0;
+#ifdef CONFIG_WIN32
+    sp_pace.slack = 0;
+#endif
     sp_rx_min = sp_rx_min_prev = INT64_MAX;
     sp_rx_min_t0 = 0;
     sp_aud_delay_us = 0;

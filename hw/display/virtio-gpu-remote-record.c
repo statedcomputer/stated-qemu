@@ -76,7 +76,7 @@
 bool spacebox_video_record_on;
 uint64_t spacebox_frame_tickets[SP_REC_TICKETS];
 unsigned spacebox_frame_ntickets;
-int64_t spacebox_frame_flush_dev, spacebox_frame_flush_read;
+int64_t spacebox_frame_flush_dev, spacebox_frame_flush_read, spacebox_frame_flush_rx;
 int spacebox_present_pause_ms;
 
 typedef struct SpRecPic {
@@ -295,10 +295,11 @@ void sp_record_flush(uint32_t resource_id, bool begin)
 {
     if (!begin) {
         spacebox_frame_ntickets = 0;
-        spacebox_frame_flush_dev = spacebox_frame_flush_read = 0;
+        spacebox_frame_flush_dev = spacebox_frame_flush_read = spacebox_frame_flush_rx = 0;
     } else if (spacebox_video_record_on) {
         spacebox_frame_flush_dev = rec.cmd_dev;
         spacebox_frame_flush_read = rec.cmd_read;
+        spacebox_frame_flush_rx = rec.cmd_rx;
         int64_t t0 = g_get_monotonic_time();
 
         spacebox_frame_ntickets = virgl_renderer_resource_video_tickets(resource_id,
@@ -343,7 +344,8 @@ void spacebox_video_record_swap(uint64_t seq, int64_t t_swap, int code,
                                 int64_t t_show, int64_t t_call, int64_t t_vsync,
                                 int64_t t_out, int64_t t_due, int64_t t_flush_dev,
                                 int64_t t_flush_read, int64_t qpc_call,
-                                int64_t qpc_ret)
+                                int64_t qpc_ret, int64_t t_flush_rx,
+                                int64_t t_sub, int64_t t_ready)
 {
     GString *s;
 
@@ -375,6 +377,11 @@ void spacebox_video_record_swap(uint64_t seq, int64_t t_swap, int code,
     if (qpc_call || qpc_ret) {
         g_string_append_printf(s, ",\"qpc_call\":%" PRId64 ",\"qpc_ret\":%" PRId64,
                                qpc_call, qpc_ret);
+    }
+    if (t_sub) {
+        sp_rec_time(s, "t_flush_rx", t_flush_rx);
+        sp_rec_time(s, "t_sub_us", t_sub);
+        sp_rec_time(s, "t_ready_us", t_ready);
     }
     g_string_append_c(s, '}');
     sp_rec_put(s);

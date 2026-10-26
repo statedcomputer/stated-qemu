@@ -45,6 +45,10 @@ typedef struct SpSlot {
     uint64_t tickets[SP_REC_TICKETS];
     unsigned ntickets;
     int64_t flush_dev, flush_read;  /* its flush's message: sent, read */
+#ifdef CONFIG_WIN32
+    int64_t flush_rx;   /* ... and run by the main loop (the record's) */
+    int64_t ready_at;   /* when the presenter first found the GPU done with it */
+#endif
     int src_w, src_h;
 #ifdef CONFIG_WIN32
     int win_w, win_h;   /* the window's drawable it is shown in */
@@ -710,6 +714,9 @@ static void *sp_present_thread(void *opaque)
         for (int i = 0; i < SP_SLOTS; i++) {
             SpSlot *s = &p->slots[i];
             if (s->state != SP_READY || s->superseded || !sp_fence_done(s->ready)) continue;
+#ifdef CONFIG_WIN32
+            if (!s->ready_at) s->ready_at = pick_now;
+#endif
             int64_t due = s->show_due ? s->show_due + phase_adj : 0;
             if (due > pick_now) {
                 if (!next_due || due < next_due) next_due = due;
@@ -945,10 +952,16 @@ static void *sp_present_thread(void *opaque)
         }
         qemu_mutex_unlock(&p->lock);
         if (recording) {
+#ifdef CONFIG_WIN32
+            int64_t t_flush_rx = s->flush_rx, t_sub = s->submitted, t_ready = s->ready_at;
+#else
+            int64_t t_flush_rx = 0, t_sub = 0, t_ready = 0;
+#endif
             spacebox_video_record_swap(presented, swapped, code, code_ok, s->tickets,
                                        s->ntickets, coalesced, code_us, show_us,
                                        swap_call, vsync_us, out_us, pick_due,
-                                       s->flush_dev, s->flush_read, qpc_call, qpc_ret);
+                                       s->flush_dev, s->flush_read, qpc_call, qpc_ret,
+                                       t_flush_rx, t_sub, t_ready);
         }
         int pause_ms = qatomic_xchg(&spacebox_present_pause_ms, 0);
         if (pause_ms) {
@@ -1053,6 +1066,8 @@ static void sp_present_submit(struct sdl2_console *scon, SpSlot *s, int src_w, i
     s->src_h = src_h;
 #ifdef CONFIG_WIN32
     SDL_GL_GetDrawableSize(p->window, &s->win_w, &s->win_h);
+    s->flush_rx = spacebox_frame_flush_rx;
+    s->ready_at = 0;
 #endif
     qemu_mutex_lock(&p->lock);
     s->ready = fence;

@@ -312,6 +312,15 @@ int64_t spacebox_frame_gap_us;  /* usual spacing of recent updates, 0 = not a st
  */
 int64_t spacebox_present_refresh_us;
 #define SP_WIN_VIDEO_US 150000  /* the least allowance while a video plays */
+/*
+ * Windows: the mean spacing of recent updates (the middle half of them), 0 =
+ * not a steady stream. The usual spacing is the median of the updates, which
+ * at a rate that is not a whole number of refreshes is one of the two
+ * spacings that the guest alternates (a 24/s video on a 59.95 Hz display: 2
+ * and 3 refreshes, 2.5 a frame); the presenter's least spacing on Windows is
+ * taken from this mean (ui/spacebox-presenter.h).
+ */
+int64_t spacebox_frame_step_us;
 #endif
 /*
  * When the user last pressed a key, clicked or scrolled (this machine's clock;
@@ -371,6 +380,9 @@ static void sp_sink_pace_frame(const SpHdr *h)
     }
     spacebox_frame_due_us = 0;
     spacebox_frame_gap_us = 0;
+#ifdef CONFIG_WIN32
+    spacebox_frame_step_us = 0;
+#endif
     if (!h->t_us || base == INT64_MAX) {
         return;
     }
@@ -526,6 +538,17 @@ static void sp_sink_pace_frame(const SpHdr *h)
         memcpy(sorted, sp_pace.gap, sp_pace.gap_n * sizeof(sorted[0]));
         qsort(sorted, sp_pace.gap_n, sizeof(sorted[0]), sp_cmp_i64);
         spacebox_frame_gap_us = sp_pace.usual_gap = sorted[sp_pace.gap_n / 2];
+#ifdef CONFIG_WIN32
+        {
+            unsigned lo = sp_pace.gap_n / 4, hi = sp_pace.gap_n - sp_pace.gap_n / 4;
+            int64_t sum = 0;
+
+            for (unsigned i = lo; i < hi; i++) {
+                sum += sorted[i];
+            }
+            spacebox_frame_step_us = sum / (hi - lo);
+        }
+#endif
     }
     if (late >= sp_pace.allowance) {
         sp_pace.late_frames++;

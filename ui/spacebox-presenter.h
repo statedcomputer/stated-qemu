@@ -30,6 +30,7 @@ extern int64_t spacebox_frame_due_us;
 extern int64_t spacebox_frame_gap_us;
 #ifdef CONFIG_WIN32
 extern int64_t spacebox_present_refresh_us;
+extern int64_t spacebox_frame_step_us;
 #endif
 enum SpSlotState { SP_FREE, SP_WRITING, SP_READY, SP_READING, SP_DISPLAYED };
 typedef struct SpSlot {
@@ -40,6 +41,9 @@ typedef struct SpSlot {
     int64_t submitted;
     int64_t due;    /* show no earlier than this, 0 = at once */
     int64_t gap;    /* usual spacing of the stream this frame belongs to, 0 = none */
+#ifdef CONFIG_WIN32
+    int64_t step;   /* ... its mean spacing (spacebox_frame_step_us), 0 = none */
+#endif
     /* the record of video frames: the tickets of the video pictures the frame
      * shows, and the size of the picture it was made from (the scanout) */
     uint64_t tickets[SP_REC_TICKETS];
@@ -792,6 +796,24 @@ static void *sp_present_thread(void *opaque)
              */
             SpSlot *s = &p->slots[oldest];
             int64_t k = MAX((s->gap + refresh_us / 2) / refresh_us, 1);
+#ifdef CONFIG_WIN32
+            /*
+             * Windows: the least spacing of the stream, its mean spacing in
+             * whole refreshes rounded down (with a quarter of a refresh for the
+             * two clocks). Of a rate that is a whole number of refreshes (30/s
+             * and 60/s on BF2's 59.95 Hz) that is the usual spacing as above;
+             * of one that is not, the shorter of the two spacings that the
+             * guest alternates (24/s: 2 and 3 refreshes, 2.5 a frame). The
+             * usual spacing (the median: 3 refreshes there) held a frame due 2
+             * refreshes after the last one a refresh longer, and the frame
+             * after it, due already, followed a refresh later: 2, 3, 4 and 1
+             * refreshes apart, judder in 18% of a 24/s YouTube video's frames
+             * by PresentMon (the Windows client's G5d).
+             */
+            if (s->step) {
+                k = MAX((s->step + refresh_us / 4) / refresh_us, 1);
+            }
+#endif
             if (n_due >= 2 && k > 1) k--;
 #ifdef CONFIG_WIN32
             /*
@@ -1157,6 +1179,10 @@ static void sp_present_submit(struct sdl2_console *scon, SpSlot *s, int src_w, i
     s->superseded = false;
     spacebox_frame_due_us = 0;
     spacebox_frame_gap_us = 0;
+#ifdef CONFIG_WIN32
+    s->step = spacebox_frame_step_us;
+    spacebox_frame_step_us = 0;
+#endif
     s->state = SP_READY;
     qemu_cond_signal(&p->wake);
     qemu_mutex_unlock(&p->lock);

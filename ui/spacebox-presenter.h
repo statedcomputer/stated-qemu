@@ -582,6 +582,37 @@ static int sp_present_code_finish(bool *ok, int64_t *read_us)
 }
 #endif
 
+#ifdef CONFIG_WIN32
+/*
+ * Windows: a swap from 3 ms before a vertical blank to SP_WIN_AFTER_BLANK_US
+ * after it waits until then (the DWM's composition, below), and a swap is
+ * shown at the composition after it whenever in the refresh it comes, as
+ * long as the GPU has done the frame by then. A frame's time moves through
+ * the refresh as the guest's clock and the display's part (a 30/s video on
+ * BF2's 59.95 Hz display, over about 40 s), and a swap late in it missed the
+ * composition while the GPU was busy (a 3840x2160 HEVC Main 10 video at 30/s
+ * on BF2: frames swapped 10 ms or more after a blank shown a refresh late,
+ * 1.6% judder, by PresentMon; the Windows client's G5c). So a paced frame is
+ * swapped at the start of the window of its time, SP_WIN_AFTER_BLANK_US after
+ * the blank before it: the composition that its time leads to (a time in the
+ * last 3 ms of a refresh, which waited past the next blank, now one sooner),
+ * with the most time for the GPU. due: the frame's time (0: at once); blank:
+ * the last vertical blank.
+ */
+#define SP_WIN_AFTER_BLANK_US 4000
+static int64_t sp_present_window(int64_t due, int64_t blank, int64_t refresh_us)
+{
+    int64_t k;
+
+    if (!due || !blank || refresh_us <= 0) {
+        return due;
+    }
+    k = due - blank - SP_WIN_AFTER_BLANK_US;
+    k = k >= 0 ? k / refresh_us : -((-k + refresh_us - 1) / refresh_us);
+    return blank + SP_WIN_AFTER_BLANK_US + k * refresh_us;
+}
+#endif
+
 /*
  * Two paced frames of a stream one refresh apart, where the frame after them
  * comes within the stream's usual spacing (and half a refresh) of the first,
@@ -661,6 +692,10 @@ static void *sp_present_thread(void *opaque)
     const char *stats_env = getenv("SPACEBOX_PRESENT_STATS");
     int64_t stats_us = stats_env ? (int64_t)MAX(atoi(stats_env), 1) * 1000000 : 0;
     int64_t refresh_us = 8333, last_swap = 0, held_max = 0, phase_adj = 0;
+#ifdef CONFIG_WIN32
+    int64_t last_window = 0;    /* the window of the last swap (sp_present_window) */
+    GLuint probe_pbo = 0;
+#endif
     /* where between two refreshes a frame's time is kept: this fraction of a
      * refresh before the one it is shown at (SPACEBOX_PRESENT_PHASE_TARGET) */
     double phase_target = getenv("SPACEBOX_PRESENT_PHASE_TARGET") ? atof(getenv("SPACEBOX_PRESENT_PHASE_TARGET")) : 0.5;
@@ -710,6 +745,9 @@ static void *sp_present_thread(void *opaque)
         int pick = -1, oldest = -1, newest = -1, n_due = 0;
         bool stream = true;
         int64_t pick_now = g_get_monotonic_time(), next_due = 0;
+#ifdef CONFIG_WIN32
+        int64_t win_blank = p->tick_now_host ? sp_present_host_us(p->tick_now_host) : 0;
+#endif
         sp_pair_updates(p, refresh_us);
         for (int i = 0; i < SP_SLOTS; i++) {
             SpSlot *s = &p->slots[i];
@@ -718,6 +756,9 @@ static void *sp_present_thread(void *opaque)
             if (!s->ready_at) s->ready_at = pick_now;
 #endif
             int64_t due = s->show_due ? s->show_due + phase_adj : 0;
+#ifdef CONFIG_WIN32
+            due = sp_present_window(due, win_blank, refresh_us);
+#endif
             if (due > pick_now) {
                 if (!next_due || due < next_due) next_due = due;
                 continue;
@@ -752,7 +793,18 @@ static void *sp_present_thread(void *opaque)
             SpSlot *s = &p->slots[oldest];
             int64_t k = MAX((s->gap + refresh_us / 2) / refresh_us, 1);
             if (n_due >= 2 && k > 1) k--;
+#ifdef CONFIG_WIN32
+            /*
+             * Windows: k windows after the last swap's. The swap returns at the
+             * DWM's composition, with the wake-up 0.5 to 6 ms after the blank on
+             * BF2, and counted from there the spacing put the next swap late
+             * in its refresh, where it missed the composition while the GPU
+             * was busy (sp_present_window).
+             */
+            int64_t earliest = last_window ? last_window + k * refresh_us : 0;
+#else
             int64_t earliest = last_swap ? last_swap + (k - 1) * refresh_us + refresh_us / 8 : 0;
+#endif
             if (earliest > pick_now) {
                 if (!next_due || earliest < next_due) next_due = earliest;
             } else {
@@ -832,7 +884,23 @@ static void *sp_present_thread(void *opaque)
         if (probe) {
             /* test aid: the colour at the centre of each frame shown */
             glBindFramebuffer(GL_READ_FRAMEBUFFER, readfb);
+#ifdef CONFIG_WIN32
+            /*
+             * Windows: into a pixel buffer, read after the swap (as the frame
+             * code): read at once it waited here for the GPU, 5 to 8 ms of a
+             * busy one on BF2, which put the swap late in its refresh
+             * (sp_present_window).
+             */
+            if (!probe_pbo) {
+                glGenBuffers(1, &probe_pbo);
+            }
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, probe_pbo);
+            glBufferData(GL_PIXEL_PACK_BUFFER, 4, NULL, GL_STREAM_READ);
+            glReadPixels(s->fb.width / 2, s->fb.height / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+#else
             glReadPixels(s->fb.width / 2, s->fb.height / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, probe_px);
+#endif
         }
         int64_t swap_call = g_get_monotonic_time(), vsync_us = 0, out_us = 0, show_us = 0;
         int64_t qpc_call = sp_present_qpc(), qpc_ret;
@@ -862,16 +930,17 @@ static void *sp_present_thread(void *opaque)
                 /* the last blank by the refresh: the waiter's may be late */
                 blank += (t - blank) / refresh_us * refresh_us;
             }
-            if (blank && t - blank < 4000) {
-                at = blank + 4000;
+            if (blank && t - blank < SP_WIN_AFTER_BLANK_US) {
+                at = blank + SP_WIN_AFTER_BLANK_US;
             } else if (blank && t - blank > refresh_us - 3000) {
-                at = blank + refresh_us + 4000;
+                at = blank + refresh_us + SP_WIN_AFTER_BLANK_US;
             }
             if (at > t) {
                 sp_present_sleep_us(at - t);
                 swap_call = g_get_monotonic_time();
                 qpc_call = sp_present_qpc();
             }
+            last_window = sp_present_window(swap_call, blank, refresh_us);
         }
         spacebox_swap(p->window, win_w, win_h);
         /*
@@ -898,6 +967,15 @@ static void *sp_present_thread(void *opaque)
                                            &vsync_us, &out_us);
         }
         if (probe) {
+#ifdef CONFIG_WIN32
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, probe_pbo);
+            const uint8_t *m = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, 4, GL_MAP_READ_BIT);
+            if (m) {
+                memcpy(probe_px, m, 4);
+                glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+            }
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+#endif
             fprintf(probe, "%lld %u %u %u\n", (long long)g_get_monotonic_time(), probe_px[0], probe_px[1], probe_px[2]);
         }
         GLsync consumed = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
@@ -954,14 +1032,15 @@ static void *sp_present_thread(void *opaque)
         if (recording) {
 #ifdef CONFIG_WIN32
             int64_t t_flush_rx = s->flush_rx, t_sub = s->submitted, t_ready = s->ready_at;
+            int64_t t_pick = pick_now;
 #else
-            int64_t t_flush_rx = 0, t_sub = 0, t_ready = 0;
+            int64_t t_flush_rx = 0, t_sub = 0, t_ready = 0, t_pick = 0;
 #endif
             spacebox_video_record_swap(presented, swapped, code, code_ok, s->tickets,
                                        s->ntickets, coalesced, code_us, show_us,
                                        swap_call, vsync_us, out_us, pick_due,
                                        s->flush_dev, s->flush_read, qpc_call, qpc_ret,
-                                       t_flush_rx, t_sub, t_ready);
+                                       t_flush_rx, t_sub, t_ready, t_pick);
         }
         int pause_ms = qatomic_xchg(&spacebox_present_pause_ms, 0);
         if (pause_ms) {

@@ -39,7 +39,8 @@ bool spacebox_video_rect(int *x, int *y, int *w, int *h);
  * same clock; on Windows also the QueryPerformanceCounter's values at the
  * swap's call and return, and the frame's way to the swap: the main loop's
  * run of its flush, its submit to the presenter, the first time the
- * presenter found the GPU done with it (0 elsewhere: not written) */
+ * presenter found the GPU done with it, the presenter's pick of it (0
+ * elsewhere: not written) */
 void spacebox_video_record_swap(uint64_t seq, int64_t t_swap, int code,
                                 bool code_ok, const uint64_t *tickets,
                                 unsigned n, uint64_t coalesced,
@@ -49,7 +50,7 @@ void spacebox_video_record_swap(uint64_t seq, int64_t t_swap, int code,
                                 int64_t t_flush_dev, int64_t t_flush_read,
                                 int64_t qpc_call, int64_t qpc_ret,
                                 int64_t t_flush_rx, int64_t t_sub,
-                                int64_t t_ready);
+                                int64_t t_ready, int64_t t_pick);
 /* the test pause, from its start to its end */
 void spacebox_video_record_paused(int ms, int64_t t0, int64_t t1);
 

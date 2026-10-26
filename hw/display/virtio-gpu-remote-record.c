@@ -345,7 +345,7 @@ void spacebox_video_record_swap(uint64_t seq, int64_t t_swap, int code,
                                 int64_t t_out, int64_t t_due, int64_t t_flush_dev,
                                 int64_t t_flush_read, int64_t qpc_call,
                                 int64_t qpc_ret, int64_t t_flush_rx,
-                                int64_t t_sub, int64_t t_ready)
+                                int64_t t_sub, int64_t t_ready, int64_t t_pick)
 {
     GString *s;
 
@@ -382,6 +382,7 @@ void spacebox_video_record_swap(uint64_t seq, int64_t t_swap, int code,
         sp_rec_time(s, "t_flush_rx", t_flush_rx);
         sp_rec_time(s, "t_sub_us", t_sub);
         sp_rec_time(s, "t_ready_us", t_ready);
+        sp_rec_time(s, "t_pick_us", t_pick);
     }
     g_string_append_c(s, '}');
     sp_rec_put(s);

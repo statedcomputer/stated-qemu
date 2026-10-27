@@ -811,8 +811,24 @@ static void handle_keydown(SDL_Event *ev)
         case SDL_SCANCODE_G:
             scon->gui_keysym = true;
 #ifdef CONFIG_WIN32
+            /*
+             * The hotkey's grab is the keyboard's, which only the hotkey (and
+             * full screen) sets; the pointer's grab follows it. On an absolute
+             * tablet the pointer's moves in the window start the pointer's
+             * grab by themselves (absolute_mouse_grab), so toggling the two
+             * apart left them out of phase: the hotkey then grabbed one and
+             * released the other, and the title never showed a release.
+             */
             if (!gui_fullscreen) {
-                spacebox_win_kbd_grab(scon, !spacebox_kbd_grab);
+                bool on = !spacebox_kbd_grab;
+
+                spacebox_win_kbd_grab(scon, on);
+                if (on && !gui_grab) {
+                    sdl_grab_start(scon);
+                } else if (!on && gui_grab) {
+                    sdl_grab_end(scon);
+                }
+                break;
             }
 #endif
             if (!gui_grab) {

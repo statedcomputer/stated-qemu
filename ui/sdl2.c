@@ -238,10 +238,22 @@ static void spacebox_win_print_hook(bool on)
     }
 }
 
+/* hw/display/virtio-gpu-remote.c: the stop script's request (it detaches first). */
+bool spacebox_sink_stop_request(uint64_t id, int64_t pid);
+static UINT spacebox_stop_msg;   /* "SpaceboxSinkStop": WPARAM the request, LPARAM the pid */
+
 static void SDLCALL spacebox_win_message(void *data, void *hwnd, unsigned int msg,
                                          Uint64 wp, Sint64 lp)
 {
     int sc = (lp >> 16) & 0xff;
+
+    if (spacebox_stop_msg && msg == spacebox_stop_msg) {
+        if (!spacebox_sink_stop_request(wp, lp)) {
+            shutdown_action = SHUTDOWN_ACTION_POWEROFF;
+            qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+        }
+        return;
+    }
 
     if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && (sc & 0x7f) >= 0x71 && (sc & 0x7f) <= 0x72) {
         SDL_Scancode code = (sc & 0x7f) == 0x72 ? SDL_SCANCODE_LANG1 : SDL_SCANCODE_LANG2;
@@ -1315,6 +1327,7 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
     }
 #endif
 #ifdef CONFIG_WIN32
+    spacebox_stop_msg = RegisterWindowMessageW(L"SpaceboxSinkStop");
     SDL_SetWindowsMessageHook(spacebox_win_message, NULL);
 #endif
     if (SDL_Init(SDL_INIT_VIDEO)) {

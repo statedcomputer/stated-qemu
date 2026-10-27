@@ -4613,8 +4613,8 @@ bool spacebox_sink_close(void)
  * to the main loop by a bottom half, which closes as a signal does. For the
  * close, the logoff and the shutdown the system ends the process when the
  * handler returns (at most 5 s after the event), so the handler waits up to
- * 4.5 s for the bye first. (The stop script on Windows closes the window
- * instead: WM_CLOSE, ui/sdl2.c.)
+ * 4.5 s for the bye first. (The stop script on Windows posts the window a
+ * stop request instead: spacebox_sink_stop_request, below.)
  */
 static QEMUBH *sp_sig_bh;
 static int sp_sig_event;
@@ -4642,6 +4642,42 @@ static BOOL WINAPI sp_sink_console_event(DWORD ev)
     }
     Sleep(4500);
     return TRUE;
+}
+
+/*
+ * The stop script's request (screen/windows/sp-win.py): a message of its own
+ * posted to the sink's window (ui/sdl2.c), with the request's identifier and
+ * the process it is for. It closes as the window would; its line, logged
+ * only when this request starts the close, is the Windows form of the
+ * Mac's signal line (the check of a planned stop reads it). A request that
+ * comes while the sink already waits for the bye, by a click of the close
+ * box or an earlier request, is logged apart and changes nothing. Returns
+ * false when this is not a remote sink.
+ */
+bool spacebox_sink_stop_request(uint64_t id, int64_t pid)
+{
+    unsigned long own = GetCurrentProcessId();
+
+    if (sp.mode != SP_REMOTE_SINK) {
+        return false;
+    }
+    if (pid != (int64_t)own) {
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink got stop request %" PRIu64
+                " for pid %" PRId64 ", not this sink (pid %lu): ignored\n",
+                id, pid, own);
+        return true;
+    }
+    if (sp.closing) {
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink got stop request %" PRIu64
+                " for pid %" PRId64 " while it waits for the bye: no change\n",
+                id, pid);
+        return true;
+    }
+    fprintf(stderr, "[SPACEBOX-REMOTE] sink got stop request %" PRIu64
+            " for pid %" PRId64 " (this sink): closing as its window would\n",
+            id, pid);
+    spacebox_sink_close();
+    return true;
 }
 
 /* From the main loop: QEMU sets its handlers after the devices are made. */

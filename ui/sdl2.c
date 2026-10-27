@@ -104,9 +104,9 @@ static int spacebox_pixel_scale(void)
  * Windows: with SPACEBOX_RETINA_SCALE set (any value) the process is per-
  * monitor DPI aware and SDL scales by the monitor's DPI, as macOS does for a
  * Retina display: the window's size is in points (pixels at 96 per inch),
- * its drawable in physical pixels, and the guest gets the drawable's size;
- * at 100% the guest gets what the Mac's sink gives it on a display without
- * Retina, twice the points (spacebox_update_ui_info).
+ * its drawable in physical pixels; at 200% and above the guest gets the
+ * drawable's size, below 200% what the Mac's sink gives it on a display
+ * without Retina, twice the points (spacebox_update_ui_info).
  * The scale is the drawable's width over the window's (1.5 at 150%), read
  * again at each change of the window; before there is a window, the scale of
  * the main display.
@@ -176,11 +176,11 @@ static unsigned spacebox_win_window_refresh_mhz(SDL_Window *window)
     return sdl2_win_refresh_mhz(MonitorFromWindow(wm.info.win.window, MONITOR_DEFAULTTONEAREST));
 }
 
-/* the guest's pixels for a point: the monitor's scale, or the Mac's 2 at 100%
- * (spacebox_update_ui_info) */
+/* the guest's pixels for a point: the Mac's 2 up to a scale of 200%, the
+ * monitor's scale above it (spacebox_update_ui_info) */
 static double spacebox_win_guest_scale(void)
 {
-    return spacebox_win_scale > 1.01 ? spacebox_win_scale : 2.0;
+    return spacebox_win_scale > 1.99 ? spacebox_win_scale : 2.0;
 }
 
 static int spacebox_points(int pixels)
@@ -277,19 +277,21 @@ static void spacebox_update_ui_info(struct sdl2_console *scon)
             info.width = pw;
             info.height = ph;
         }
-        if (spacebox_win_scale > 1.01) {
+        if (spacebox_win_scale > 1.99) {
             /* the density for the guest's compositor: the Mac's 220 per inch at 2x */
             info.width_mm = info.width * 254 / 10 / (110 * spacebox_win_scale);
             info.height_mm = info.height * 254 / 10 / (110 * spacebox_win_scale);
         } else {
             /*
-             * A display at 100%: what the Mac's sink gives the guest on a
+             * A display below 200%: what the Mac's sink gives the guest on a
              * display without Retina (spacebox_pixel_scale: twice the
              * window's points, 220 per inch), shown scaled to the window
              * (whose size in points is then half the guest's surface:
-             * spacebox_points). The guest's desktop keeps the scale 2 (its
-             * agent), so with the window's own pixels it would have half the
-             * window's points.
+             * spacebox_points); at 200% that is the window's own pixels, as
+             * on a Retina display. The guest's desktop keeps the scale 2 (its
+             * agent), so with the window's own pixels at 100% it would have
+             * half the window's points (the user's answer of 2026-10-26: as
+             * the Mac, at 125% to 175% too).
              */
             info.width = width * spacebox_win_guest_scale();
             info.height = height * spacebox_win_guest_scale();

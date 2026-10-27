@@ -287,6 +287,16 @@ static int64_t sp_aud_delay_us; /* sink: how much later sound is played, 0 = sil
  * (with sound, the picture is then that much less the sound's delay behind
  * the sound).
  *
+ * With large writes in pieces (sp_hold_write) the updates that need such a
+ * write wait for it at the sink, after their read: the lateness above does
+ * not see that wait, and the allowance of the moment (a few tens of ms after
+ * 10 s with no such write) let a 3.2 and a 3.8 MB picture stall the screen
+ * 116 and 150 ms (the video task's turn G5). The sink knows of each write
+ * ahead, from its notice; it expects the updates behind it that much late
+ * (sp_sink_pace_write) and raises the allowance toward that while the write
+ * comes, by half the spacing a frame. The rise has only the frames that come
+ * before the first update that waits for the write.
+ *
  * The guest's own spacing is not even either: a 60 Hz video on its 120 Hz
  * desktop comes out as updates 1, 2 or 3 refreshes apart. While pacing, the
  * presenter also does not show a frame sooner after the previous one than the
@@ -351,10 +361,29 @@ static struct {
     int64_t gap[32];    /* source-clock spacing of recent screen updates */
     unsigned gap_n, gap_pos;
     int64_t last_t_us;
+    int64_t expect;     /* the lateness expected of the updates behind the
+                           writes in pieces that come, 0 = none */
+    int64_t expect_max; /* ... the most of the 5 s line */
 #ifdef CONFIG_WIN32
     int64_t slack;      /* the stream's spacing beyond a refresh a frame, summed */
 #endif
 } sp_pace = { .mode = -1, .input_us = -1 };
+
+/* what the pacing learns of the writes in pieces (sp_sink_pace_write) */
+#define SP_PW_N 8
+static struct {
+    int64_t rate[SP_PW_N];  /* bytes/s of recent video writes of 1 MiB or more */
+    unsigned rate_n, rate_pos;
+    int64_t exact, exact_gap;   /* the guest's lead (us) at the last write that an
+                                   update waited for, and the usual spacing then;
+                                   0 = none */
+    int64_t bound[10], bound_gap[10], bound_sec[10];    /* since then, the most of
+                                                           each of the last 10 s of
+                                                           writes that none waited
+                                                           for (the lead is at least
+                                                           this), the spacing, the s */
+    int64_t rate_used, lead_used;   /* of the last notice, for the 5 s line */
+} sp_pw;
 
 static int sp_cmp_i64(const void *a, const void *b)
 {
@@ -368,7 +397,7 @@ static void sp_sink_pace_frame(const SpHdr *h)
     /* the lateness is the network's: from the message's read off the socket */
     int64_t now = g_get_monotonic_time(), read = sp_rx_now ? sp_rx_now : now;
     int64_t base = MIN(sp_rx_min, sp_rx_min_prev);
-    int64_t late, target, sec, gap, cap, sorted[G_N_ELEMENTS(sp_pace.gap)];
+    int64_t late, target, sec, gap, cap, step, sorted[G_N_ELEMENTS(sp_pace.gap)];
     bool starting;
 
     if (sp_pace.mode < 0) {
@@ -497,6 +526,7 @@ static void sp_sink_pace_frame(const SpHdr *h)
         }
         target = MAX(target, sp_aud_delay_us + av_offset);
     }
+    target = MAX(target, sp_pace.expect);
     /* The presenter keeps the waiting frames as textures (SP_SLOTS in
      * ui/spacebox-presenter.h is 32); do not ask it to keep more than 24 (of
      * 60/s while the spacing is not known yet). */
@@ -509,18 +539,22 @@ static void sp_sink_pace_frame(const SpHdr *h)
      * so the allowance takes its lateness at once; any other rise (video
      * starting, the lateness of other updates) is spread over the frames, a
      * third of their spacing each, which keeps each interval under the
-     * judder bound of 1.5 times the spacing.
+     * judder bound of 1.5 times the spacing. Ahead of the updates that a
+     * write in pieces will hold, half the spacing each: the most that keeps
+     * each interval within that bound (at 60/s on a 120 Hz display both make
+     * intervals of 3 refreshes, 25 ms; the half makes them on every frame).
      */
     if (late > sp_pace.allowance) {
         sp_pace.allowance = MIN(late, cap);
     }
+    step = sp_pace.expect > sp_pace.allowance ? gap / 2 : gap / 3;
     if (target > sp_pace.allowance) {
 #ifdef CONFIG_WIN32
         int64_t r = qatomic_read(&spacebox_present_refresh_us);
 
-        sp_pace.allowance += MIN(target - sp_pace.allowance, r > 0 ? r : gap / 3);
+        sp_pace.allowance += MIN(target - sp_pace.allowance, r > 0 ? r : step);
 #else
-        sp_pace.allowance += MIN(target - sp_pace.allowance, gap / 3);
+        sp_pace.allowance += MIN(target - sp_pace.allowance, step);
 #endif
     } else {
         int64_t fall = (sp_pace.allowance - target) / 64;
@@ -575,12 +609,105 @@ static void sp_sink_pace_reset(void)
     sp_pace.usual_gap = 0;
     sp_pace.gap_n = sp_pace.gap_pos = 0;
     sp_pace.last_t_us = 0;
+    sp_pace.expect = 0;
+    memset(&sp_pw, 0, sizeof(sp_pw));
 #ifdef CONFIG_WIN32
     sp_pace.slack = 0;
 #endif
     sp_rx_min = sp_rx_min_prev = INT64_MAX;
     sp_rx_min_t0 = 0;
     sp_aud_delay_us = 0;
+}
+
+/*
+ * How late a write in pieces will make the updates that need it, from its
+ * notice (sp_hold_write; bytes: its size and what is still to come of the
+ * writes before it). Its time on the link is its size at the lowest rate of
+ * the last 8 video writes of 1 MiB or more (8 MB/s before one; sp_hold_piece
+ * says which writes are video's), and a quarter more for the decode of what
+ * it carries (a key picture of 3.2 and 3.8 MB of VP9 10-bit 2160p took 62 and
+ * 70 ms after its 290 and 327 ms, turn G5), plus the notice's own lateness. The guest sent it ahead of those updates: a player
+ * decodes several pictures ahead of their display (Chromium about 11: 190 ms
+ * at 60/s, 375 ms at 30/s), so most writes hold none. That lead is learnt
+ * from video writes (sp_sink_pace_lead): the time from the notice to the
+ * first update that waited for it, of the last write that one waited for, or
+ * more if since then, in the last 10 s, a write that none waited for was
+ * passed by updates for longer (the lead is at least that: it grows from
+ * about 0 as a play starts; a short write says little, so the most of 10 s).
+ * Each at about the usual spacing of now. The expectation holds while writes
+ * come (sp_sink_pace_writes_done).
+ */
+static int64_t sp_sink_pace_write(const SpHdr *h, uint64_t bytes)
+{
+    int64_t base = MIN(sp_rx_min, sp_rx_min_prev);
+    int64_t gap = sp_pace.usual_gap ? sp_pace.usual_gap : 16667;
+    int64_t rate = 8000000, lead = 0, e, d, sec = g_get_monotonic_time() / G_USEC_PER_SEC;
+
+    for (unsigned i = 0; i < sp_pw.rate_n; i++) {
+        rate = i ? MIN(rate, sp_pw.rate[i]) : sp_pw.rate[i];
+    }
+    /* of about this frame rate only */
+    d = sp_pw.exact_gap - gap;
+    if (4 * (d < 0 ? -d : d) <= gap) {
+        lead = sp_pw.exact;
+    }
+    for (int i = 0; i < 10; i++) {
+        d = sp_pw.bound_gap[i] - gap;
+        if (sec - sp_pw.bound_sec[i] < 10 && 4 * (d < 0 ? -d : d) <= gap) {
+            lead = MAX(lead, sp_pw.bound[i]);
+        }
+    }
+    sp_pw.rate_used = rate;
+    sp_pw.lead_used = lead;
+    e = (int64_t)bytes * G_USEC_PER_SEC / rate * 5 / 4 - sp_pw.lead_used;
+    if (h->t_us && base != INT64_MAX && sp_rx_now) {
+        e += MAX(sp_rx_now - h->t_us - base, 0);
+    }
+    if (e > 0) {
+        sp_pace.expect = MAX(sp_pace.expect, e);
+        sp_pace.expect_max = MAX(sp_pace.expect_max, e);
+    }
+    return e;
+}
+
+/* a write of bytes complete, us after its notice */
+static void sp_sink_pace_written(uint64_t bytes, int64_t us)
+{
+    if (bytes >= (1u << 20) && us >= 20000) {
+        sp_pw.rate[sp_pw.rate_pos] = (int64_t)bytes * G_USEC_PER_SEC / us;
+        sp_pw.rate_pos = (sp_pw.rate_pos + 1) % SP_PW_N;
+        sp_pw.rate_n = MIN(sp_pw.rate_n + 1, SP_PW_N);
+    }
+}
+
+/* the guest's lead for a write: exact, the first update that waited for it
+ * came lead after its notice (source clock); else the updates that passed it
+ * came up to lead after it */
+static void sp_sink_pace_lead(int64_t lead, bool exact)
+{
+    int64_t sec = g_get_monotonic_time() / G_USEC_PER_SEC;
+
+    if (!sp_pace.usual_gap || lead < 0) {
+        return;
+    }
+    if (exact) {
+        sp_pw.exact = lead;
+        sp_pw.exact_gap = sp_pace.usual_gap;
+        memset(sp_pw.bound_sec, 0, sizeof(sp_pw.bound_sec));
+        return;
+    }
+    if (sp_pw.bound_sec[sec % 10] != sec) {
+        sp_pw.bound_sec[sec % 10] = sec;
+        sp_pw.bound[sec % 10] = 0;
+    }
+    sp_pw.bound[sec % 10] = MAX(sp_pw.bound[sec % 10], lead);
+    sp_pw.bound_gap[sec % 10] = sp_pace.usual_gap;
+}
+
+/* no write in pieces comes any more */
+static void sp_sink_pace_writes_done(void)
+{
+    sp_pace.expect = 0;
 }
 
 typedef struct SpPending {
@@ -1500,6 +1627,11 @@ typedef struct SpWait {
     int64_t t_done;
     uint64_t passed, flushes;   /* commands, of them screen updates, that ran
                                    while its write came */
+    int64_t t_src, pass_src;    /* its notice's source time, and the last of those
+                                   screen updates' */
+    int64_t expect;             /* the lateness it was expected to give */
+    bool lead_seen;             /* a screen update waited for it ... */
+    int64_t lead;               /* ... this long after its notice (source clock) */
     uint32_t type, first;       /* its command's type, and a stream's first command */
 } SpWait;
 
@@ -1750,6 +1882,7 @@ static void sp_run_msgs(SpRxMsg *m)
                 if (e->w) {
                     e->passed++;
                     e->flushes += flush;
+                    e->pass_src = flush ? h.t_us : e->pass_src;
                 }
             }
         }
@@ -1807,10 +1940,12 @@ static void sp_wait_run(SpWait *e)
     if (sph.log && e->t_done) {
         fprintf(stderr, "[SPACEBOX-REMOTE] sink write ctx=%u bytes=%" PRIu64
                 " command=0x%x first=%u touches=%s notice_us=%" PRId64 " complete_us=%" PRId64
-                " run_us=%" PRId64 " passed=%" PRIu64 " screen_updates_passed=%" PRIu64 "\n",
+                " run_us=%" PRId64 " passed=%" PRIu64 " screen_updates_passed=%" PRIu64
+                " expected_lateness_ms=%.1f screen_update_waited=%d\n",
                 e->ctx, e->wlen, e->type, e->first,
                 e->unknown ? "unknown" : e->reads_all ? "writes" : "known",
-                e->t_notice, e->t_done, g_get_monotonic_time(), e->passed, e->flushes);
+                e->t_notice, e->t_done, g_get_monotonic_time(), e->passed, e->flushes,
+                e->expect / 1000.0, e->lead_seen);
     }
     sp_wait_free(e);
 }
@@ -1854,6 +1989,7 @@ static void sp_hold_drop(const char *why)
     }
     sph.n = 0;
     sph.incomplete = 0;
+    sp_sink_pace_writes_done();
     sp_rx_free(sph.grp);
     sph.grp = sph.grp_tail = NULL;
     sp_rx_free(sph.notice);
@@ -1948,6 +2084,18 @@ static void sp_hold_cmd(const SpHdr *h, SpRxMsg *m)
     } else {
         e->touch = t;
     }
+    if (e->type == VIRTIO_GPU_CMD_RESOURCE_FLUSH && sph.incomplete) {
+        /* a screen update waits: the guest's lead for the first write that comes */
+        QTAILQ_FOREACH(f, &sph.q, next) {
+            if (f->w) {
+                break;
+            }
+        }
+        if (f && !f->lead_seen && f->t_src && h->t_us >= f->t_src) {
+            f->lead_seen = true;
+            f->lead = h->t_us - f->t_src;
+        }
+    }
     sp_wait_add(e);
     sph.st.waited++;
 }
@@ -1955,7 +2103,16 @@ static void sp_hold_cmd(const SpHdr *h, SpRxMsg *m)
 /* a notice with pieces: its command waits for its write */
 static void sp_hold_write(const SpHdr *h, const uint8_t *a)
 {
-    SpWait *e = g_new0(SpWait, 1);
+    SpWait *e = g_new0(SpWait, 1), *f;
+    uint64_t ahead = h->seq;    /* its bytes and those still to come before them */
+
+    QTAILQ_FOREACH(f, &sph.q, next) {
+        if (f->w) {
+            ahead += f->wlen - f->wbuf->len;
+        }
+    }
+    e->t_src = h->t_us;
+    e->expect = sp_sink_pace_write(h, ahead);
 
     e->msgs = sph.grp;
     e->tail = sph.grp_tail;
@@ -2032,6 +2189,24 @@ static void sp_hold_piece(const SpHdr *h, const uint8_t *a)
     sph.st.writes++;
     sph.st.bytes += e->wlen;
     sph.st.write_max = MAX(sph.st.write_max, e->t_done - e->t_notice);
+    /*
+     * The pacing learns the link's rate and the guest's lead from video only:
+     * a command stream that only decodes (its reads known), whose bitstream does
+     * not compress. Other large writes (the console's full-screen uploads of
+     * 16 MB, which compress to a few hundred KB, with an update right behind)
+     * would make both look otherwise.
+     */
+    if (e->type == VIRTIO_GPU_CMD_SUBMIT_3D && !e->unknown && !e->reads_all) {
+        sp_sink_pace_written(e->wlen, e->t_done - e->t_notice);
+        if (e->lead_seen) {
+            sp_sink_pace_lead(e->lead, true);
+        } else if (e->flushes && e->t_src && e->pass_src >= e->t_src) {
+            sp_sink_pace_lead(e->pass_src - e->t_src, false);
+        }
+    }
+    if (!sph.incomplete) {
+        sp_sink_pace_writes_done();
+    }
     sp_hold_run();
 }
 
@@ -5529,10 +5704,13 @@ static void sp_stats(void *opaque)
     if (sp.mode == SP_REMOTE_SINK) {
         fprintf(stderr, "[SPACEBOX-REMOTE] sink frame pacing: screen updates=%" PRIu64 " held for their time=%" PRIu64
                 " too late for it=%" PRIu64 " shown at once after input=%" PRIu64
-                " allowance_ms=%.1f usual_spacing_ms=%.1f\n",
+                " allowance_ms=%.1f usual_spacing_ms=%.1f writes_expected_lateness_ms=%.1f"
+                " guest_lead_ms=%.1f link_MBps=%.1f\n",
                 sp_pace.frames, sp_pace.paced, sp_pace.late_frames, sp_pace.unpaced_for_input,
-                sp_pace.allowance / 1000.0, sp_pace.usual_gap / 1000.0);
+                sp_pace.allowance / 1000.0, sp_pace.usual_gap / 1000.0,
+                sp_pace.expect_max / 1000.0, sp_pw.lead_used / 1000.0, sp_pw.rate_used / 1e6);
         sp_pace.frames = sp_pace.paced = sp_pace.late_frames = sp_pace.unpaced_for_input = 0;
+        sp_pace.expect_max = 0;
     }
     if (sp.mode == SP_REMOTE_SOURCE) {
         GHashTableIter it;

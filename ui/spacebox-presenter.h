@@ -813,6 +813,20 @@ static void *sp_present_thread(void *opaque)
             if (s->step) {
                 k = MAX((s->step + refresh_us / 4) / refresh_us, 1);
             }
+            /*
+             * ... and never more than the guest's own spacing of this frame's
+             * time from that of the frame on screen. An update that shows no
+             * new picture of the video (a 24/s YouTube video in the guest's
+             * Chromium: about one update in four, a refresh before or after a
+             * frame) counted as the stream's last frame, and the frame due a
+             * refresh after it waited a refresh more: 4 refreshes between
+             * frames, judder in 6 to 20% of the frames by PresentMon (the
+             * Windows client's G5g). Frames whose times are the usual spacing
+             * apart, late or not, are held as before.
+             */
+            if (s->show_due && p->shown_due && s->show_due > p->shown_due) {
+                k = MIN(k, MAX((s->show_due - p->shown_due + refresh_us / 2) / refresh_us, 1));
+            }
 #endif
             if (n_due >= 2 && k > 1) k--;
 #ifdef CONFIG_WIN32

@@ -4333,10 +4333,24 @@ static void sp_sink_send_info(VirtIOGPU *g, bool caps)
     }
     di.hdr.type = VIRTIO_GPU_RESP_OK_DISPLAY_INFO;
     virtio_gpu_base_fill_display_info(VIRTIO_GPU_BASE(g), &di);
-    sp_send(SP_INFO, 0, &di, sizeof(di), NULL, 0, 2, 0, 0);
     ed.hdr.type = VIRTIO_GPU_RESP_OK_EDID;
     virtio_gpu_base_generate_edid(VIRTIO_GPU_BASE(g), 0, &ed);
+#ifdef _WIN32
+    /*
+     * The EDID first: the device shows the guest a new display when the
+     * display information changes (its event) and answers the guest's EDID
+     * query with the EDID it holds then. Sent after the display information,
+     * the EDID could come after that query, and the guest kept the EDID of
+     * the earlier size with the new display (its compositor then took a mode
+     * of that EDID, 5120x2160 at 50 Hz, about once in 20 entries into full
+     * screen).
+     */
     sp_send(SP_INFO, 0, &ed, sizeof(ed), NULL, 0, 3, 0, 0);
+    sp_send(SP_INFO, 0, &di, sizeof(di), NULL, 0, 2, 0, 0);
+#else
+    sp_send(SP_INFO, 0, &di, sizeof(di), NULL, 0, 2, 0, 0);
+    sp_send(SP_INFO, 0, &ed, sizeof(ed), NULL, 0, 3, 0, 0);
+#endif
 }
 
 void sp_sink_notify_event(uint32_t event_type)

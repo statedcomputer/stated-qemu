@@ -4655,6 +4655,16 @@ static void sp_hello(SpHdr *h)
          * source that sends its spec is told after the check, sp_sink_spec). */
         sp_sink_send_info(sp.g, true);
         sp_send(SP_DISPLAY, 0, NULL, 0, NULL, 0, VIRTIO_GPU_EVENT_DISPLAY, 0, 0);
+    } else if (resume && sp.mode == SP_REMOTE_SINK) {
+        /*
+         * The display may have changed while the link was down (the window
+         * resized or moved to another display): the event was queued, but
+         * sp_sink_send_info() sends nothing without a link, so the source
+         * would answer the guest with the size it had before. Tell it the
+         * display as it is now, and the guest reads it again.
+         */
+        sp_sink_send_info(sp.g, false);
+        sp_send(SP_DISPLAY, 0, NULL, 0, NULL, 0, VIRTIO_GPU_EVENT_DISPLAY, 0, 0);
     }
     sp_tx_start(resume ? h->arg2 : 0);
     if (sp.mode == SP_REMOTE_SINK) {

@@ -25,7 +25,9 @@
  *                                           (default 20, 0 = not beyond the window).
  *                                           See sp_source_may_answer_early().
  * SPACEBOX_GPU_REMOTE_FENCE_AGE_VIDEO_MS=<ms> source: the same age while the guest
- *                                           decodes video (default 100).
+ *                                           decodes video (default 350: the sink
+ *                                           shows video pictures up to that late,
+ *                                           its pacing allowance's cap).
  * SPACEBOX_GPU_REMOTE_KEEP_TIMER_QUERY=1    sink: leave GPU timer queries advertised.
  *                                           By default they are hidden from the
  *                                           guest: a compositor that times every
@@ -51,6 +53,8 @@
  *                                           spec. See sp_profile_load(), sp_sink_spec().
  * SPACEBOX_GPU_REMOTE_CONTROL=<file>        sink: test commands, see
  *                                           virtio-gpu-remote-state.c.
+ * SPACEBOX_VIDEO_RECORD=<file>              sink: the record of video frames
+ *                                           (virtio-gpu-remote-record.c).
  * SPACEBOX_STREAM_SCALE=2                   sink inside the guest: the pictures of
  *                                           the user's toggle at half the scanout's
  *                                           size (virtio-gpu-remote-picture.c).
@@ -66,6 +70,7 @@
 #include "qemu/thread.h"
 #include "qemu/timer.h"
 #include "qemu/sockets.h"
+#include "qemu/event_notifier.h"
 #include "hw/virtio/virtio.h"
 #include "hw/virtio/virtio-gpu.h"
 #include "ui/console.h"
@@ -73,6 +78,7 @@
 #include "audio/audio.h"
 #include "virtio-gpu-remote-formats.h"
 #include "virtio-gpu-remote.h"
+#include "ui/spacebox-video-record.h"
 #include "system/runstate.h"
 
 #include <virglrenderer.h>
@@ -148,6 +154,13 @@ typedef struct SpHdr {
 #define SP_F_OWN_CAPS 32 /* in SP_HELLO from a source: send the renderer's own
                            capsets (the timer query cleared), not the profile's
                            (screen/tools/capset-profile.py read) */
+#define SP_F_PIECES 64  /* in SP_HELLO: this end sends (the Firecracker device)
+                           or takes (the sink) large writes in pieces (SP_HOLD,
+                           SP_PIECE, SP_RXB); the QEMU source does not */
+#define SP_HOLD_UNKNOWN (1ull << 32) /* in SP_HOLD's arg2: what the command
+                           touches is not known */
+#define SP_HOLD_READS_UNKNOWN (1ull << 33) /* ... only what it reads is not known: it
+                           is taken as reading everything */
 
 /*
  * A compressed connection (both ends set SP_F_ZSTD in their HELLO): after the
@@ -209,10 +222,16 @@ static struct SpDelayStat {
     int64_t max;
 } sp_txd, sp_rxd;
 static int64_t sp_rx_min = INT64_MAX, sp_rx_min_prev = INT64_MAX, sp_rx_min_t0;
+/* the message that the main loop handles: when the link's reader read it off
+ * the socket (sp_rx_thread), and when the main loop took it */
+static int64_t sp_rx_now, sp_rx_run;
+/* statistics: from the reader's read of a message to the main loop's, and
+ * (sink) from the read of a command to its answer */
+static struct SpDelayStat sp_rxq, sp_ansd;
 
-static void sp_rx_delay(int64_t t_us)
+/* the lateness of a message read at now (its read time) */
+static void sp_rx_delay(int64_t t_us, int64_t now)
 {
-    int64_t now = g_get_monotonic_time();
     int64_t d = now - t_us, base;
 
     if (!t_us) {
@@ -246,16 +265,41 @@ static int64_t sp_aud_delay_us; /* sink: how much later sound is played, 0 = sil
  * clock" seen recently is the delay of an undisturbed message; a frame is
  * shown at "source clock + that + allowance", which restores the guest's
  * spacing for every frame that is late by less than the allowance. The
- * allowance follows how late recent screen updates were (95th percentile,
- * capped) and costs that much latency, so by default it is used only while
- * the guest decodes video. SPACEBOX_PRESENT_JITTER=off|video|always,
- * SPACEBOX_PRESENT_JITTER_MAX_MS (default 50).
+ * allowance follows how late the screen updates of the last 10 s were (the
+ * latest of them, capped; when video starts after none for a second, it
+ * goes to the cap and comes down from there; how it rises is below) and
+ * costs that much latency,
+ * so by default it is used only while the guest decodes video. (It followed
+ * the 95th percentile of the last 128 updates, about 2 s: a burst of late
+ * updates after a calm stretch was a stall, and so was the percentile's rise
+ * a few frames after it.) SPACEBOX_PRESENT_JITTER=off|video|always,
+ * SPACEBOX_PRESENT_JITTER_MAX_MS (default 350; the presenter keeps at most 24
+ * frames, 400 ms at 60/s). The video task's turn G3a measured the link
+ * holding the guest's screen updates behind one large picture's bitstream:
+ * a 3.8 MB picture of a 2160p30 clip (a cut) takes about 330 ms on a link of
+ * 11.5 MB/s, and 1 to 2.4 MB pictures (a 2160p60 play's start, where Chromium
+ * decodes ahead) 90 to 210 ms; each was a stall with the earlier cap of 50 ms.
+ * A picture shown that much later is the price of showing it without a stall
+ * (with sound, the picture is then that much less the sound's delay behind
+ * the sound).
+ *
+ * With large writes in pieces (sp_hold_write) the updates that need such a
+ * write wait for it at the sink, after their read: the lateness above does
+ * not see that wait, and the allowance of the moment (a few tens of ms after
+ * 10 s with no such write) let a 3.2 and a 3.8 MB picture stall the screen
+ * 116 and 150 ms (the video task's turn G5). The sink knows of each write
+ * ahead, from its notice; it expects the updates behind it that much late
+ * (sp_sink_pace_write) and raises the allowance toward that while the write
+ * comes, by half the spacing a frame. The rise has only the frames that come
+ * before the first update that waits for the write.
  *
  * The guest's own spacing is not even either: a 60 Hz video on its 120 Hz
  * desktop comes out as updates 1, 2 or 3 refreshes apart. While pacing, the
  * presenter also does not show a frame sooner after the previous one than the
  * usual spacing of recent updates (their median, in whole refreshes), which
- * turns "1 then 3" into "2 then 2".
+ * turns "1 then 3" into "2 then 2". Of two updates a refresh apart with the
+ * next one a spacing after the first ("1 then 1": the page's other drawing
+ * beside the video frames), the later one replaces the earlier one.
  */
 int64_t spacebox_frame_due_us;
 int64_t spacebox_frame_gap_us;  /* usual spacing of recent updates, 0 = not a steady stream */
@@ -278,8 +322,9 @@ int64_t spacebox_scroll_answer_us;
 static struct {
     int mode;           /* 0 off, 1 video, 2 always; -1 not read yet */
     int64_t max_us;
-    int64_t late[128];  /* lateness of recent screen updates */
-    unsigned n, pos;
+    int64_t late_max[10];   /* the latest update of each of the last 10 s */
+    int64_t late_sec[10];   /* ... and that second (of the read time) */
+    int64_t video_last;     /* the read time of the last update with video */
     int64_t allowance;
     int64_t input_us;
     uint64_t paced, late_frames, frames, unpaced_for_input;
@@ -287,7 +332,26 @@ static struct {
     int64_t gap[32];    /* source-clock spacing of recent screen updates */
     unsigned gap_n, gap_pos;
     int64_t last_t_us;
+    int64_t expect;     /* the lateness expected of the updates behind the
+                           writes in pieces that come, 0 = none */
+    int64_t expect_max; /* ... the most of the 5 s line */
 } sp_pace = { .mode = -1, .input_us = -1 };
+
+/* what the pacing learns of the writes in pieces (sp_sink_pace_write) */
+#define SP_PW_N 8
+static struct {
+    int64_t rate[SP_PW_N];  /* bytes/s of recent video writes of 1 MiB or more */
+    unsigned rate_n, rate_pos;
+    int64_t exact, exact_gap;   /* the guest's lead (us) at the last write that an
+                                   update waited for, and the usual spacing then;
+                                   0 = none */
+    int64_t bound[10], bound_gap[10], bound_sec[10];    /* since then, the most of
+                                                           each of the last 10 s of
+                                                           writes that none waited
+                                                           for (the lead is at least
+                                                           this), the spacing, the s */
+    int64_t rate_used, lead_used;   /* of the last notice, for the 5 s line */
+} sp_pw;
 
 static int sp_cmp_i64(const void *a, const void *b)
 {
@@ -298,16 +362,18 @@ static int sp_cmp_i64(const void *a, const void *b)
 
 static void sp_sink_pace_frame(const SpHdr *h)
 {
-    int64_t now = g_get_monotonic_time();
+    /* the lateness is the network's: from the message's read off the socket */
+    int64_t now = g_get_monotonic_time(), read = sp_rx_now ? sp_rx_now : now;
     int64_t base = MIN(sp_rx_min, sp_rx_min_prev);
-    int64_t late, target, sorted[G_N_ELEMENTS(sp_pace.late)];
+    int64_t late, target, sec, gap, cap, step, sorted[G_N_ELEMENTS(sp_pace.gap)];
+    bool starting;
 
     if (sp_pace.mode < 0) {
         const char *m = getenv("SPACEBOX_PRESENT_JITTER");
         const char *x = getenv("SPACEBOX_PRESENT_JITTER_MAX_MS");
 
         sp_pace.mode = !m || !strcmp(m, "video") ? 1 : !strcmp(m, "always") ? 2 : 0;
-        sp_pace.max_us = (x ? MAX(atoi(x), 0) : 50) * 1000;
+        sp_pace.max_us = (x ? MAX(atoi(x), 0) : 350) * 1000;
     }
     spacebox_frame_due_us = 0;
     spacebox_frame_gap_us = 0;
@@ -323,15 +389,25 @@ static void sp_sink_pace_frame(const SpHdr *h)
         sp_pace.gap_n = sp_pace.gap_pos = 0; /* a pause: not a steady stream */
     }
     sp_pace.last_t_us = h->t_us;
-    late = MAX(now - h->t_us - base, 0);
-    sp_pace.late[sp_pace.pos] = late;
-    sp_pace.pos = (sp_pace.pos + 1) % G_N_ELEMENTS(sp_pace.late);
-    sp_pace.n = MIN(sp_pace.n + 1, G_N_ELEMENTS(sp_pace.late));
+    late = MAX(read - h->t_us - base, 0);
+    sec = read / G_USEC_PER_SEC;
+    if (sp_pace.late_sec[sec % 10] != sec) {
+        sp_pace.late_sec[sec % 10] = sec;
+        sp_pace.late_max[sec % 10] = 0;
+    }
+    sp_pace.late_max[sec % 10] = MAX(sp_pace.late_max[sec % 10], late);
     sp_pace.frames++;
 
-    if (sp_pace.mode == 0 || (sp_pace.mode == 1 && !(h->flags & SP_F_VIDEO))) {
+    /* an update without the video flag within a second of video is paced
+     * still: the flag follows the guest's decoding, which comes in batches */
+    starting = !sp_pace.video_last || read - sp_pace.video_last > G_USEC_PER_SEC;
+    if (sp_pace.mode == 0 ||
+        (sp_pace.mode == 1 && !(h->flags & SP_F_VIDEO) && starting)) {
         sp_pace.allowance = 0;
         return;
+    }
+    if (sp_pace.mode == 2 || (h->flags & SP_F_VIDEO)) {
+        sp_pace.video_last = read;
     }
     if (sp_pace.input_us < 0) {
         const char *i = getenv("SPACEBOX_PRESENT_INPUT_MS");
@@ -343,9 +419,13 @@ static void sp_sink_pace_frame(const SpHdr *h)
         sp_pace.unpaced_for_input++;
         return; /* the allowance is kept, so pacing picks up where it was */
     }
-    memcpy(sorted, sp_pace.late, sp_pace.n * sizeof(sorted[0]));
-    qsort(sorted, sp_pace.n, sizeof(sorted[0]), sp_cmp_i64);
-    target = MIN(sorted[sp_pace.n * 95 / 100], sp_pace.max_us);
+    target = 0;
+    for (int i = 0; i < 10; i++) {
+        if (sec - sp_pace.late_sec[i] < 10) {
+            target = MAX(target, sp_pace.late_max[i]);
+        }
+    }
+    target = MIN(starting ? sp_pace.max_us : target, sp_pace.max_us);
     if (sp_aud_delay_us) {
         /*
          * Sound is played later by its buffer; keep the picture with it. On top
@@ -365,12 +445,30 @@ static void sp_sink_pace_frame(const SpHdr *h)
         }
         target = MAX(target, sp_aud_delay_us + av_offset);
     }
+    target = MAX(target, sp_pace.expect);
     /* The presenter keeps the waiting frames as textures (SP_SLOTS in
-     * ui/spacebox-presenter.h is 16); do not ask it to keep more than 12, nor
-     * to wait longer than a quarter of a second. */
-    target = MIN(target, MIN(MAX(12 * sp_pace.usual_gap, 40000), 250000));
+     * ui/spacebox-presenter.h is 32); do not ask it to keep more than 24 (of
+     * 60/s while the spacing is not known yet). */
+    gap = sp_pace.usual_gap ? sp_pace.usual_gap : 16667;
+    cap = MIN(MAX(24 * gap, 40000), MAX(sp_pace.max_us, 40000));
+    target = MIN(target, cap);
+    /*
+     * A rise of the allowance moves every later frame by as much: a gap on
+     * the screen. An update later than the allowance makes that gap anyway,
+     * so the allowance takes its lateness at once; any other rise (video
+     * starting, the lateness of other updates) is spread over the frames, a
+     * third of their spacing each, which keeps each interval under the
+     * judder bound of 1.5 times the spacing. Ahead of the updates that a
+     * write in pieces will hold, half the spacing each: the most that keeps
+     * each interval within that bound (at 60/s on a 120 Hz display both make
+     * intervals of 3 refreshes, 25 ms; the half makes them on every frame).
+     */
+    if (late > sp_pace.allowance) {
+        sp_pace.allowance = MIN(late, cap);
+    }
+    step = sp_pace.expect > sp_pace.allowance ? gap / 2 : gap / 3;
     if (target > sp_pace.allowance) {
-        sp_pace.allowance = target;
+        sp_pace.allowance += MIN(target - sp_pace.allowance, step);
     } else {
         sp_pace.allowance -= (sp_pace.allowance - target) / 64;
     }
@@ -387,7 +485,120 @@ static void sp_sink_pace_frame(const SpHdr *h)
         return;
     }
     sp_pace.paced++;
-    spacebox_frame_due_us = now - late + sp_pace.allowance;
+    spacebox_frame_due_us = read - late + sp_pace.allowance;
+}
+
+/*
+ * Each connection starts the pacing again: the allowance, the lateness of the
+ * recent updates and the base of the lateness (the source's clock may be
+ * another machine's after a move, and a new session's frames owe nothing to
+ * the last one's), and the sound's delay until the next sound arrives.
+ */
+static void sp_sink_pace_reset(void)
+{
+    memset(sp_pace.late_max, 0, sizeof(sp_pace.late_max));
+    memset(sp_pace.late_sec, 0, sizeof(sp_pace.late_sec));
+    sp_pace.video_last = 0;
+    sp_pace.allowance = 0;
+    sp_pace.usual_gap = 0;
+    sp_pace.gap_n = sp_pace.gap_pos = 0;
+    sp_pace.last_t_us = 0;
+    sp_pace.expect = 0;
+    memset(&sp_pw, 0, sizeof(sp_pw));
+    sp_rx_min = sp_rx_min_prev = INT64_MAX;
+    sp_rx_min_t0 = 0;
+    sp_aud_delay_us = 0;
+}
+
+/*
+ * How late a write in pieces will make the updates that need it, from its
+ * notice (sp_hold_write; bytes: its size and what is still to come of the
+ * writes before it). Its time on the link is its size at the lowest rate of
+ * the last 8 video writes of 1 MiB or more (8 MB/s before one; sp_hold_piece
+ * says which writes are video's), and a quarter more for the decode of what
+ * it carries (a key picture of 3.2 and 3.8 MB of VP9 10-bit 2160p took 62 and
+ * 70 ms after its 290 and 327 ms, turn G5), plus the notice's own lateness. The guest sent it ahead of those updates: a player
+ * decodes several pictures ahead of their display (Chromium about 11: 190 ms
+ * at 60/s, 375 ms at 30/s), so most writes hold none. That lead is learnt
+ * from video writes (sp_sink_pace_lead): the time from the notice to the
+ * first update that waited for it, of the last write that one waited for, or
+ * more if since then, in the last 10 s, a write that none waited for was
+ * passed by updates for longer (the lead is at least that: it grows from
+ * about 0 as a play starts; a short write says little, so the most of 10 s).
+ * Each at about the usual spacing of now. The expectation holds while writes
+ * come (sp_sink_pace_writes_done).
+ */
+static int64_t sp_sink_pace_write(const SpHdr *h, uint64_t bytes)
+{
+    int64_t base = MIN(sp_rx_min, sp_rx_min_prev);
+    int64_t gap = sp_pace.usual_gap ? sp_pace.usual_gap : 16667;
+    int64_t rate = 8000000, lead = 0, e, d, sec = g_get_monotonic_time() / G_USEC_PER_SEC;
+
+    for (unsigned i = 0; i < sp_pw.rate_n; i++) {
+        rate = i ? MIN(rate, sp_pw.rate[i]) : sp_pw.rate[i];
+    }
+    /* of about this frame rate only */
+    d = sp_pw.exact_gap - gap;
+    if (4 * (d < 0 ? -d : d) <= gap) {
+        lead = sp_pw.exact;
+    }
+    for (int i = 0; i < 10; i++) {
+        d = sp_pw.bound_gap[i] - gap;
+        if (sec - sp_pw.bound_sec[i] < 10 && 4 * (d < 0 ? -d : d) <= gap) {
+            lead = MAX(lead, sp_pw.bound[i]);
+        }
+    }
+    sp_pw.rate_used = rate;
+    sp_pw.lead_used = lead;
+    e = (int64_t)bytes * G_USEC_PER_SEC / rate * 5 / 4 - sp_pw.lead_used;
+    if (h->t_us && base != INT64_MAX && sp_rx_now) {
+        e += MAX(sp_rx_now - h->t_us - base, 0);
+    }
+    if (e > 0) {
+        sp_pace.expect = MAX(sp_pace.expect, e);
+        sp_pace.expect_max = MAX(sp_pace.expect_max, e);
+    }
+    return e;
+}
+
+/* a write of bytes complete, us after its notice */
+static void sp_sink_pace_written(uint64_t bytes, int64_t us)
+{
+    if (bytes >= (1u << 20) && us >= 20000) {
+        sp_pw.rate[sp_pw.rate_pos] = (int64_t)bytes * G_USEC_PER_SEC / us;
+        sp_pw.rate_pos = (sp_pw.rate_pos + 1) % SP_PW_N;
+        sp_pw.rate_n = MIN(sp_pw.rate_n + 1, SP_PW_N);
+    }
+}
+
+/* the guest's lead for a write: exact, the first update that waited for it
+ * came lead after its notice (source clock); else the updates that passed it
+ * came up to lead after it */
+static void sp_sink_pace_lead(int64_t lead, bool exact)
+{
+    int64_t sec = g_get_monotonic_time() / G_USEC_PER_SEC;
+
+    if (!sp_pace.usual_gap || lead < 0) {
+        return;
+    }
+    if (exact) {
+        sp_pw.exact = lead;
+        sp_pw.exact_gap = sp_pace.usual_gap;
+        memset(sp_pw.bound_sec, 0, sizeof(sp_pw.bound_sec));
+        return;
+    }
+    if (sp_pw.bound_sec[sec % 10] != sec) {
+        sp_pw.bound_sec[sec % 10] = sec;
+        sp_pw.bound[sec % 10] = 0;
+    }
+    sp_pw.bound[sec % 10] = MAX(sp_pw.bound[sec % 10], lead);
+    sp_pw.bound_gap[sec % 10] = sp_pace.usual_gap;
+}
+
+/* no write in pieces comes any more */
+static void sp_sink_pace_writes_done(void)
+{
+    sp_pace.expect = 0;
 }
 
 typedef struct SpPending {
@@ -425,6 +636,16 @@ static struct {
     int fd;
     bool rx_busy;
 
+    /* the link's reader (sp_rx_thread) and the messages it queued for the
+     * main loop (sp_rx); under rx_lock */
+    struct SpReader *reader;
+    QemuMutex rx_lock;
+    QemuCond rx_cond;       /* to the reader: the HELLO handled, room, the end */
+    struct SpRxMsg *rx_head, *rx_tail;
+    size_t rx_queued;       /* their bytes */
+    bool rx_woken;          /* the main loop was woken for them */
+    EventNotifier rx_notify;
+
     /*
      * Reliable messages stay in tx_queue until the peer acknowledges them, so
      * that a new connection can continue where the old one stopped. tx_next is
@@ -446,6 +667,8 @@ static struct {
     bool hello_done;
     bool peer_scroll;       /* sink: the source's last HELLO set SP_F_SCROLL */
     bool peer_own_caps;     /* sink: the source's last HELLO set SP_F_OWN_CAPS */
+    bool peer_pieces;       /* sink: the source's last HELLO set SP_F_PIECES: the
+                               reader reports its reading (SP_RXB); under tx_lock */
     bool spec_wait;         /* sink: the source sends its spec, and this renderer
                                has not said yes to it: nothing else is run */
     uint64_t spec_dropped;  /* sink: messages dropped while spec_wait */
@@ -458,18 +681,12 @@ static struct {
     QEMUTimer *ack_timer;
     uint64_t n_reconnect, n_resent;
 
-    GByteArray *rx;
-
     /* compression of the connection */
     int z_level;            /* 0 = not offered */
     bool z_on;              /* both ends offered it (set with the peer's HELLO) */
     uint64_t conn_gen;      /* counts connections: each starts new zstd streams */
-    GByteArray *rxw;        /* bytes as received, before sp_rx_unwrap() */
-    bool rx_hello_in;       /* the peer's HELLO has been taken out of rxw */
-    uint64_t wire_tx, wire_rx; /* bytes written to / read from the socket */
-#ifdef SPACEBOX_ZSTD
-    ZSTD_DCtx *z_d;
-#endif
+    uint64_t wire_tx, wire_rx; /* bytes written to / read from the socket
+                                  (wire_rx and rx_bytes under rx_lock) */
 
     uint64_t seq;
     GHashTable *pending;
@@ -550,7 +767,7 @@ int sp_remote_mode(void)
         p = getenv("SPACEBOX_GPU_REMOTE_FENCE_AGE_MS");
         sp.fence_age_us = (p ? MAX(atoi(p), 0) : 20) * 1000;
         p = getenv("SPACEBOX_GPU_REMOTE_FENCE_AGE_VIDEO_MS");
-        sp.fence_age_video_us = (p ? MAX(atoi(p), 0) : 100) * 1000;
+        sp.fence_age_video_us = (p ? MAX(atoi(p), 0) : 350) * 1000;
         sp.rtt_min_cur = sp.rtt_min_prev = INT64_MAX;
         p = getenv("SPACEBOX_GPU_REMOTE_TX_LIMIT_MB");
         sp.tx_limit = (size_t)MAX(p ? atoi(p) : 8, 1) << 20;
@@ -673,21 +890,21 @@ static size_t sp_z_pack(ZSTD_CCtx *c, const SpBuf *b, uint8_t **out,
 }
 
 /*
- * The reader's side: move what has arrived (sp.rxw) into sp.rx as plain
+ * The reader's side: move what has arrived (raw) into plain as plain
  * messages. 1 = moved something, 0 = nothing complete yet, -1 = bad data.
  */
-static int sp_z_unpack(void)
+static int sp_z_unpack(ZSTD_DCtx *zd, GByteArray *raw, GByteArray *plain)
 {
     size_t off = 0;
 
-    while (sp.rxw->len - off >= sizeof(SpZHdr)) {
+    while (raw->len - off >= sizeof(SpZHdr)) {
         SpZHdr zh;
         SpZFilter zf = { 0 };
         size_t hl = sizeof(zh), clen, at;
         ZSTD_inBuffer in;
         ZSTD_outBuffer o;
 
-        memcpy(&zh, sp.rxw->data + off, sizeof(zh));
+        memcpy(&zh, raw->data + off, sizeof(zh));
         clen = zh.clen & ~SP_Z_FILTERED;
         if (zh.clen & SP_Z_FILTERED) {
             hl += sizeof(zf);
@@ -696,70 +913,41 @@ static int sp_z_unpack(void)
             clen > (size_t)zh.rlen + (zh.rlen >> 7) + 1024) {
             return -1;
         }
-        if (sp.rxw->len - off < hl + clen) {
+        if (raw->len - off < hl + clen) {
             break;
         }
         if (zh.clen & SP_Z_FILTERED) {
-            memcpy(&zf, sp.rxw->data + off + sizeof(zh), sizeof(zf));
+            memcpy(&zf, raw->data + off + sizeof(zh), sizeof(zf));
             if (zf.off < sizeof(SpHdr) || zf.off >= zh.rlen || !zf.bpp ||
                 zf.bpp > 64) {
                 return -1;
             }
         }
-        at = sp.rx->len;
-        g_byte_array_set_size(sp.rx, at + zh.rlen);
-        in = (ZSTD_inBuffer){ sp.rxw->data + off + hl, clen, 0 };
-        o = (ZSTD_outBuffer){ sp.rx->data + at, zh.rlen, 0 };
+        at = plain->len;
+        g_byte_array_set_size(plain, at + zh.rlen);
+        in = (ZSTD_inBuffer){ raw->data + off + hl, clen, 0 };
+        o = (ZSTD_outBuffer){ plain->data + at, zh.rlen, 0 };
         while (in.pos < in.size || o.pos < o.size) {
             size_t before = in.pos + o.pos;
-            size_t r = ZSTD_decompressStream(sp.z_d, &o, &in);
+            size_t r = ZSTD_decompressStream(zd, &o, &in);
 
             if (ZSTD_isError(r) || in.pos + o.pos == before) {
-                g_byte_array_set_size(sp.rx, at);
+                g_byte_array_set_size(plain, at);
                 return -1;
             }
         }
         if (zf.bpp) {
-            sp_z_unfilter(sp.rx->data + at + zf.off, zh.rlen - zf.off, zf.bpp,
+            sp_z_unfilter(plain->data + at + zf.off, zh.rlen - zf.off, zf.bpp,
                           zf.stride);
         }
         off += hl + clen;
     }
     if (off) {
-        g_byte_array_remove_range(sp.rxw, 0, off);
+        g_byte_array_remove_range(raw, 0, off);
     }
     return off ? 1 : 0;
 }
 #endif
-
-/*
- * Move received bytes from sp.rxw to sp.rx. The first message of a connection
- * is the peer's HELLO, never compressed; it is handed over alone, because it
- * decides how the rest is to be read.
- */
-static int sp_rx_unwrap(void)
-{
-    if (!sp.rx_hello_in) {
-        if (sp.rxw->len < sizeof(SpHdr)) {
-            return 0;
-        }
-        g_byte_array_append(sp.rx, sp.rxw->data, sizeof(SpHdr));
-        g_byte_array_remove_range(sp.rxw, 0, sizeof(SpHdr));
-        sp.rx_hello_in = true;
-        return 1;
-    }
-#ifdef SPACEBOX_ZSTD
-    if (sp.z_on) {
-        return sp_z_unpack();
-    }
-#endif
-    if (!sp.rxw->len) {
-        return 0;
-    }
-    g_byte_array_append(sp.rx, sp.rxw->data, sp.rxw->len);
-    g_byte_array_set_size(sp.rxw, 0);
-    return 1;
-}
 
 static void *sp_tx_thread(void *opaque)
 {
@@ -985,93 +1173,1131 @@ static void sp_sink_spec(VirtIOGPU *g, const uint8_t *a, size_t len);
 static void sp_hello(SpHdr *h);
 static void sp_disconnected(void);
 
-static void sp_rx(void *opaque)
-{
-    static uint8_t tmp[1 << 18];
-    size_t off = 0, got = 0;
-    bool closed = false;
-    int unwrapped = 0;
+/*
+ * The link is read on a thread of its own (sp_rx_thread), one for each
+ * connection: it takes the bytes off the socket, unpacks them (zstd), cuts
+ * them into whole messages, each with the time its last byte was read, and
+ * queues them for the main loop (sp_rx), which it wakes. So the reading never
+ * waits for the main loop's work (the guest's drawing, the decoding), and the
+ * lateness of a message (sp_rx_delay, the pacing) is taken where it left the
+ * network. The first message of a connection is the peer's HELLO, never
+ * compressed: the reader hands it over alone and waits until the main loop
+ * has handled it, because it decides how the rest is to be read. At most
+ * SP_RX_QUEUE_MAX bytes wait for the main loop; beyond that the reader stops
+ * reading, as the main loop's own reading did.
+ */
+#define SP_RX_QUEUE_MAX (64u << 20)
 
-    if (sp.fd < 0 || sp.rx_busy) {
+typedef struct SpRxMsg {
+    struct SpRxMsg *next;
+    int64_t t_read;     /* g_get_monotonic_time() when its last byte was read */
+    size_t len;         /* 0: the connection ended (closed, or bad data) */
+    uint8_t data[];     /* SpHdr, a, b */
+} SpRxMsg;
+
+typedef struct SpReader {
+    int fd;
+    QemuThread thread;
+    bool stop;          /* to the reader: end (under sp.rx_lock) */
+    bool hello_wait;    /* the reader waits for the main loop's HELLO (ditto) */
+} SpReader;
+
+static SpRxMsg *sp_rx_msg(const uint8_t *data, size_t len, int64_t t_read)
+{
+    SpRxMsg *m = g_malloc(sizeof(*m) + len);
+
+    m->next = NULL;
+    m->t_read = t_read;
+    m->len = len;
+    if (len) {
+        memcpy(m->data, data, len);
+    }
+    return m;
+}
+
+static void sp_rx_free(SpRxMsg *m)
+{
+    while (m) {
+        SpRxMsg *next = m->next;
+
+        g_free(m);
+        m = next;
+    }
+}
+
+/*
+ * The reader's messages to the main loop, which is woken; then, while too
+ * much waits, no more reading. false when the reader is to end.
+ */
+static bool sp_rx_queue(SpReader *r, SpRxMsg *first, SpRxMsg *last,
+                        size_t bytes, uint64_t wire, uint64_t plain)
+{
+    bool wake = false, go_on;
+
+    qemu_mutex_lock(&sp.rx_lock);
+    if (first) {
+        if (sp.rx_tail) {
+            sp.rx_tail->next = first;
+        } else {
+            sp.rx_head = first;
+        }
+        sp.rx_tail = last;
+        sp.rx_queued += bytes;
+        if (!sp.rx_woken) {
+            sp.rx_woken = wake = true;
+        }
+    }
+    sp.wire_rx += wire;
+    sp.rx_bytes += plain;
+    if (wake) {
+        event_notifier_set(&sp.rx_notify);
+    }
+    while (!r->stop && sp.rx_queued > SP_RX_QUEUE_MAX) {
+        qemu_cond_wait(&sp.rx_cond, &sp.rx_lock);
+    }
+    go_on = !r->stop;
+    qemu_mutex_unlock(&sp.rx_lock);
+    return go_on;
+}
+
+/*
+ * The reader: what it has read on this connection after the source's HELLO,
+ * as on the wire (compressed: what took the link's time), for a source that
+ * sends pieces (SP_RXB, not resent): the source sends its pieces only while it
+ * has written little more than that, so that they do not fill the network's
+ * buffers in front of its small messages. Queued from this thread directly.
+ */
+#define SP_RXB_STEP (16u << 10)
+
+static void sp_rx_report(uint64_t bytes)
+{
+    SpHdr h = {
+        .magic = SP_MAGIC, .type = SP_RXB, .arg0 = bytes,
+        .t_us = g_get_monotonic_time(),
+    };
+    SpBuf *buf = g_malloc0(sizeof(*buf) + sizeof(h));
+    GList *link;
+
+    buf->t_us = h.t_us;
+    buf->len = sizeof(h);
+    memcpy(buf->data, &h, sizeof(h));
+    qemu_mutex_lock(&sp.tx_lock);
+    if (sp.fd < 0 || !sp.tx_enabled) {
+        qemu_mutex_unlock(&sp.tx_lock);
+        g_free(buf);
         return;
     }
-    while (got < (8u << 20)) {
-        ssize_t n = recv(sp.fd, tmp, sizeof(tmp), MSG_DONTWAIT);
+    g_queue_push_tail(&sp.tx_queue, buf);
+    link = g_queue_peek_tail_link(&sp.tx_queue);
+    if (!sp.tx_next) {
+        sp.tx_next = link;
+    }
+    sp.tx_backlog += buf->len;
+    sp.tx_unacked += buf->len;
+    qemu_cond_signal(&sp.tx_cond);
+    qemu_mutex_unlock(&sp.tx_lock);
+}
 
-        if (n > 0) {
-            g_byte_array_append(sp.rxw, tmp, n);
-            got += n;
-        } else if (n == 0) {
-            closed = true;
-            break;
-        } else if (errno == EINTR) {
+static void *sp_rx_thread(void *opaque)
+{
+    SpReader *r = opaque;
+    size_t cap = 1 << 18;
+    uint8_t *tmp = g_malloc(cap);
+    g_autoptr(GByteArray) raw = g_byte_array_new();
+    g_autoptr(GByteArray) plain = g_byte_array_new();
+    bool hello_in = false, z_on = false, end = false, pieces = false;
+    uint64_t wire = 0, said = 0;
+#ifdef SPACEBOX_ZSTD
+    ZSTD_DCtx *zd = ZSTD_createDCtx();
+#endif
+
+    while (!end) {
+        ssize_t n = recv(r->fd, tmp, cap, 0);
+        int64_t t_read = g_get_monotonic_time();
+        SpRxMsg *first = NULL, *last = NULL;
+        size_t off = 0, bytes = 0, had;
+
+        if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
             continue;
-        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            break;
+        }
+        if (n > 0) {
+            g_byte_array_append(raw, tmp, n);
+            wire += n;
         } else {
-            closed = true;
+            end = true;     /* closed, or an error: the main loop ends it */
+        }
+        if (!hello_in && raw->len >= sizeof(SpHdr)) {
+            /* the HELLO alone, handled before anything else is read */
+            first = last = sp_rx_msg(raw->data, sizeof(SpHdr), t_read);
+            g_byte_array_remove_range(raw, 0, sizeof(SpHdr));
+            hello_in = true;
+            qemu_mutex_lock(&sp.rx_lock);
+            r->hello_wait = true;
+            qemu_mutex_unlock(&sp.rx_lock);
+            if (!sp_rx_queue(r, first, last, sizeof(SpHdr), n > 0 ? n : 0,
+                             sizeof(SpHdr))) {
+                break;
+            }
+            n = 0;
+            first = last = NULL;
+            qemu_mutex_lock(&sp.rx_lock);
+            while (r->hello_wait && !r->stop) {
+                qemu_cond_wait(&sp.rx_cond, &sp.rx_lock);
+            }
+            qemu_mutex_unlock(&sp.rx_lock);
+            qemu_mutex_lock(&sp.tx_lock);
+            z_on = sp.z_on;
+            pieces = sp.peer_pieces;
+            qemu_mutex_unlock(&sp.tx_lock);
+        }
+        had = plain->len;
+        if (hello_in && raw->len) {
+#ifdef SPACEBOX_ZSTD
+            if (z_on) {
+                int unpacked;
+
+                while ((unpacked = sp_z_unpack(zd, raw, plain)) > 0) {
+                }
+                if (unpacked < 0) {
+                    error_report("spacebox remote gpu: bad compressed data, closing");
+                    end = true;
+                }
+            } else
+#endif
+            {
+                g_byte_array_append(plain, raw->data, raw->len);
+                g_byte_array_set_size(raw, 0);
+            }
+        }
+        while (plain->len - off >= sizeof(SpHdr)) {
+            SpHdr h;
+            size_t total;
+            SpRxMsg *m;
+
+            memcpy(&h, plain->data + off, sizeof(h));
+            if (h.magic != SP_MAGIC) {
+                error_report("spacebox remote gpu: bad frame, closing");
+                end = true;
+                break;
+            }
+            total = sizeof(h) + (size_t)h.a_len + h.b_len;
+            if (plain->len - off < total) {
+                break;
+            }
+            m = sp_rx_msg(plain->data + off, total, t_read);
+            if (last) {
+                last->next = m;
+            } else {
+                first = m;
+            }
+            last = m;
+            bytes += total;
+            off += total;
+        }
+        if (off) {
+            g_byte_array_remove_range(plain, 0, off);
+        }
+        if (pieces && hello_in && wire - sizeof(SpHdr) - said >= SP_RXB_STEP) {
+            said = wire - sizeof(SpHdr);
+            sp_rx_report(said);
+        }
+        if (end) {
+            SpRxMsg *m = sp_rx_msg(NULL, 0, t_read);
+
+            if (last) {
+                last->next = m;
+            } else {
+                first = m;
+            }
+            last = m;
+        }
+        if (!sp_rx_queue(r, first, last, bytes, n > 0 ? n : 0,
+                         plain->len + off - had)) {
             break;
         }
     }
-    sp.wire_rx += got;
+#ifdef SPACEBOX_ZSTD
+    ZSTD_freeDCtx(zd);
+#endif
+    g_free(tmp);
+    return NULL;
+}
+
+/* the reader of the connection fd */
+static void sp_rx_start(int fd)
+{
+    SpReader *r = g_new0(SpReader, 1);
+
+    r->fd = fd;
+    sp.reader = r;
+    qemu_socket_set_block(fd);  /* the reader waits in its recv */
+    qemu_thread_create(&r->thread, "spacebox-gpu-rx", sp_rx_thread, r,
+                       QEMU_THREAD_JOINABLE);
+}
+
+/* the reader ended, and what it queued dropped */
+static void sp_rx_stop(void)
+{
+    SpReader *r = sp.reader;
+    SpRxMsg *m;
+
+    if (!r) {
+        return;
+    }
+    qemu_mutex_lock(&sp.rx_lock);
+    r->stop = true;
+    qemu_cond_broadcast(&sp.rx_cond);
+    qemu_mutex_unlock(&sp.rx_lock);
+    shutdown(r->fd, SHUT_RDWR);     /* its recv returns */
+    qemu_thread_join(&r->thread);
+    g_free(r);
+    sp.reader = NULL;
+    qemu_mutex_lock(&sp.rx_lock);
+    m = sp.rx_head;
+    sp.rx_head = sp.rx_tail = NULL;
+    sp.rx_queued = 0;
+    sp.rx_woken = false;
+    qemu_mutex_unlock(&sp.rx_lock);
+    sp_rx_free(m);
+}
+
+/*
+ * Large writes in pieces (the screen's protocol, screen/protocol.md of the
+ * spacebox repository). A command whose data is large comes as a notice of
+ * what it touches (SP_HOLD) and a write in pieces (SP_PIECE: the command's
+ * memory writes and the command), and the messages behind it that do not
+ * depend on it run before it: on the one connection a picture's bitstream of a
+ * few MB held every message behind it for a third of a second. The order kept
+ * is the dependency; the result is the same as with the stream's order, since
+ * nothing runs before what it depends on.
+ *
+ * A message runs at once unless it must wait; what waits is kept in the
+ * stream's order (sph.q) until what it waits for has run:
+ *
+ * - A command is its SP_MEMWRITEs, SP_EXPECT and SP_WMARK and its SP_CTRL (or
+ *   SP_CURSOR, SP_IMPORT, SP_EXPORT); with pieces, those before its SP_HOLD and
+ *   its write. It waits while its write is not complete, and while an earlier
+ *   command that waits is of its GL context, touches what it touches (one of
+ *   the two writing), or touches what is not known, or while anything waits if
+ *   it touches what is not known itself (SP_EXPORT touches everything).
+ * - A command stream (SUBMIT_3D) of whose touches nothing is known waits only
+ *   for an earlier command of its context or one whose touches are not known:
+ *   the renderer holds what the waiting commands touch (when that is known) and
+ *   stops the stream before its first command that touches a held resource
+ *   (sp_sink_submit_held, virgl_renderer_submit_cmd_held); the rest of it waits
+ *   at its place, with touches not known.
+ * - What touches no context's GL state runs at once (the sound, the scroll
+ *   channel, the toggle's pictures, the capset and display queries, SP_BYE).
+ *   SP_STATE_RESET and SP_RESET drop what waits and every write not complete
+ *   (the source has dropped them too), and so does a new pairing.
+ */
+typedef struct SpTouch {
+    uint32_t id;        /* a resource; 0 for the scanout and the cursor */
+    uint8_t kind;       /* SP_TOUCH_* */
+    uint8_t write;
+} SpTouch;
+
+enum { SP_TOUCH_RES, SP_TOUCH_SCANOUT, SP_TOUCH_CURSOR };
+
+typedef struct SpWait {
+    QTAILQ_ENTRY(SpWait) next;
+    SpRxMsg *msgs, *tail;   /* the command's messages, in their order */
+    uint32_t ctx;           /* its GL context, 0 = none */
+    bool unknown;           /* what it touches is not known */
+    bool reads_all;         /* what it writes is known, what it reads is not: it is
+                               taken as reading everything */
+    bool stream;            /* a command stream: the renderer stops it (above) */
+    bool all;               /* it touches everything (SP_EXPORT) */
+    GArray *touch;          /* SpTouch, when known */
+    bool held;              /* the renderer holds its touches */
+    uint64_t w;             /* the write it waits for (its notice's id); 0 = none,
+                               or complete */
+    GByteArray *wbuf;       /* that write so far, and its size */
+    uint64_t wlen;
+    int64_t t_notice;       /* its notice's read, its write's last piece's */
+    int64_t t_done;
+    uint64_t passed, flushes;   /* commands, of them screen updates, that ran
+                                   while its write came */
+    int64_t t_src, pass_src;    /* its notice's source time, and the last of those
+                                   screen updates' */
+    int64_t expect;             /* the lateness it was expected to give */
+    bool lead_seen;             /* a screen update waited for it ... */
+    int64_t lead;               /* ... this long after its notice (source clock) */
+    uint32_t type, first;       /* its command's type, and a stream's first command */
+} SpWait;
+
+static struct {
+    QTAILQ_HEAD(, SpWait) q;
+    unsigned n;
+    SpRxMsg *grp, *grp_tail;    /* the command being put together */
+    SpRxMsg *notice;            /* its SP_HOLD with no pieces */
+    unsigned incomplete;        /* writes not complete (their notices come ahead of
+                                   their pieces, which come one write after the other) */
+    bool running;               /* a waiting command runs: a stream's rest goes */
+    SpWait *at;                 /* ... before this one (NULL: at the end) */
+    bool log;                   /* a line for each write (the control's "hold-log on") */
+    struct {
+        uint64_t notices, writes, bytes, waited, passed, flushes, split, dropped;
+        int64_t write_max;
+    } st;                       /* statistics, 5 s */
+} sph = { .q = QTAILQ_HEAD_INITIALIZER(sph.q) };
+
+void sp_sink_hold_log(bool on)
+{
+    sph.log = on;
+}
+
+static void sp_msg_append(SpRxMsg **head, SpRxMsg **tail, SpRxMsg *m)
+{
+    m->next = NULL;
+    if (*tail) {
+        (*tail)->next = m;
+    } else {
+        *head = m;
+    }
+    *tail = m;
+}
+
+static void sp_touch_add(GArray *t, uint8_t kind, uint32_t id, bool write)
+{
+    SpTouch x = { .id = id, .kind = kind, .write = write };
+
+    if (kind != SP_TOUCH_RES || id) {
+        g_array_append_val(t, x);
+    }
+}
+
+/* the resource at off of a request, if it is that long */
+static uint32_t sp_req_u32(const uint8_t *req, size_t len, size_t off)
+{
+    return len >= off + 4 ? ldl_le_p(req + off) : 0;
+}
+
+/*
+ * What an SP_CTRL's request touches, and its context; false if that is not
+ * known (a command stream: the renderer finds out). *nothing: it touches
+ * nothing (a query).
+ */
+static bool sp_ctrl_touches(const uint8_t *req, size_t len, GArray *t,
+                            uint32_t *ctx, bool *nothing)
+{
+    uint32_t type = sp_req_u32(req, len, 0);
+
+    *ctx = sp_req_u32(req, len, 16);
+    *nothing = false;
+    switch (type) {
+    case VIRTIO_GPU_CMD_GET_DISPLAY_INFO:
+    case VIRTIO_GPU_CMD_GET_CAPSET_INFO:
+    case VIRTIO_GPU_CMD_GET_CAPSET:
+    case VIRTIO_GPU_CMD_GET_EDID:
+        *nothing = true;
+        return true;
+    case VIRTIO_GPU_CMD_RESOURCE_CREATE_2D:
+    case VIRTIO_GPU_CMD_RESOURCE_UNREF:
+    case VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING:
+    case VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING:
+    case VIRTIO_GPU_CMD_RESOURCE_CREATE_3D:
+    case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB:
+    case VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB:
+    case VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB:
+        sp_touch_add(t, SP_TOUCH_RES, sp_req_u32(req, len, 24), true);
+        return true;
+    case VIRTIO_GPU_CMD_SET_SCANOUT:
+    case VIRTIO_GPU_CMD_SET_SCANOUT_BLOB:
+        sp_touch_add(t, SP_TOUCH_RES, sp_req_u32(req, len, 44), false);
+        sp_touch_add(t, SP_TOUCH_SCANOUT, 0, true);
+        return true;
+    case VIRTIO_GPU_CMD_RESOURCE_FLUSH:
+        sp_touch_add(t, SP_TOUCH_RES, sp_req_u32(req, len, 40), false);
+        sp_touch_add(t, SP_TOUCH_SCANOUT, 0, true);
+        return true;
+    case VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D:
+        sp_touch_add(t, SP_TOUCH_RES, sp_req_u32(req, len, 48), true);
+        return true;
+    case VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D:
+    case VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D:
+        /* a read back writes the copy of the guest's backing */
+        sp_touch_add(t, SP_TOUCH_RES, sp_req_u32(req, len, 56), true);
+        return true;
+    case VIRTIO_GPU_CMD_CTX_CREATE:
+    case VIRTIO_GPU_CMD_CTX_DESTROY:
+    /* what a context reaches: no resource's contents (its context's order
+     * keeps it before the context's commands that use the resource) */
+    case VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE:
+    case VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* the touches of a notice: n writes, then reads */
+static GArray *sp_notice_touches(const SpHdr *h, const uint8_t *a)
+{
+    GArray *t = g_array_new(false, false, sizeof(SpTouch));
+    uint32_t nw = h->arg2 & 0xffffffffu;
+
+    for (uint32_t i = 0; i < h->a_len / 4; i++) {
+        sp_touch_add(t, SP_TOUCH_RES, ldl_le_p(a + i * 4), i < nw);
+    }
+    return t;
+}
+
+/* why an earlier waiting command f holds back a command (its context, its
+ * touches t if known, a stream, one that touches everything): 0 it does not;
+ * SP_WHY_*, with *res the resource of a conflict */
+enum { SP_WHY_NONE, SP_WHY_UNKNOWN, SP_WHY_CTX, SP_WHY_NOT_KNOWN, SP_WHY_READS_ALL, SP_WHY_TOUCH };
+
+static int sp_wait_blocks(const SpWait *f, uint32_t ctx, const GArray *t,
+                          bool stream, bool all, uint32_t *res)
+{
+    if (f->unknown || f->all || all) {
+        return SP_WHY_UNKNOWN;
+    }
+    if (ctx && f->ctx == ctx) {
+        return SP_WHY_CTX;
+    }
+    if (!t) {
+        return stream ? SP_WHY_NONE : SP_WHY_NOT_KNOWN;
+    }
+    for (guint i = 0; i < t->len; i++) {
+        const SpTouch *x = &g_array_index(t, SpTouch, i);
+
+        /* it may read what this writes, if its context reaches it */
+        if (f->reads_all && x->kind == SP_TOUCH_RES && x->write &&
+            virgl_renderer_ctx_resource_attached(f->ctx, x->id)) {
+            *res = x->id;
+            return SP_WHY_READS_ALL;
+        }
+
+        for (guint j = 0; j < f->touch->len; j++) {
+            const SpTouch *y = &g_array_index(f->touch, SpTouch, j);
+
+            if (x->kind == y->kind && x->id == y->id && (x->write || y->write)) {
+                *res = x->kind == SP_TOUCH_RES ? x->id : 0;
+                return SP_WHY_TOUCH;
+            }
+        }
+    }
+    return SP_WHY_NONE;
+}
+
+/* the first waiting command before upto that a command waits for, or NULL;
+ * *why and *res as sp_wait_blocks */
+static SpWait *sp_must_wait_for(uint32_t ctx, const GArray *t, bool stream, bool all,
+                                const SpWait *upto, int *why, uint32_t *res)
+{
+    SpWait *f;
+
+    QTAILQ_FOREACH(f, &sph.q, next) {
+        if (f == upto) {
+            break;
+        }
+        *why = sp_wait_blocks(f, ctx, t, stream, all, res);
+        if (*why) {
+            return f;
+        }
+    }
+    return NULL;
+}
+
+/* whether a command waits for one of the waiting commands before upto */
+static bool sp_must_wait(uint32_t ctx, const GArray *t, bool stream, bool all,
+                         const SpWait *upto)
+{
+    int why;
+    uint32_t res;
+
+    return sp_must_wait_for(ctx, t, stream, all, upto, &why, &res);
+}
+
+/* the renderer holds (1) or lets go of (-1) what a waiting command touches */
+static void sp_wait_hold(SpWait *e, int delta)
+{
+    if (!e->touch || e->unknown || e->held == (delta > 0)) {
+        return;
+    }
+    if (e->reads_all) {
+        /* what its context reaches, held for reading */
+        virgl_renderer_ctx_hold_reads(e->ctx, delta);
+    }
+    for (guint i = 0; i < e->touch->len; i++) {
+        const SpTouch *x = &g_array_index(e->touch, SpTouch, i);
+
+        if (x->kind == SP_TOUCH_RES) {
+            virgl_renderer_resource_hold(x->id, x->write ? VIRGL_RESOURCE_HOLD_WRITE
+                                                         : VIRGL_RESOURCE_HOLD_READ,
+                                         delta);
+        }
+    }
+    e->held = delta > 0;
+}
+
+static void sp_wait_free(SpWait *e)
+{
+    sp_wait_hold(e, -1);
+    sp_rx_free(e->msgs);
+    if (e->touch) {
+        g_array_free(e->touch, true);
+    }
+    if (e->wbuf) {
+        g_byte_array_free(e->wbuf, true);
+    }
+    g_free(e);
+}
+
+static void sp_wait_add(SpWait *e)
+{
+    QTAILQ_INSERT_TAIL(&sph.q, e, next);
+    sph.n++;
+    sp_wait_hold(e, 1);
+}
+
+/* run messages in their order, as the stream would have */
+static void sp_run_msgs(SpRxMsg *m)
+{
+    while (m) {
+        SpRxMsg *next = m->next;
+        SpHdr h;
+        uint8_t *a = m->data + sizeof(h);
+
+        memcpy(&h, m->data, sizeof(h));
+        if (sph.incomplete && h.type == SP_CTRL) {
+            /* one that passed the writes that are still coming */
+            bool flush = h.a_len >= 4 && ldl_le_p(a) == VIRTIO_GPU_CMD_RESOURCE_FLUSH;
+            SpWait *e;
+
+            sph.st.passed++;
+            sph.st.flushes += flush;
+            QTAILQ_FOREACH(e, &sph.q, next) {
+                if (e->w) {
+                    e->passed++;
+                    e->flushes += flush;
+                    e->pass_src = flush ? h.t_us : e->pass_src;
+                }
+            }
+        }
+        sp_rx_now = m->t_read;
+        sp_rx_run = g_get_monotonic_time();
+        sp_dispatch(&h, a, a + h.a_len);
+        m->next = NULL;
+        sp_rx_free(m);
+        m = next;
+    }
+}
+
+/*
+ * Run a waiting command. It comes before the commands that wait after it in
+ * the stream: what they hold in the renderer must not stop it, so their holds
+ * are let go while it runs (those of the commands before it stay).
+ */
+static void sp_wait_run(SpWait *e)
+{
+    SpRxMsg *m = e->msgs;
+    SpWait *f, *after = QTAILQ_NEXT(e, next);
+
+    QTAILQ_REMOVE(&sph.q, e, next);
+    sph.n--;
+    sp_wait_hold(e, -1);
+    for (f = after; f; f = QTAILQ_NEXT(f, next)) {
+        sp_wait_hold(f, -1);
+    }
+    e->msgs = NULL;
+    sph.running = true;
+    sph.at = after;
+    sp_run_msgs(m);
+    sph.running = false;
+    sph.at = NULL;
+    for (f = after; f; f = QTAILQ_NEXT(f, next)) {
+        sp_wait_hold(f, 1);
+    }
+    if (sph.log && e->t_done) {
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink write ctx=%u bytes=%" PRIu64
+                " command=0x%x first=%u touches=%s notice_us=%" PRId64 " complete_us=%" PRId64
+                " run_us=%" PRId64 " passed=%" PRIu64 " screen_updates_passed=%" PRIu64
+                " expected_lateness_ms=%.1f screen_update_waited=%d\n",
+                e->ctx, e->wlen, e->type, e->first,
+                e->unknown ? "unknown" : e->reads_all ? "writes" : "known",
+                e->t_notice, e->t_done, g_get_monotonic_time(), e->passed, e->flushes,
+                e->expect / 1000.0, e->lead_seen);
+    }
+    sp_wait_free(e);
+}
+
+/*
+ * Run what waits and need not wait any more, in order. A command stream that
+ * the renderer stops again leaves its rest at its place: that is no progress
+ * (it waits for what an earlier command holds), and the pass goes on after it.
+ */
+static void sp_hold_run(void)
+{
+    bool progress = true;
+
+    while (progress) {
+        SpWait *e = QTAILQ_FIRST(&sph.q);
+
+        progress = false;
+        while (e) {
+            SpWait *next = QTAILQ_NEXT(e, next);
+            uint64_t split = sph.st.split;
+
+            if (!e->w && !sp_must_wait(e->ctx, e->unknown || e->reads_all ? NULL : e->touch,
+                                       e->stream, e->all, e)) {
+                sp_wait_run(e);
+                progress |= sph.st.split == split;
+            }
+            e = next;
+        }
+    }
+}
+
+/* everything that waits and the command being put together go (a reset) */
+static void sp_hold_drop(const char *why)
+{
+    SpWait *e, *tmp;
+    unsigned n = sph.n;
+
+    QTAILQ_FOREACH_SAFE(e, &sph.q, next, tmp) {
+        QTAILQ_REMOVE(&sph.q, e, next);
+        sp_wait_free(e);
+    }
+    sph.n = 0;
+    sph.incomplete = 0;
+    sp_sink_pace_writes_done();
+    sp_rx_free(sph.grp);
+    sph.grp = sph.grp_tail = NULL;
+    sp_rx_free(sph.notice);
+    sph.notice = NULL;
+    if (n) {
+        sph.st.dropped += n;
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink: %u commands that waited dropped (%s)\n",
+                n, why);
+    }
+}
+
+/* a command (the group put together, whose last message is m): run or wait */
+static void sp_hold_cmd(const SpHdr *h, SpRxMsg *m)
+{
+    const uint8_t *a = m->data + sizeof(*h);
+    GArray *t = g_array_new(false, false, sizeof(SpTouch));
+    uint32_t ctx = 0;
+    bool unknown = false, reads_all = false, stream = false, nothing = false, all = false;
+    SpRxMsg *grp = sph.grp;
+    SpWait *e, *f = NULL;
+    int why = SP_WHY_NONE;
+    uint32_t why_res = 0;
+
+    sph.grp = sph.grp_tail = NULL;
+    switch (h->type) {
+    case SP_CTRL:
+        unknown = !sp_ctrl_touches(a, h->a_len, t, &ctx, &nothing);
+        stream = sp_req_u32(a, h->a_len, 0) == VIRTIO_GPU_CMD_SUBMIT_3D;
+        if (sph.notice && stream) {
+            SpHdr nh;
+
+            memcpy(&nh, sph.notice->data, sizeof(nh));
+            unknown = nh.arg2 & SP_HOLD_UNKNOWN;
+            reads_all = nh.arg2 & SP_HOLD_READS_UNKNOWN;
+            if (!unknown) {
+                g_array_free(t, true);
+                t = sp_notice_touches(&nh, sph.notice->data + sizeof(nh));
+            }
+        }
+        break;
+    case SP_CURSOR:
+        sp_touch_add(t, SP_TOUCH_CURSOR, 0, true);
+        if (sp_req_u32(a, h->a_len, 0) == VIRTIO_GPU_CMD_UPDATE_CURSOR) {
+            sp_touch_add(t, SP_TOUCH_RES, sp_req_u32(a, h->a_len, 40), false);
+        }
+        break;
+    case SP_IMPORT:
+        sp_touch_add(t, SP_TOUCH_RES, sp_req_u32(a, h->a_len, 0), true);
+        break;
+    case SP_EXPORT:
+        all = true;
+        break;
+    }
+    sp_rx_free(sph.notice);
+    sph.notice = NULL;
+    /* a stream whose reads are not known runs past what waits (the renderer stops it) */
+    if (!nothing) {
+        f = sp_must_wait_for(ctx, unknown || reads_all ? NULL : t, stream, all, NULL,
+                             &why, &why_res);
+    }
+    if (nothing || !f) {
+        g_array_free(t, true);
+        sp_run_msgs(grp);
+        return;
+    }
+    if (sph.log) {
+        static const char *const whys[] = {
+            "", "it waits for one whose touches are not known", "of its context",
+            "its touches are not known", "it writes what one may read", "it touches what one touches",
+        };
+
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink waits: %s 0x%x ctx=%u resource=%u: %s"
+                " (the waiting ctx=%u command=0x%x write=%" PRIu64 "%s)\n",
+                h->type == SP_CTRL ? "command" : "message",
+                h->type == SP_CTRL ? sp_req_u32(a, h->a_len, 0) : h->type, ctx,
+                why == SP_WHY_TOUCH || why == SP_WHY_READS_ALL ? why_res :
+                t->len ? g_array_index(t, SpTouch, 0).id : 0,
+                whys[why], f->ctx, f->type, f->w, f->stream && f->unknown ? ", a stream's rest" : "");
+    }
+    e = g_new0(SpWait, 1);
+    e->msgs = grp;
+    for (e->tail = grp; e->tail && e->tail->next; e->tail = e->tail->next) {
+    }
+    e->ctx = ctx;
+    e->unknown = unknown;
+    e->reads_all = reads_all;
+    e->stream = stream;
+    e->all = all;
+    e->type = h->type == SP_CTRL ? sp_req_u32(a, h->a_len, 0) : 0;
+    if (unknown) {
+        g_array_free(t, true);
+    } else {
+        e->touch = t;
+    }
+    if (e->type == VIRTIO_GPU_CMD_RESOURCE_FLUSH && sph.incomplete) {
+        /* a screen update waits: the guest's lead for the first write that comes */
+        QTAILQ_FOREACH(f, &sph.q, next) {
+            if (f->w) {
+                break;
+            }
+        }
+        if (f && !f->lead_seen && f->t_src && h->t_us >= f->t_src) {
+            f->lead_seen = true;
+            f->lead = h->t_us - f->t_src;
+        }
+    }
+    sp_wait_add(e);
+    sph.st.waited++;
+}
+
+/* a notice with pieces: its command waits for its write */
+static void sp_hold_write(const SpHdr *h, const uint8_t *a)
+{
+    SpWait *e = g_new0(SpWait, 1), *f;
+    uint64_t ahead = h->seq;    /* its bytes and those still to come before them */
+
+    QTAILQ_FOREACH(f, &sph.q, next) {
+        if (f->w) {
+            ahead += f->wlen - f->wbuf->len;
+        }
+    }
+    e->t_src = h->t_us;
+    e->expect = sp_sink_pace_write(h, ahead);
+
+    e->msgs = sph.grp;
+    e->tail = sph.grp_tail;
+    sph.grp = sph.grp_tail = NULL;
+    sp_rx_free(sph.notice);
+    sph.notice = NULL;
+    e->w = h->id;
+    e->wlen = h->seq;
+    e->wbuf = g_byte_array_sized_new(MIN(h->seq, 64u << 20));
+    e->ctx = h->arg1;
+    e->unknown = h->arg2 & SP_HOLD_UNKNOWN;
+    e->reads_all = h->arg2 & SP_HOLD_READS_UNKNOWN;
+    if (!e->unknown) {
+        e->touch = sp_notice_touches(h, a);
+    }
+    e->t_notice = sp_rx_now;
+    sp_wait_add(e);
+    sph.incomplete++;
+    sph.st.notices++;
+}
+
+/* a piece of the write that comes; when it is complete, its messages join its
+ * command, which may run */
+static void sp_hold_piece(const SpHdr *h, const uint8_t *a)
+{
+    SpWait *e;
+    size_t off = 0;
+
+    QTAILQ_FOREACH(e, &sph.q, next) {
+        if (e->w && e->w == h->arg0) {
+            break;
+        }
+    }
+    if (!e || h->arg1 != e->wbuf->len || e->wbuf->len + h->a_len > e->wlen) {
+        error_report("spacebox remote gpu: a piece of write %" PRIu64 " at %" PRIu64
+                     " does not follow (%s)", (uint64_t)h->arg0, (uint64_t)h->arg1,
+                     e ? "not where its write is" : "no such write waits");
+        return;
+    }
+    g_byte_array_append(e->wbuf, a, h->a_len);
+    if (e->wbuf->len < e->wlen) {
+        return;
+    }
+    while (off + sizeof(SpHdr) <= e->wbuf->len) {
+        SpHdr ih;
+        size_t total;
+        SpRxMsg *m;
+
+        memcpy(&ih, e->wbuf->data + off, sizeof(ih));
+        total = sizeof(ih) + (size_t)ih.a_len + ih.b_len;
+        if (ih.magic != SP_MAGIC || total > e->wbuf->len - off) {
+            break;
+        }
+        ih.id = e->w;   /* its place in the stream: its notice's */
+        m = sp_rx_msg(e->wbuf->data + off, total, sp_rx_now);
+        memcpy(m->data, &ih, sizeof(ih));
+        if (ih.type == SP_CTRL) {
+            e->type = sp_req_u32(m->data + sizeof(ih), ih.a_len, 0);
+            e->stream = e->type == VIRTIO_GPU_CMD_SUBMIT_3D;
+            e->first = e->stream ? sp_req_u32(m->data + sizeof(ih), ih.a_len, 32) & 0xff : 0;
+        }
+        sp_msg_append(&e->msgs, &e->tail, m);
+        off += total;
+    }
+    if (off != e->wbuf->len) {
+        error_report("spacebox remote gpu: write %" PRIu64 " of %" PRIu64
+                     " bytes is not whole messages (at %zu)", e->w, e->wlen, off);
+    }
+    g_byte_array_free(e->wbuf, true);
+    e->wbuf = NULL;
+    e->w = 0;
+    e->t_done = sp_rx_now;
+    sph.incomplete--;
+    sph.st.writes++;
+    sph.st.bytes += e->wlen;
+    sph.st.write_max = MAX(sph.st.write_max, e->t_done - e->t_notice);
+    /*
+     * The pacing learns the link's rate and the guest's lead from video only:
+     * a command stream that only decodes (its reads known), whose bitstream does
+     * not compress. Other large writes (the console's full-screen uploads of
+     * 16 MB, which compress to a few hundred KB, with an update right behind)
+     * would make both look otherwise.
+     */
+    if (e->type == VIRTIO_GPU_CMD_SUBMIT_3D && !e->unknown && !e->reads_all) {
+        sp_sink_pace_written(e->wlen, e->t_done - e->t_notice);
+        if (e->lead_seen) {
+            sp_sink_pace_lead(e->lead, true);
+        } else if (e->flushes && e->t_src && e->pass_src >= e->t_src) {
+            sp_sink_pace_lead(e->pass_src - e->t_src, false);
+        }
+    }
+    if (!sph.incomplete) {
+        sp_sink_pace_writes_done();
+    }
+    sp_hold_run();
+}
+
+/* sp_sink_submit_held: the rest of a command stream that the renderer stopped
+ * waits as a command of its own, at the place of the command that runs (with
+ * the original's sequence number, fence and expectations: it answers) */
+static void sp_hold_rest(struct virtio_gpu_ctrl_command *cmd, const uint8_t *rest,
+                         uint32_t ndw)
+{
+    struct virtio_gpu_cmd_submit cs;
+    int64_t base = MIN(sp_rx_min, sp_rx_min_prev);
+    SpHdr h = {
+        .magic = SP_MAGIC, .type = SP_CTRL, .seq = cmd->sp_seq,
+        .a_len = sizeof(cs) + (size_t)ndw * 4,
+        .arg0 = cmd->elem.in_sg[0].iov_len, .arg1 = cmd->sp_off, .arg2 = cmd->sp_len,
+        .t_us = cmd->sp_t_dev && base != INT64_MAX ? cmd->sp_t_dev - base : 0,
+    };
+    SpWait *e = g_new0(SpWait, 1);
+    SpRxMsg *m;
+
+    memcpy(&cs, cmd->elem.out_sg[0].iov_base, sizeof(cs));
+    cs.size = cpu_to_le32(ndw * 4);
+    if (cmd->sp_expect) {
+        GByteArray *x = cmd->sp_expect;
+        SpHdr eh = { .magic = SP_MAGIC, .type = SP_EXPECT, .a_len = x->len };
+
+        m = g_malloc(sizeof(*m) + sizeof(eh) + x->len);
+        m->next = NULL;
+        m->t_read = cmd->sp_t_read;
+        m->len = sizeof(eh) + x->len;
+        memcpy(m->data, &eh, sizeof(eh));
+        memcpy(m->data + sizeof(eh), x->data, x->len);
+        sp_msg_append(&e->msgs, &e->tail, m);
+        g_byte_array_unref(x);
+        cmd->sp_expect = NULL;
+    }
+    m = g_malloc(sizeof(*m) + sizeof(h) + h.a_len);
+    m->next = NULL;
+    m->t_read = cmd->sp_t_read;
+    m->len = sizeof(h) + h.a_len;
+    memcpy(m->data, &h, sizeof(h));
+    memcpy(m->data + sizeof(h), &cs, sizeof(cs));
+    memcpy(m->data + sizeof(h) + sizeof(cs), rest, (size_t)ndw * 4);
+    sp_msg_append(&e->msgs, &e->tail, m);
+    e->ctx = le32_to_cpu(cs.hdr.ctx_id);
+    e->unknown = true;
+    e->stream = true;
+    e->type = VIRTIO_GPU_CMD_SUBMIT_3D;
+    if (sph.running && sph.at) {
+        QTAILQ_INSERT_BEFORE(sph.at, e, next);
+    } else {
+        QTAILQ_INSERT_TAIL(&sph.q, e, next);
+    }
+    sph.n++;
+    sph.st.split++;
+}
+
+bool sp_sink_submit_held(struct virtio_gpu_ctrl_command *cmd)
+{
+    struct virtio_gpu_cmd_submit cs;
+    uint8_t *req = cmd->elem.out_sg[0].iov_base;
+    size_t len = cmd->elem.out_sg[0].iov_len;
+    uint32_t size;
+    int done, ret;
+
+    if (len < sizeof(cs)) {
+        return false;
+    }
+    memcpy(&cs, req, sizeof(cs));
+    size = le32_to_cpu(cs.size);
+    if (le32_to_cpu(cs.hdr.type) != VIRTIO_GPU_CMD_SUBMIT_3D || !size || size % 4 ||
+        size > len - sizeof(cs) || size > VIRTIO_GPU_MAX_CMD_SUBMIT_SIZE) {
+        return false;   /* QEMU's virgl code answers it */
+    }
+    virgl_renderer_force_ctx_0();
+    ret = virgl_renderer_submit_cmd_held(req + sizeof(cs), le32_to_cpu(cs.hdr.ctx_id),
+                                         size / 4, &done);
+    /* what ran: QEMU's virgl code submits nothing more of it, and answers it */
+    cs.size = 0;
+    memcpy(req, &cs, sizeof(cs));
+    if (ret != VIRGL_SUBMIT_HELD) {
+        return false;
+    }
+    if (sph.log) {
+        uint32_t hdr, res;
+
+        virgl_renderer_held_where(&hdr, &res);
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink stream stopped: ctx=%u at dword %d of %u,"
+                " command %u object %u resource=%u\n", le32_to_cpu(cs.hdr.ctx_id), done,
+                size / 4, hdr & 0xff, (hdr >> 8) & 0xff, res);
+    }
+    sp_hold_rest(cmd, req + sizeof(cs) + (size_t)done * 4, size / 4 - done);
+    return true;
+}
+
+/*
+ * The main loop: a message of the source (sink). 0: dispatch it (it runs at
+ * once); 1: taken (it is part of a command, which runs or waits); 2: done.
+ */
+static int sp_sink_admit(SpRxMsg *m)
+{
+    SpHdr h;
+
+    memcpy(&h, m->data, sizeof(h));
+    switch (h.type) {
+    case SP_MEMWRITE:
+    case SP_EXPECT:
+    case SP_WMARK:
+        sp_msg_append(&sph.grp, &sph.grp_tail, m);
+        return 1;
+    case SP_HOLD:
+        if (!h.arg0) {
+            sp_rx_free(sph.notice);
+            m->next = NULL;
+            sph.notice = m;
+            return 1;
+        }
+        sp_hold_write(&h, m->data + sizeof(h));
+        return 2;
+    case SP_PIECE:
+        sp_hold_piece(&h, m->data + sizeof(h));
+        return 2;
+    case SP_CTRL:
+    case SP_CURSOR:
+    case SP_IMPORT:
+    case SP_EXPORT:
+        sp_msg_append(&sph.grp, &sph.grp_tail, m);
+        sp_hold_cmd(&h, m);
+        return 1;
+    case SP_STATE_RESET:
+    case SP_RESET:
+        sp_hold_drop("a state reset");
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+/* the main loop: the messages that the reader queued, in their order */
+static void sp_rx(void *opaque)
+{
+    SpRxMsg *m, *done;
+    uint64_t gen = sp.conn_gen;
+    bool closed = false;
+
+    if (sp.rx_busy) {
+        return;     /* the notifier stays set: called again after */
+    }
+    event_notifier_test_and_clear(&sp.rx_notify);
+    qemu_mutex_lock(&sp.rx_lock);
+    m = sp.rx_head;
+    sp.rx_head = sp.rx_tail = NULL;
+    sp.rx_queued = 0;
+    sp.rx_woken = false;
+    qemu_cond_broadcast(&sp.rx_cond);
+    qemu_mutex_unlock(&sp.rx_lock);
 
     sp.rx_busy = true;
-  more:
-    if (!closed) {
-        size_t had = sp.rx->len;
-
-        unwrapped = sp_rx_unwrap();
-        if (unwrapped < 0) {
-            error_report("spacebox remote gpu: bad compressed data, closing");
-            closed = true;
-        } else {
-            sp.rx_bytes += sp.rx->len - had;
-        }
-    }
-    while (!closed && sp.rx->len - off >= sizeof(SpHdr)) {
+    while (m && !closed && sp.fd >= 0 && sp.conn_gen == gen) {
         SpHdr h;
-        size_t total;
+        int64_t run = g_get_monotonic_time(), d = run - m->t_read;
 
-        memcpy(&h, sp.rx->data + off, sizeof(h));
-        if (h.magic != SP_MAGIC) {
-            error_report("spacebox remote gpu: bad frame, closing");
+        done = m;
+        m = m->next;
+        done->next = NULL;
+        if (!done->len) {
             closed = true;
+            sp_rx_free(done);
             break;
         }
-        total = sizeof(h) + (size_t)h.a_len + h.b_len;
-        if (sp.rx->len - off < total) {
-            break;
-        }
-        off += total;
+        memcpy(&h, done->data, sizeof(h));
+        sp_rx_now = done->t_read;
+        sp_rx_run = run;
+        sp_rxq.n++;
+        sp_rxq.over12 += d > 12000;
+        sp_rxq.over25 += d > 25000;
+        sp_rxq.over50 += d > 50000;
+        sp_rxq.max = MAX(sp_rxq.max, d);
         if (h.type == SP_HELLO) {
             sp_hello(&h);
+            /* the reader goes on */
+            qemu_mutex_lock(&sp.rx_lock);
+            if (sp.reader) {
+                sp.reader->hello_wait = false;
+                qemu_cond_broadcast(&sp.rx_cond);
+            }
+            qemu_mutex_unlock(&sp.rx_lock);
             if (sp.refuse_now) {
                 sp.refuse_now = false;
                 closed = true;
-                break;
             }
+            sp_rx_free(done);
             continue;
         }
         if (!sp.hello_done) {
+            sp_rx_free(done);
             continue;
         }
         sp_acked(h.ack);
         if (h.id) {
             if (h.id <= sp.rx_id) {
+                sp_rx_free(done);
                 continue; /* resent, already handled */
             }
             if (h.id != sp.rx_id + 1) {
                 error_report("spacebox remote gpu: message %" PRIu64
                              " after %" PRIu64 ", closing", h.id, sp.rx_id);
                 closed = true;
+                sp_rx_free(done);
                 break;
             }
             sp.rx_id = h.id;
         }
         if (h.type != SP_ACK) {
-            uint8_t *a = sp.rx->data + off - total + sizeof(h);
+            uint8_t *a = done->data + sizeof(h);
 
-            sp_rx_delay(h.t_us);
+            sp_rx_delay(h.t_us, done->t_read);
             if (sp.mode == SP_REMOTE_SINK && h.type == SP_SPEC) {
                 if (sp.spec_wait) {
                     sp_sink_spec(sp.g, a, h.a_len);
@@ -1080,10 +2306,20 @@ static void sp_rx(void *opaque)
                 /* nothing of a source runs before this renderer said yes to
                  * its spec (or after it said no) */
                 sp.spec_dropped++;
+            } else if (sp.mode == SP_REMOTE_SINK) {
+                switch (sp_sink_admit(done)) {
+                case 0:
+                    sp_dispatch(&h, a, a + h.a_len);
+                    break;
+                case 1:
+                    done = NULL;    /* part of a command */
+                    break;
+                }
             } else {
                 sp_dispatch(&h, a, a + h.a_len);
             }
         }
+        sp_rx_free(done);
         if (sp.bye) {
             closed = true;
             break;
@@ -1092,15 +2328,10 @@ static void sp_rx(void *opaque)
             sp_send_full(false, SP_ACK, 0, NULL, 0, NULL, 0, 0, 0, 0);
         }
     }
-    if (off) {
-        g_byte_array_remove_range(sp.rx, 0, off);
-        off = 0;
-    }
-    if (!closed && unwrapped > 0 && sp.fd >= 0) {
-        goto more;
-    }
+    sp_rx_free(m);
+    sp_rx_now = sp_rx_run = 0;
     sp.rx_busy = false;
-    if (closed) {
+    if (closed && sp.conn_gen == gen) {
         sp_disconnected();
     }
 }
@@ -1113,12 +2344,6 @@ static void sp_set_connected(int fd)
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
 #endif
     (void)yes;
-    g_byte_array_set_size(sp.rx, 0);
-    g_byte_array_set_size(sp.rxw, 0);
-    sp.rx_hello_in = false;
-#ifdef SPACEBOX_ZSTD
-    ZSTD_DCtx_reset(sp.z_d, ZSTD_reset_session_only);
-#endif
     qemu_mutex_lock(&sp.tx_lock);
     sp.fd = fd;
     sp.hello_done = false;
@@ -1126,14 +2351,14 @@ static void sp_set_connected(int fd)
     sp.z_on = false;
     sp.conn_gen++;
     qemu_mutex_unlock(&sp.tx_lock);
-    qemu_set_fd_handler(fd, sp_rx, NULL, NULL);
 
     /* HELLO goes out directly: the queue stays closed until the peer answers. */
     {
         SpHdr h = {
             .magic = SP_MAGIC, .type = SP_HELLO,
             .arg0 = sp.session, .arg1 = sp.peer_session, .arg2 = sp.rx_id,
-            .flags = sp.z_level ? SP_F_ZSTD : 0,
+            .flags = (sp.z_level ? SP_F_ZSTD : 0) |
+                     (sp.mode == SP_REMOTE_SINK ? SP_F_PIECES : 0),
         };
         size_t done = 0;
 
@@ -1148,6 +2373,7 @@ static void sp_set_connected(int fd)
             }
         }
     }
+    sp_rx_start(fd);
 }
 
 /* Open the queue: everything the peer does not have yet goes out (again). */
@@ -2392,6 +3618,15 @@ void sp_sink_response(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd,
         cmd->sp_snap = NULL;
         return;
     }
+    if (cmd->sp_t_read) {
+        int64_t d = g_get_monotonic_time() - cmd->sp_t_read;
+
+        sp_ansd.n++;
+        sp_ansd.over12 += d > 12000;
+        sp_ansd.over25 += d > 25000;
+        sp_ansd.over50 += d > 50000;
+        sp_ansd.max = MAX(sp_ansd.max, d);
+    }
     sp_send(SP_RESP, cmd->sp_seq, resp, resp_len,
             ok ? cmd->sp_snap : NULL, ok ? cmd->sp_len : 0,
             0, cmd->sp_off, 0);
@@ -2923,6 +4158,14 @@ static void sp_sink_ctrl(VirtIOGPU *g, SpHdr *h, uint8_t *a, uint8_t *b)
     cmd->sp_expect = sp.next_expect;
     sp.next_expect = NULL;
     sp_state_attach(cmd, h->id);
+    cmd->sp_t_read = sp_rx_now;
+    if (spacebox_video_record_on) {
+        /* the source's time on this clock as the lateness takes it (sp_rx_delay) */
+        int64_t base = MIN(sp_rx_min, sp_rx_min_prev);
+
+        cmd->sp_t_dev = h->t_us && base != INT64_MAX ? h->t_us + base : 0;
+        cmd->sp_t_rx = sp_rx_run;
+    }
 
     memcpy(&hdr, req, MIN((size_t)h->a_len, sizeof(hdr)));
     if (hdr.type == VIRTIO_GPU_CMD_RESOURCE_FLUSH) {
@@ -2978,6 +4221,14 @@ void sp_sink_send(uint32_t type, const void *a, size_t a_len,
  * Told to end (the control file): the source makes its planned switch while
  * this sink still answers, and says SP_BYE when it has what it needs.
  */
+void sp_video_pending_log(const char *at)
+{
+    if (sp.mode == SP_REMOTE_SINK) {
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink video pictures pending at %s: %u\n",
+                at, virgl_renderer_video_pending());
+    }
+}
+
 void sp_sink_detach(void)
 {
     if (!sp.peer_session) {
@@ -2985,6 +4236,7 @@ void sp_sink_detach(void)
         return;
     }
     sp_send(SP_DETACH, 0, NULL, 0, NULL, 0, 0, 0, 0);
+    sp_video_pending_log("the detach");
     fprintf(stderr, "[SPACEBOX-REMOTE] sink detach: SP_DETACH sent, running until "
             "the source says bye\n");
 }
@@ -3012,6 +4264,7 @@ void sp_sink_gpu(bool on)
                 "asked\n", on ? "on" : "off");
         return;
     }
+    sp_video_pending_log(on ? "the toggle on" : "the toggle off");
     sp_gpu.off = !on;
     sp_gpu.used = true;
     sp_gpu.refused = false;
@@ -3265,15 +4518,14 @@ static void sp_disconnected(void)
     if (fd < 0) {
         return;
     }
-    qemu_set_fd_handler(fd, NULL, NULL, NULL);
+    sp_video_pending_log("the connection's end");
+    sp_rx_stop();
     qemu_mutex_lock(&sp.tx_lock);
     sp.fd = -1;
     sp.hello_done = false;
     sp.tx_enabled = false;
     qemu_mutex_unlock(&sp.tx_lock);
     close(fd);
-    g_byte_array_set_size(sp.rx, 0);
-    g_byte_array_set_size(sp.rxw, 0);
 
     if (sp.bye) {
         /* A detached sink is not connected again: the source's state now
@@ -3317,8 +4569,13 @@ static void sp_hello(SpHdr *h)
     if (sp.hello_done) {
         return;
     }
+    if (sp.mode == SP_REMOTE_SINK) {
+        sp_video_pending_log("a source's hello");
+        sp_sink_pace_reset();
+    }
     qemu_mutex_lock(&sp.tx_lock);
     sp.z_on = sp.z_level && (h->flags & SP_F_ZSTD);
+    sp.peer_pieces = sp.mode == SP_REMOTE_SINK && (h->flags & SP_F_PIECES);
     qemu_mutex_unlock(&sp.tx_lock);
     if (sp.mode == SP_REMOTE_SINK) {
         sp.peer_scroll = h->flags & SP_F_SCROLL;
@@ -3337,6 +4594,8 @@ static void sp_hello(SpHdr *h)
         uint64_t had = sp.rx_id;
 
         sp.n_reconnect++;
+        /* what waits was the VM's that ran on */
+        sp_hold_drop("a source restored from a snapshot");
         sp_tx_forget();
         qemu_mutex_lock(&sp.tx_lock);
         sp.tx_id = h->arg2;
@@ -3366,6 +4625,7 @@ static void sp_hello(SpHdr *h)
         /* A source this renderer state does not belong to: start empty. */
         info_report("spacebox remote gpu: source attached%s",
                     spec_src ? "; it sends its spec" : "");
+        sp_hold_drop("a new source");
         sp_tx_forget();
         sp_sink_reset(sp.g);
         sp.peer_session = h->arg0;
@@ -3394,6 +4654,16 @@ static void sp_hello(SpHdr *h)
         /* Tell the new source what this renderer and display look like (a
          * source that sends its spec is told after the check, sp_sink_spec). */
         sp_sink_send_info(sp.g, true);
+        sp_send(SP_DISPLAY, 0, NULL, 0, NULL, 0, VIRTIO_GPU_EVENT_DISPLAY, 0, 0);
+    } else if (resume && sp.mode == SP_REMOTE_SINK) {
+        /*
+         * The display may have changed while the link was down (the window
+         * resized or moved to another display): the event was queued, but
+         * sp_sink_send_info() sends nothing without a link, so the source
+         * would answer the guest with the size it had before. Tell it the
+         * display as it is now, and the guest reads it again.
+         */
+        sp_sink_send_info(sp.g, false);
         sp_send(SP_DISPLAY, 0, NULL, 0, NULL, 0, VIRTIO_GPU_EVENT_DISPLAY, 0, 0);
     }
     sp_tx_start(resume ? h->arg2 : 0);
@@ -4050,12 +5320,17 @@ static void sp_dispatch(SpHdr *h, uint8_t *a, uint8_t *b)
 
 static void sp_stats(void *opaque)
 {
-    uint64_t wire_tx;
+    uint64_t wire_tx, wire_rx, rx_bytes;
 
     qemu_mutex_lock(&sp.tx_lock);
     wire_tx = sp.wire_tx;
     sp.wire_tx = 0;
     qemu_mutex_unlock(&sp.tx_lock);
+    qemu_mutex_lock(&sp.rx_lock);
+    wire_rx = sp.wire_rx;
+    rx_bytes = sp.rx_bytes;
+    sp.wire_rx = sp.rx_bytes = 0;
+    qemu_mutex_unlock(&sp.rx_lock);
     sp_flush_report(sp.mode == SP_REMOTE_SOURCE ? "source" : "sink");
     if (sp.mode == SP_REMOTE_SINK && !sp_late_timer &&
         getenv("SPACEBOX_GPU_REMOTE_DEBUG_LOOP")) {
@@ -4080,12 +5355,29 @@ static void sp_stats(void *opaque)
             sp.mode == SP_REMOTE_SOURCE ? "source" : "sink",
             sp_rxd.n, sp_rxd.over12, sp_rxd.over25, sp_rxd.over50, sp_rxd.max / 1000.0);
     memset(&sp_rxd, 0, sizeof(sp_rxd));
+    fprintf(stderr, "[SPACEBOX-REMOTE] %s messages run by the main loop=%u after their read by over 12 ms=%u over 25 ms=%u over 50 ms=%u longest_ms=%.1f\n",
+            sp.mode == SP_REMOTE_SOURCE ? "source" : "sink",
+            sp_rxq.n, sp_rxq.over12, sp_rxq.over25, sp_rxq.over50, sp_rxq.max / 1000.0);
+    memset(&sp_rxq, 0, sizeof(sp_rxq));
+    if (sp.mode == SP_REMOTE_SINK) {
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink answers sent=%u after the read of their command by over 12 ms=%u over 25 ms=%u over 50 ms=%u longest_ms=%.1f\n",
+                sp_ansd.n, sp_ansd.over12, sp_ansd.over25, sp_ansd.over50, sp_ansd.max / 1000.0);
+        memset(&sp_ansd, 0, sizeof(sp_ansd));
+    }
     if (sp.mode == SP_REMOTE_SINK) {
         fprintf(stderr, "[SPACEBOX-REMOTE] sink time running guest commands: total_ms=%.0f drawing_ms=%.0f (longest %.1f)"
                 " screen_update_ms=%.0f (longest %.1f) other longest %.1f\n",
                 sp_busy.total / 1000.0, sp_busy.submit / 1000.0, sp_busy.submit_max / 1000.0,
                 sp_busy.flush / 1000.0, sp_busy.flush_max / 1000.0, sp_busy.other_max / 1000.0);
         memset(&sp_busy, 0, sizeof(sp_busy));
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink pieces: writes announced=%" PRIu64
+                " complete=%" PRIu64 " bytes=%" PRIu64 " longest_ms=%.1f; commands that waited=%"
+                PRIu64 " ran past a write=%" PRIu64 " of them screen updates=%" PRIu64
+                " streams stopped=%" PRIu64 " dropped=%" PRIu64 " waiting now=%u\n",
+                sph.st.notices, sph.st.writes, sph.st.bytes, sph.st.write_max / 1000.0,
+                sph.st.waited, sph.st.passed, sph.st.flushes, sph.st.split,
+                sph.st.dropped, sph.n);
+        memset(&sph.st, 0, sizeof(sph.st));
     }
     if (sp.mode == SP_REMOTE_SOURCE && (sp_ach.sent || sp_ach.dropped)) {
         fprintf(stderr, "[SPACEBOX-REMOTE] source sound on its own connection: messages=%" PRIu64
@@ -4118,10 +5410,13 @@ static void sp_stats(void *opaque)
     if (sp.mode == SP_REMOTE_SINK) {
         fprintf(stderr, "[SPACEBOX-REMOTE] sink frame pacing: screen updates=%" PRIu64 " held for their time=%" PRIu64
                 " too late for it=%" PRIu64 " shown at once after input=%" PRIu64
-                " allowance_ms=%.1f usual_spacing_ms=%.1f\n",
+                " allowance_ms=%.1f usual_spacing_ms=%.1f writes_expected_lateness_ms=%.1f"
+                " guest_lead_ms=%.1f link_MBps=%.1f\n",
                 sp_pace.frames, sp_pace.paced, sp_pace.late_frames, sp_pace.unpaced_for_input,
-                sp_pace.allowance / 1000.0, sp_pace.usual_gap / 1000.0);
+                sp_pace.allowance / 1000.0, sp_pace.usual_gap / 1000.0,
+                sp_pace.expect_max / 1000.0, sp_pw.lead_used / 1000.0, sp_pw.rate_used / 1e6);
         sp_pace.frames = sp_pace.paced = sp_pace.late_frames = sp_pace.unpaced_for_input = 0;
+        sp_pace.expect_max = 0;
     }
     if (sp.mode == SP_REMOTE_SOURCE) {
         GHashTableIter it;
@@ -4192,11 +5487,11 @@ static void sp_stats(void *opaque)
             sp.mode == SP_REMOTE_SOURCE ? "source" : "sink",
             sp.n_ctrl, sp.n_submit, sp.submit_bytes, sp.n_xfer, sp.xfer_bytes,
             sp.n_mem, sp.mem_bytes, sp.n_back, sp.back_bytes,
-            sp.tx_bytes, sp.rx_bytes, sp_tx_backlog(), sp.tx_unacked,
-            sp.n_reconnect, wire_tx, sp.wire_rx, sp.z_on);
+            sp.tx_bytes, rx_bytes, sp_tx_backlog(), sp.tx_unacked,
+            sp.n_reconnect, wire_tx, wire_rx, sp.z_on);
     sp.n_ctrl = sp.n_submit = sp.submit_bytes = sp.n_xfer = sp.xfer_bytes = 0;
     sp.n_mem = sp.mem_bytes = sp.n_back = sp.back_bytes = 0;
-    sp.tx_bytes = sp.rx_bytes = sp.wire_rx = 0;
+    sp.tx_bytes = 0;
     timer_mod(sp.stats_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 5000);
 }
 
@@ -4206,11 +5501,13 @@ void sp_remote_realize(VirtIOGPU *g, Error **errp)
         return;
     }
     sp.g = g;
-    sp.rx = g_byte_array_new();
-    sp.rxw = g_byte_array_new();
-#ifdef SPACEBOX_ZSTD
-    sp.z_d = ZSTD_createDCtx();
-#endif
+    qemu_mutex_init(&sp.rx_lock);
+    qemu_cond_init(&sp.rx_cond);
+    if (event_notifier_init(&sp.rx_notify, false) < 0) {
+        error_setg(errp, "spacebox remote gpu: no notifier for the link's reader");
+        return;
+    }
+    qemu_set_fd_handler(event_notifier_get_fd(&sp.rx_notify), sp_rx, NULL, NULL);
     qemu_mutex_init(&sp.tx_lock);
     qemu_cond_init(&sp.tx_cond);
     g_queue_init(&sp.tx_queue);
@@ -4259,6 +5556,7 @@ void sp_remote_realize(VirtIOGPU *g, Error **errp)
         qemu_set_fd_handler(sp.listen_fd, sp_sink_accept, NULL, NULL);
         sp_ach_sink_listen();
         sp_state_realize(g);
+        sp_record_realize();
         sp.input = qemu_input_handler_register(DEVICE(g), &sp_input_handler);
         qemu_input_handler_activate(sp.input);
         aio_bh_schedule_oneshot(qemu_get_aio_context(),

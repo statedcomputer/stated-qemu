@@ -151,6 +151,10 @@ struct virtio_gpu_ctrl_command {
     void *sp_wmark;     /* SP_WMARK before it: the resources it may write */
     void *sp_op;        /* not a guest command: a step of the sink's own, in
                            order with the commands (virtio-gpu-remote-state.c) */
+    int64_t sp_t_dev;   /* the record of video pictures: the source's time of the
+                           message on this clock, 0 = not known ... */
+    int64_t sp_t_read;  /* ... when this sink's reader read it off the link ... */
+    int64_t sp_t_rx;    /* ... and when its main loop ran it (virtio-gpu-remote-record.c) */
     QTAILQ_ENTRY(virtio_gpu_ctrl_command) next;
 };
 
@@ -172,6 +176,9 @@ static inline void virtio_gpu_ctrl_command_sp_clear(
     cmd->sp_id = 0;
     cmd->sp_wmark = NULL;
     cmd->sp_op = NULL;
+    cmd->sp_t_dev = 0;
+    cmd->sp_t_read = 0;
+    cmd->sp_t_rx = 0;
 }
 
 struct VirtIOGPUBase {
@@ -447,6 +454,8 @@ void sp_sink_notify_event(uint32_t event_type);
 void sp_sink_after_submit(struct virtio_gpu_ctrl_command *cmd);
 void sp_sink_poll_watches(void);
 bool sp_sink_before_cmd(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd);
+/* the record of video frames: around the display's update of a flush */
+void sp_record_flush(uint32_t resource_id, bool begin);
 void virtio_gpu_sp_update_cursor(VirtIOGPU *g,
                                  struct virtio_gpu_update_cursor *cursor);
 void virtio_gpu_sp_cursor_pixels(VirtIOGPU *g,

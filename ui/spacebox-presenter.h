@@ -4,11 +4,16 @@
 #ifdef CONFIG_DARWIN
 #include <CoreVideo/CoreVideo.h>
 #include <CoreGraphics/CoreGraphics.h>
+#include <mach/mach_time.h>
 #include <pthread/qos.h>
 #include "qemu/thread.h"
+#include "qemu/atomic.h"
+#include "ui/spacebox-video-record.h"
+#include "spacebox-frame-code.h"
 /* Frames kept ahead of the one on screen. Without pacing only a few are ever
- * in use (their textures are made on first use); with pacing up to about 12. */
-#define SP_SLOTS 16
+ * in use (their textures are made on first use); with pacing up to 24
+ * (hw/display/virtio-gpu-remote.c, sp_sink_pace_frame). */
+#define SP_SLOTS 32
 /* hw/display/virtio-gpu-remote.c: when to show the frame being submitted, 0 = at once */
 extern int64_t spacebox_frame_due_us;
 extern int64_t spacebox_frame_gap_us;
@@ -21,6 +26,14 @@ typedef struct SpSlot {
     int64_t submitted;
     int64_t due;    /* show no earlier than this, 0 = at once */
     int64_t gap;    /* usual spacing of the stream this frame belongs to, 0 = none */
+    /* the record of video frames: the tickets of the video pictures the frame
+     * shows, and the size of the picture it was made from (the scanout) */
+    uint64_t tickets[SP_REC_TICKETS];
+    unsigned ntickets;
+    int64_t flush_dev, flush_read;  /* its flush's message: sent, read */
+    int src_w, src_h;
+    int64_t show_due;   /* due, or the due of the frame it replaces (sp_pair_updates) */
+    bool superseded;    /* replaced by the next frame (sp_pair_updates) */
 } SpSlot;
 typedef struct SpPresenter {
     SDL_Window *window;
@@ -29,8 +42,14 @@ typedef struct SpPresenter {
     QemuMutex lock;
     QemuCond wake;
     CVDisplayLinkRef link;
+    CGDirectDisplayID display;  /* the display the link follows: the window's */
+    int64_t display_checked;
     bool stop;
-    uint64_t tick, sequence, presented, discarded, busy;
+    uint64_t tick, sequence, presented, discarded, busy, superseded;
+    int64_t shown_due;  /* the show_due of the frame on screen, 0 = none */
+    /* the last tick of the display link (host time, mach_absolute_time):
+     * the refresh it came at and the refresh it prepares for */
+    uint64_t tick_now_host, tick_out_host;
     SpSlot slots[SP_SLOTS];
 } SpPresenter;
 
@@ -41,9 +60,88 @@ static CVReturn sp_present_tick(CVDisplayLinkRef link, const CVTimeStamp *now,
     SpPresenter *p = opaque;
     qemu_mutex_lock(&p->lock);
     p->tick++;
+    p->tick_now_host = now->hostTime;
+    p->tick_out_host = out->hostTime;
     qemu_cond_signal(&p->wake);
     qemu_mutex_unlock(&p->lock);
     return kCVReturnSuccess;
+}
+
+/*
+ * The record of video frames: at which refresh of the display a swap is shown
+ * (t_show_us), from the display link's own times of the window's display. The
+ * link's tick before the swap gives the refresh it came at (vsync) and the
+ * one that what is made now will be shown at (out); a swap that starts k
+ * refreshes after that vsync is shown k refreshes after out. Its accuracy is
+ * measured against a capture of the screen (screen/README.md, "The refresh
+ * time of a swap"). 0 when the link has not ticked.
+ */
+static int64_t sp_present_host_us(uint64_t host)
+{
+    static mach_timebase_info_data_t tb;
+    static int64_t off;     /* g_get_monotonic_time() - the host time in us */
+    static int64_t off_at;
+    int64_t now = g_get_monotonic_time();
+
+    if (!tb.denom) {
+        mach_timebase_info(&tb);
+    }
+    if (!off_at || now - off_at > G_USEC_PER_SEC) {
+        /* both clocks read at once; again each second (one may count sleep) */
+        off = now - (int64_t)(mach_absolute_time() * tb.numer / tb.denom / 1000);
+        off_at = now;
+    }
+    return (int64_t)(host * tb.numer / tb.denom / 1000) + off;
+}
+
+static int64_t sp_present_show_time(uint64_t now_host, uint64_t out_host,
+                                    int64_t call, int64_t refresh_us,
+                                    int64_t *vsync, int64_t *out)
+{
+    int64_t k;
+
+    if (!now_host || !out_host || refresh_us <= 0) {
+        *vsync = *out = 0;
+        return 0;
+    }
+    *vsync = sp_present_host_us(now_host);
+    *out = sp_present_host_us(out_host);
+    k = call > *vsync ? (call - *vsync) / refresh_us : 0;
+    return *out + k * refresh_us;
+}
+
+/* The display link follows the display that shows the window (checked every
+ * two seconds, on the thread that submits frames, which may call SDL). */
+static void sp_present_follow_window(SpPresenter *p)
+{
+    int64_t now = g_get_monotonic_time();
+    int index = SDL_GetWindowDisplayIndex(p->window);
+    SDL_Rect b;
+    CGDirectDisplayID ids[16];
+    uint32_t n = 0;
+
+    if (now - p->display_checked < 2 * G_USEC_PER_SEC) {
+        return;
+    }
+    p->display_checked = now;
+    if (index < 0 || SDL_GetDisplayBounds(index, &b) ||
+        CGGetActiveDisplayList(16, ids, &n) != kCGErrorSuccess) {
+        return;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        CGRect r = CGDisplayBounds(ids[i]);
+
+        if ((int)r.origin.x == b.x && (int)r.origin.y == b.y &&
+            (int)r.size.width == b.w && (int)r.size.height == b.h) {
+            if (ids[i] != p->display &&
+                CVDisplayLinkSetCurrentCGDisplay(p->link, ids[i]) == kCVReturnSuccess) {
+                fprintf(stderr, "[SPACEBOX-PRESENT] the window is on display %u: "
+                        "the display link follows it\n", ids[i]);
+                p->display = ids[i];
+            }
+            return;
+        }
+    }
 }
 
 static bool sp_fence_done(GLsync fence)
@@ -51,6 +149,106 @@ static bool sp_fence_done(GLsync fence)
     if (!fence) return true;
     GLenum r = glClientWaitSync(fence, 0, 0);
     return r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED;
+}
+
+/*
+ * The record of video frames: the frame code in the frame about to be shown,
+ * at the top of the video's rectangle (the control's video-rect, in the
+ * scanout's pixels). The slot holds the scanout scaled to the window, bottom
+ * row first. Three rows across the central half of the cells' height are read
+ * back from the slot's texture (readfb); -1 when there is no rectangle or it
+ * is not inside the frame.
+ */
+static int sp_present_code(SpSlot *s, bool *ok, int64_t *read_us)
+{
+    static uint8_t *buf;
+    static size_t buf_size;
+    const uint8_t *rows[3];
+    int x, y, w, h, code;
+    int64_t t0 = g_get_monotonic_time();
+
+    *ok = false;
+    *read_us = -1;
+    if (!spacebox_video_rect(&x, &y, &w, &h) || !s->src_w || !s->src_h) {
+        return -1;
+    }
+    double sx = (double)s->fb.width / s->src_w, sy = (double)s->fb.height / s->src_h;
+    int left = (int)(x * sx), width = (int)(w * sx);
+    double cell = w / (double)SP_CODE_CELLS;    /* in the scanout's pixels */
+
+    if (width < SP_CODE_CELLS || left < 0 || left + width > s->fb.width ||
+        (y + cell) * sy > s->fb.height) {
+        return -1;
+    }
+    if (buf_size < (size_t)width * 4 * 3) {
+        buf_size = (size_t)width * 4 * 3;
+        buf = g_realloc(buf, buf_size);
+    }
+    for (int k = 0; k < 3; k++) {
+        int row = (int)((y + cell * (3 + k) / 8) * sy);
+
+        rows[k] = buf + (size_t)k * width * 4;
+        glReadPixels(left, s->fb.height - 1 - row, width, 1, GL_RGBA,
+                     GL_UNSIGNED_BYTE, (void *)rows[k]);
+    }
+    code = spacebox_frame_code_read(rows, 3, width, ok);
+    *read_us = g_get_monotonic_time() - t0;
+    return code;
+}
+
+/*
+ * Two paced frames of a stream one refresh apart, where the frame after them
+ * comes within the stream's usual spacing (and half a refresh) of the first,
+ * are a frame of the stream and an update of the page's other drawing (an
+ * animation of the page that plays the video, in its own rhythm), in either
+ * order, the first of them on time (within the spacing of the frame before
+ * it). The later one replaces the earlier one at the earlier one's time: it
+ * was drawn later, so it shows the newer video frame and everything else.
+ * Shown as two frames, the update took the place of a frame of the stream in
+ * the spacing below and held the next video frame back by a refresh: 25 ms
+ * where 16.7 ms was due, 2 to 4% of a real YouTube video's frames at 60/s
+ * (the video task, turn G4c). A frame that the guest sent a refresh early,
+ * with the next one two spacings after the first, is not replaced (the
+ * spacing below holds it), nor is a late one that the next ones follow a
+ * refresh apart to catch up (each of them is a video frame). Sets show_due
+ * and superseded of the ready slots.
+ */
+static void sp_pair_updates(SpPresenter *p, int64_t refresh_us)
+{
+    SpSlot *ord[SP_SLOTS];
+    int n = 0;
+
+    for (int i = 0; i < SP_SLOTS; i++) {
+        SpSlot *s = &p->slots[i];
+
+        if (s->state != SP_READY) {
+            continue;
+        }
+        s->show_due = s->due;
+        s->superseded = false;
+        int k = n++;
+        while (k > 0 && ord[k - 1]->sequence > s->sequence) {
+            ord[k] = ord[k - 1];
+            k--;
+        }
+        ord[k] = s;
+    }
+    int64_t prev = p->shown_due;    /* the frame before the next one */
+
+    for (int i = 0; i < n; i++) {
+        SpSlot *f = ord[i], *g = i + 1 < n ? ord[i + 1] : NULL, *h = i + 2 < n ? ord[i + 2] : NULL;
+
+        if (h && f->due && f->gap && g->due && g->gap && h->due &&
+            (!prev || f->due - prev < f->gap + refresh_us / 2) &&
+            g->due > f->due && g->due - f->due < f->gap - refresh_us / 2 &&
+            h->due - f->due < f->gap + refresh_us / 2) {
+            f->superseded = true;
+            g->show_due = f->show_due;
+            i++;    /* the frame that replaced one does not pair again */
+            f = g;
+        }
+        prev = f->show_due;
+    }
 }
 
 static bool sp_has_ready(SpPresenter *p)
@@ -62,7 +260,7 @@ static bool sp_has_ready(SpPresenter *p)
 static void *sp_present_thread(void *opaque)
 {
     SpPresenter *p = opaque;
-    uint64_t seen = 0;
+    uint64_t seen = 0, record_discarded = 0;
     int shown = -1;
     GLuint readfb;
     int64_t last_stats = 0, last_control = 0;
@@ -120,10 +318,11 @@ static void *sp_present_thread(void *opaque)
         int pick = -1, oldest = -1, newest = -1, n_due = 0;
         bool stream = true;
         int64_t pick_now = g_get_monotonic_time(), next_due = 0;
+        sp_pair_updates(p, refresh_us);
         for (int i = 0; i < SP_SLOTS; i++) {
             SpSlot *s = &p->slots[i];
-            if (s->state != SP_READY || !sp_fence_done(s->ready)) continue;
-            int64_t due = s->due ? s->due + phase_adj : 0;
+            if (s->state != SP_READY || s->superseded || !sp_fence_done(s->ready)) continue;
+            int64_t due = s->show_due ? s->show_due + phase_adj : 0;
             if (due > pick_now) {
                 if (!next_due || due < next_due) next_due = due;
                 continue;
@@ -165,17 +364,19 @@ static void *sp_present_thread(void *opaque)
             }
             qemu_mutex_unlock(&p->lock); continue;
         }
-        int64_t pick_due = p->slots[pick].due ? p->slots[pick].due + phase_adj : 0;
+        int64_t pick_due = p->slots[pick].show_due ? p->slots[pick].show_due + phase_adj : 0;
         bool pick_waited = waited_for_due && pick_due;
         waited_for_due = false;
         SpSlot *s = &p->slots[pick];
         s->state = SP_READING;
+        p->shown_due = s->show_due;
         if (s->ready) { glDeleteSync(s->ready); s->ready = NULL; }
         for (int i = 0; i < SP_SLOTS; i++) {
             if (i != pick && p->slots[i].state == SP_READY &&
                 p->slots[i].sequence < s->sequence) {
                 p->slots[i].state = SP_FREE;
                 p->discarded++;
+                p->superseded += p->slots[i].superseded;
             }
         }
         qemu_mutex_unlock(&p->lock);
@@ -184,6 +385,9 @@ static void *sp_present_thread(void *opaque)
         glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                GL_TEXTURE_2D, s->fb.texture, 0);
         glReadBuffer(GL_COLOR_ATTACHMENT0);
+        bool recording = qatomic_read(&spacebox_video_record_on), code_ok = false;
+        int64_t code_us = -1;
+        int code = recording ? sp_present_code(s, &code_ok, &code_us) : -1;
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         glDrawBuffer(GL_BACK);
         glViewport(0, 0, s->fb.width, s->fb.height);
@@ -198,7 +402,20 @@ static void *sp_present_thread(void *opaque)
             glBindFramebuffer(GL_READ_FRAMEBUFFER, readfb);
             glReadPixels(s->fb.width / 2, s->fb.height / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, probe_px);
         }
+        int64_t swap_call = g_get_monotonic_time(), vsync_us = 0, out_us = 0, show_us = 0;
+        uint64_t now_host = 0, out_host = 0;
+        if (recording) {
+            qemu_mutex_lock(&p->lock);
+            now_host = p->tick_now_host;
+            out_host = p->tick_out_host;
+            qemu_mutex_unlock(&p->lock);
+        }
         spacebox_swap(p->window, s->fb.width, s->fb.height);
+        int64_t swapped = g_get_monotonic_time();
+        if (recording) {
+            show_us = sp_present_show_time(now_host, out_host, swap_call, refresh_us,
+                                           &vsync_us, &out_us);
+        }
         if (probe) {
             fprintf(probe, "%lld %u %u %u\n", (long long)g_get_monotonic_time(), probe_px[0], probe_px[1], probe_px[2]);
         }
@@ -234,22 +451,42 @@ static void *sp_present_thread(void *opaque)
         s->consumed = consumed;
         s->state = SP_DISPLAYED;
         p->presented++;
+        uint64_t presented = p->presented, coalesced = p->discarded - record_discarded;
+        record_discarded = p->discarded;
         int64_t now = g_get_monotonic_time();
         if (stats_us && now - last_stats > stats_us) {
             fprintf(stderr, "[SPACEBOX-PRESENT-STATS] us=%lld submitted=%llu presented=%llu coalesced=%llu busy=%llu"
-                    " refresh_us=%lld held1=%llu held2=%llu held3=%llu held4=%llu held5=%llu held6plus=%llu held_max_ms=%.1f\n",
+                    " refresh_us=%lld held1=%llu held2=%llu held3=%llu held4=%llu held5=%llu held6plus=%llu held_max_ms=%.1f"
+                    " superseded=%llu\n",
                     (long long)now, (unsigned long long)p->sequence,
                     (unsigned long long)p->presented, (unsigned long long)p->discarded,
                     (unsigned long long)p->busy, (long long)refresh_us,
                     (unsigned long long)held[1], (unsigned long long)held[2],
                     (unsigned long long)held[3], (unsigned long long)held[4],
                     (unsigned long long)held[5], (unsigned long long)held[6],
-                    held_max / 1000.0);
+                    held_max / 1000.0, (unsigned long long)p->superseded);
             memset(held, 0, sizeof(held));
             held_max = 0;
             last_stats = now;
         }
         qemu_mutex_unlock(&p->lock);
+        if (recording) {
+            spacebox_video_record_swap(presented, swapped, code, code_ok, s->tickets,
+                                       s->ntickets, coalesced, code_us, show_us,
+                                       swap_call, vsync_us, out_us, pick_due,
+                                       s->flush_dev, s->flush_read);
+        }
+        int pause_ms = qatomic_xchg(&spacebox_present_pause_ms, 0);
+        if (pause_ms) {
+            /* the test pause (pause-present): nothing is shown for pause_ms */
+            int64_t until = swapped + (int64_t)pause_ms * 1000, t;
+            qemu_mutex_lock(&p->lock);
+            while (!p->stop && (t = g_get_monotonic_time()) < until) {
+                qemu_cond_timedwait(&p->wake, &p->lock, (int)MAX((until - t) / 1000, 1));
+            }
+            qemu_mutex_unlock(&p->lock);
+            spacebox_video_record_paused(pause_ms, swapped, g_get_monotonic_time());
+        }
     }
     glFinish();
     glDeleteFramebuffers(1, &readfb);
@@ -283,6 +520,8 @@ void sdl2_gl_present_init(struct sdl2_console *scon)
         return;
     }
     scon->presenter = p;
+    p->display = CGMainDisplayID();
+    sp_present_follow_window(p);
     CVDisplayLinkSetOutputCallback(p->link, sp_present_tick, p);
     qemu_thread_create(&p->thread, "sp-present", sp_present_thread, p, QEMU_THREAD_JOINABLE);
     CVDisplayLinkStart(p->link);
@@ -317,17 +556,27 @@ static SpSlot *sp_present_acquire(struct sdl2_console *scon, int w, int h)
     return pick;
 }
 
-static void sp_present_submit(struct sdl2_console *scon, SpSlot *s)
+/* src_w x src_h: the size of the picture the frame was made from */
+static void sp_present_submit(struct sdl2_console *scon, SpSlot *s, int src_w, int src_h)
 {
     SpPresenter *p = scon->presenter;
     GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     glFlush();
+    sp_present_follow_window(p);
+    s->ntickets = MIN(spacebox_frame_ntickets, SP_REC_TICKETS);
+    memcpy(s->tickets, spacebox_frame_tickets, s->ntickets * sizeof(s->tickets[0]));
+    spacebox_frame_ntickets = 0;
+    s->flush_dev = spacebox_frame_flush_dev;
+    s->flush_read = spacebox_frame_flush_read;
+    s->src_w = src_w;
+    s->src_h = src_h;
     qemu_mutex_lock(&p->lock);
     s->ready = fence;
     s->sequence = ++p->sequence;
     s->submitted = g_get_monotonic_time();
     s->due = spacebox_frame_due_us;
     s->gap = spacebox_frame_gap_us;
+    s->superseded = false;
     spacebox_frame_due_us = 0;
     spacebox_frame_gap_us = 0;
     s->state = SP_READY;

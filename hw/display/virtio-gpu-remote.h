@@ -48,6 +48,15 @@ enum {
                             renderer's count of its pictures */
     SP_GPU_STATE = 32,   /* source -> sink: what the toggle made. arg0 1 on, 0
                             off; arg1 1: it could not be turned off */
+    SP_HOLD = 33,        /* source -> sink: the notice of the next command, what
+                            it touches; with pieces (arg0 1) the command and its
+                            memory writes come as a write in SP_PIECEs. See
+                            "Large writes in pieces" in virtio-gpu-remote.c */
+    SP_PIECE = 34,       /* source -> sink: a piece of such a write; arg0 its
+                            notice's id, arg1 the offset of a in it */
+    SP_RXB = 35,         /* sink -> source, not resent: arg0 the bytes read
+                            on this connection after the source's HELLO, as on
+                            the wire (the source paces its pieces by it) */
 };
 
 #define SP_XFER_MAX (16u << 20)
@@ -77,6 +86,14 @@ void sp_sink_send_once(uint32_t type, const void *a, size_t a_len,
                        uint64_t arg0, uint64_t arg1, uint64_t arg2);
 size_t sp_sink_backlog(void);
 void sp_sink_gpu(bool on);
+/* the sink's log: the video pictures that a decoder's thread has not yet
+ * handed over, at a transition (at: what happens) */
+void sp_video_pending_log(const char *at);
+
+/* virtio-gpu-remote-record.c: the record of video frames */
+void sp_record_realize(void);
+bool sp_record_control(const char *text);
+void sp_record_cmd(struct virtio_gpu_ctrl_command *cmd);
 
 /* called by ui/sdl2.c, which declares them itself */
 void spacebox_gpu_toggle(void);
@@ -99,5 +116,13 @@ void sp_state_attach(struct virtio_gpu_ctrl_command *cmd, uint64_t id);
 void sp_state_queue(VirtIOGPU *g, uint32_t type, uint64_t id, uint64_t arg0,
                     const void *a, size_t a_len, const void *b, size_t b_len);
 void sp_state_ctrl_seen(void);
+
+/* virtio-gpu-remote.c: a command stream of the source, run before QEMU's virgl
+ * code takes its command (which then submits nothing of it); true if the
+ * renderer stopped it before a command that touches what waiting commands
+ * hold: its rest waits, and the command is done with no answer */
+bool sp_sink_submit_held(struct virtio_gpu_ctrl_command *cmd);
+/* the control's "hold-log on|off": a line for each write in pieces when it runs */
+void sp_sink_hold_log(bool on);
 
 #endif

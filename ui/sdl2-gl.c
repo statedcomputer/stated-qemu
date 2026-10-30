@@ -67,7 +67,8 @@ static void sdl2_gl_render_surface(struct sdl2_console *scon)
         surface_gl_setup_viewport(scon->gls, scon->surface, ww, wh);
         glBindTexture(GL_TEXTURE_2D, scon->surface->texture);
         surface_gl_render_texture(scon->gls, scon->surface);
-        sp_present_submit(scon, slot);
+        sp_present_submit(scon, slot, surface_width(scon->surface),
+                          surface_height(scon->surface));
         return;
     }
 #endif
@@ -265,7 +266,7 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
         SpSlot *slot = sp_present_acquire(scon, ww, wh);
         if (!slot) return;
         egl_fb_blit(&slot->fb, &scon->guest_fb, !scon->y0_top);
-        sp_present_submit(scon, slot);
+        sp_present_submit(scon, slot, scon->guest_fb.width, scon->guest_fb.height);
         return;
     }
 #endif

@@ -29,6 +29,8 @@ tests = {
   'test-mul64': [],
   # all code tested by test-int128 is inside int128.h
   'test-int128': [],
+  # all code tested by test-spacebox-frame-code is inside ui/spacebox-frame-code.h
+  'test-spacebox-frame-code': [],
   'rcutorture': [],
   'test-rcu-list': [],
   'test-rcu-simpleq': [],

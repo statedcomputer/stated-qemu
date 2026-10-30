@@ -480,11 +480,18 @@ static void virgl_cmd_resource_flush(VirtIOGPU *g,
     trace_virtio_gpu_cmd_res_flush(rf.resource_id,
                                    rf.r.width, rf.r.height, rf.r.x, rf.r.y);
 
+    if (cmd->sp_remote) {
+        /* the tickets of the video pictures it shows go with the frame */
+        sp_record_flush(rf.resource_id, true);
+    }
     for (i = 0; i < g->parent_obj.conf.max_outputs; i++) {
         if (g->parent_obj.scanout[i].resource_id != rf.resource_id) {
             continue;
         }
         virtio_gpu_rect_update(g, i, rf.r.x, rf.r.y, rf.r.width, rf.r.height);
+    }
+    if (cmd->sp_remote) {
+        sp_record_flush(rf.resource_id, false);
     }
 }
 

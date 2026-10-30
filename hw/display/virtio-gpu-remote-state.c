@@ -33,7 +33,13 @@
  *                                           the sink's main loop held, before it
  *                                           runs: a renderer that stalls), "gpu
  *                                           off", "gpu on" (the user's toggle, as
- *                                           its hotkey Ctrl+Alt+A).
+ *                                           its hotkey Ctrl+Alt+A), "hold-log
+ *                                           on|off" (a line for each write in
+ *                                           pieces, virtio-gpu-remote.c); the record
+ *                                           of video frames' "video-rect",
+ *                                           "video-size", "pause-present",
+ *                                           "record-start", "record-stop"
+ *                                           (virtio-gpu-remote-record.c).
  */
 
 #include "qemu/osdep.h"
@@ -2236,6 +2242,7 @@ static void sp_state_reset(VirtIOGPU *g, uint64_t n)
     int64_t t0 = g_get_monotonic_time();
     GList *l;
 
+    sp_video_pending_log("the state's reset");
     /* contexts first: their sub-contexts, objects and attachments go with them */
     for (l = ctxs; l; l = l->next) {
         virgl_renderer_context_destroy(GPOINTER_TO_UINT(l->data));
@@ -2487,6 +2494,8 @@ static void sp_state_export(VirtIOGPU *g, SpOp *op)
     unsigned asked = 0, done = 0, i;
     int64_t t0 = g_get_monotonic_time();
     uint64_t req = op->arg0;
+
+    sp_video_pending_log("the export");
     size_t k;
 
     if (sps.export_stall_ms) {
@@ -2572,6 +2581,7 @@ bool sp_sink_before_cmd(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
     GByteArray *wm = cmd->sp_wmark;
     SpOp *op = cmd->sp_op;
 
+    sp_record_cmd(cmd);
     cmd->sp_wmark = NULL;
     if (sps.ctx0_dirty && (!op || op->type != SP_IMPORT)) {
         /* the imports complete before what comes after them reads them */
@@ -2584,6 +2594,11 @@ bool sp_sink_before_cmd(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
         sp_state_written(wm);
         if (wm) {
             g_byte_array_unref(wm);
+        }
+        if (sp_sink_submit_held(cmd)) {
+            /* the renderer stopped its command stream: the rest waits and answers */
+            cmd->finished = true;
+            return true;
         }
         return false;
     }
@@ -2639,10 +2654,15 @@ static void sp_control_tick(void *opaque)
     } else if (!strcmp(text, "gpu off") || !strcmp(text, "gpu on")) {
         /* the user's toggle, as the hotkey (virtio-gpu-remote.c) */
         sp_sink_gpu(!strcmp(text, "gpu on"));
+    } else if (!strcmp(text, "hold-log on") || !strcmp(text, "hold-log off")) {
+        /* a line for each write in pieces (virtio-gpu-remote.c) */
+        sp_sink_hold_log(!strcmp(text, "hold-log on"));
     } else if (!strncmp(text, "stall-export ", 13)) {
         sps.export_stall_ms = MIN(strtoul(text + 13, NULL, 10), 60000);
         fprintf(stderr, "[SPACEBOX-REMOTE] sink control: the next export "
                 "stalls %u ms\n", sps.export_stall_ms);
+    } else if (sp_record_control(text)) {
+        /* the record of video frames (virtio-gpu-remote-record.c) */
     } else {
         fprintf(stderr, "[SPACEBOX-REMOTE] sink control: unknown command\n");
     }

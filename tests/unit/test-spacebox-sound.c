@@ -164,6 +164,59 @@ static void test_a_real_surplus_is_worked_off(void)
     g_assert_cmpuint(s.starved_while_playing, <=, 30);
 }
 
+/* a ramp through the ring, read at another rate over requests that wrap around it: the same ramp, with no step */
+static void test_the_device_at_another_rate(void)
+{
+    enum { RING = 4096, CH = 2, REQ = 512 };
+    static float ring[RING * CH], out[REQ * CH];
+    double step = 44100.0 / 48000, phase = 0;
+    size_t start = 3000, total = 0;
+    float last = -1;
+
+    /* each frame is its own number in the ramp, written again as the reading goes round */
+    for (int request = 0; request < 2000; request++) {
+        size_t used;
+
+        for (size_t i = 0; i < spacebox_sound_need(REQ, step); i++) {
+            size_t at = (start + i) % RING;
+
+            ring[at * CH] = (float)(total + i);
+            ring[at * CH + 1] = -(float)(total + i);
+        }
+        used = spacebox_sound_resample(ring, RING, start, CH, out, REQ, step, &phase);
+        g_assert_cmpuint(used, <=, spacebox_sound_need(REQ, step) - 1);
+        for (int i = 0; i < REQ; i++) {
+            if (last >= 0) {
+                /* (a float holds these numbers to about 0.06) */
+                g_assert_cmpfloat_with_epsilon(out[i * CH] - last, (float)step, 0.2);
+            }
+            g_assert_cmpfloat(out[i * CH + 1], ==, -out[i * CH]);
+            last = out[i * CH];
+        }
+        start = (start + used) % RING;
+        total += used;
+    }
+    /* in the time of 2000 requests the device takes the frames of the voice's rate */
+    g_assert_cmpfloat_with_epsilon((double)total, 2000.0 * REQ * step, 2.0);
+}
+
+/* 44.1 kHz from a voice of 48 kHz as well */
+static void test_the_device_slower_than_the_voice(void)
+{
+    enum { RING = 4096, REQ = 512 };
+    static float ring[RING], out[REQ];
+    double step = 48000.0 / 44100, phase = 0;
+    size_t used;
+
+    for (int i = 0; i < RING; i++) {
+        ring[i] = i;
+    }
+    used = spacebox_sound_resample(ring, RING, 100, 1, out, REQ, step, &phase);
+    g_assert_cmpuint(used, ==, (size_t)(REQ * step));
+    g_assert_cmpfloat(phase, <, 1.0);
+    g_assert_cmpfloat_with_epsilon(out[REQ - 1], 100 + (REQ - 1) * step, 0.01);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -171,5 +224,7 @@ int main(int argc, char **argv)
     g_test_add_func("/spacebox-sound/no-surplus-at-the-largest-lead", test_no_surplus_at_the_largest_lead);
     g_test_add_func("/spacebox-sound/no-surplus-at-the-default-lead", test_no_surplus_at_the_default_lead);
     g_test_add_func("/spacebox-sound/a-real-surplus-is-worked-off", test_a_real_surplus_is_worked_off);
+    g_test_add_func("/spacebox-sound/the-device-at-another-rate", test_the_device_at_another_rate);
+    g_test_add_func("/spacebox-sound/the-device-slower-than-the-voice", test_the_device_slower_than_the_voice);
     return g_test_run();
 }

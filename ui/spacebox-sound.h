@@ -32,4 +32,37 @@ static inline bool spacebox_sound_fast(bool fast, int64_t held_avg_us, int64_t t
     return fast;
 }
 
+/*
+ * The device's rate can differ from the rate of the sound (another program or a new display set it): out_frames frames
+ * for the device from a ring of interleaved float frames, read from `start` with a step of step input frames for each
+ * output frame, by a straight line between two frames. *phase keeps the position between two input frames for the next
+ * request. Returns the input frames that are done with; it reads one frame beyond them, so the ring must hold
+ * spacebox_sound_need() of them.
+ */
+static inline size_t spacebox_sound_need(size_t out_frames, double step)
+{
+    return (size_t)(out_frames * step) + 2;
+}
+
+static inline size_t spacebox_sound_resample(const float *ring, size_t ring_frames, size_t start, int channels,
+                                             float *out, size_t out_frames, double step, double *phase)
+{
+    double pos = *phase;
+    size_t used;
+
+    for (size_t i = 0; i < out_frames; i++) {
+        size_t whole = (size_t)pos;
+        size_t a = (start + whole) % ring_frames, b = (a + 1) % ring_frames;
+        float f = (float)(pos - whole);
+
+        for (int c = 0; c < channels; c++) {
+            out[i * channels + c] = ring[a * channels + c] * (1 - f) + ring[b * channels + c] * f;
+        }
+        pos += step;
+    }
+    used = (size_t)pos;
+    *phase = pos - used;
+    return used;
+}
+
 #endif

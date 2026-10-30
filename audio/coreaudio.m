@@ -29,6 +29,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "audio.h"
+#include "ui/spacebox-sound.h"
 
 #define AUDIO_CAP "coreaudio"
 #include "audio_int.h"
@@ -42,6 +43,8 @@ typedef struct coreaudioVoiceOut {
     UInt32 audioDevicePropertyBufferFrameSize;
     AudioDeviceIOProcID ioprocid;
     bool enabled;
+    uint32_t device_freq;       /* Spacebox: the device's own rate now, 0 unknown */
+    double phase;               /* Spacebox: between two frames, when the rates differ */
 } coreaudioVoiceOut;
 
 static const AudioObjectPropertyAddress voice_addr = {
@@ -61,6 +64,12 @@ static OSStatus coreaudio_get_voice(AudioDeviceID *id)
                                       &size,
                                       id);
 }
+
+static const AudioObjectPropertyAddress rate_addr = {
+    kAudioDevicePropertyNominalSampleRate,
+    kAudioObjectPropertyScopeGlobal,
+    kAudioObjectPropertyElementMain
+};
 
 static OSStatus coreaudio_get_framesizerange(AudioDeviceID id,
                                              AudioValueRange *framerange)
@@ -341,7 +350,8 @@ static OSStatus audioDeviceIOProc(
     const AudioTimeStamp *inOutputTime,
     void *hwptr)
 {
-    UInt32 frameCount, pending_frames;
+    UInt32 frameCount, pending_frames, device_freq, need;
+    double step;
     void *out = outOutputData->mBuffers[0].mData;
     HWVoiceOut *hw = hwptr;
     coreaudioVoiceOut *core = (coreaudioVoiceOut *) hwptr;
@@ -360,17 +370,23 @@ static OSStatus audioDeviceIOProc(
     frameCount = core->audioDevicePropertyBufferFrameSize;
     pending_frames = hw->pending_emul / hw->info.bytes_per_frame;
     spacebox_ca.frames = frameCount;
-    if (hw->info.freq) {
-        qatomic_set(&spacebox_ca.request_us,
-                    (uint32_t)((uint64_t)frameCount * 1000000 / hw->info.freq));
+    device_freq = qatomic_read(&core->device_freq);
+    if (!device_freq) {
+        device_freq = hw->info.freq;
     }
+    if (device_freq) {
+        qatomic_set(&spacebox_ca.request_us,
+                    (uint32_t)((uint64_t)frameCount * 1000000 / device_freq));
+    }
+    step = (double)hw->info.freq / device_freq;
+    need = device_freq == hw->info.freq ? frameCount : spacebox_sound_need(frameCount, step);
     qatomic_inc(&spacebox_ca.requests);
     if (pending_frames < qatomic_read(&spacebox_ca.least_waiting)) {
         qatomic_set(&spacebox_ca.least_waiting, pending_frames);
     }
 
     /* if there are not enough samples, set signal and return */
-    if (pending_frames < frameCount) {
+    if (pending_frames < need) {
         qatomic_inc(&spacebox_ca.starved);
         qatomic_inc(&spacebox_ca.starved_total);
         inInputTime = 0;
@@ -378,7 +394,21 @@ static OSStatus audioDeviceIOProc(
         return 0;
     }
 
-    len = frameCount * hw->info.bytes_per_frame;
+    if (device_freq != hw->info.freq) {
+        /* the device runs at another rate than the voice: it is followed here,
+         * where the frames leave, so that the rest of the sink sees one rate */
+        size_t start = audio_ring_posb(hw->pos_emul, hw->pending_emul, hw->size_emul);
+        size_t used = spacebox_sound_resample((float *)hw->buf_emul,
+                                              hw->size_emul / hw->info.bytes_per_frame,
+                                              start / hw->info.bytes_per_frame,
+                                              hw->info.nchannels, out, frameCount,
+                                              step, &core->phase);
+
+        hw->pending_emul -= used * hw->info.bytes_per_frame;
+        len = 0;
+    } else {
+        len = frameCount * hw->info.bytes_per_frame;
+    }
     while (len) {
         size_t write_len, start;
 
@@ -417,6 +447,34 @@ static OSStatus audioDeviceIOProc(
         }
     }
     coreaudio_buf_unlock (core, "audioDeviceIOProc");
+    return 0;
+}
+
+/* Spacebox: the device's rate, 0 unknown */
+static uint32_t coreaudio_get_rate(AudioDeviceID id)
+{
+    Float64 rate = 0;
+    UInt32 size = sizeof(rate);
+
+    if (AudioObjectGetPropertyData(id, &rate_addr, 0, NULL, &size, &rate) != kAudioHardwareNoError) {
+        return 0;
+    }
+    return (uint32_t)rate;
+}
+
+/*
+ * Spacebox: a device's rate changes while it plays, by another program or the
+ * person. Called without BQL, and not on the thread of audioDeviceIOProc.
+ */
+static OSStatus handle_rate_change(
+    AudioObjectID in_object_id,
+    UInt32 in_number_addresses,
+    const AudioObjectPropertyAddress *in_addresses,
+    void *in_client_data)
+{
+    coreaudioVoiceOut *core = in_client_data;
+
+    qatomic_set(&core->device_freq, coreaudio_get_rate(in_object_id));
     return 0;
 }
 
@@ -502,10 +560,10 @@ static OSStatus init_out_device(coreaudioVoiceOut *core)
         return 0;
     }
     if (status != kAudioHardwareNoError) {
+        /* Spacebox: the device keeps its own rate, and audioDeviceIOProc follows it */
         coreaudio_playback_logerr (status,
                                    "Could not set samplerate %lf\n",
                                    streamBasicDescription.mSampleRate);
-        return status;
     }
 
     /*
@@ -532,6 +590,12 @@ static OSStatus init_out_device(coreaudioVoiceOut *core)
     }
 
     core->outputDeviceID = deviceID;
+    core->device_freq = coreaudio_get_rate(deviceID);
+    core->phase = 0;
+    status = AudioObjectAddPropertyListener(deviceID, &rate_addr, handle_rate_change, core);
+    if (status != kAudioHardwareNoError) {
+        coreaudio_logerr(status, "Could not listen for the device's rate\n");
+    }
     core->audioDevicePropertyBufferFrameSize = audioDevicePropertyBufferFrameSize;
     core->hw.samples = core->bufferCount * core->audioDevicePropertyBufferFrameSize;
     audio_generic_initialize_buffer_out(&core->hw);
@@ -560,6 +624,8 @@ static void fini_out_device(coreaudioVoiceOut *core)
             }
         }
     }
+
+    AudioObjectRemovePropertyListener(core->outputDeviceID, &rate_addr, handle_rate_change, core);
 
     /* remove callback */
     status = AudioDeviceDestroyIOProcID(core->outputDeviceID,

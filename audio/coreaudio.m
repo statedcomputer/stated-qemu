@@ -568,6 +568,14 @@ static OSStatus init_out_device(coreaudioVoiceOut *core)
         return status;
     }
 
+    /*
+     * Spacebox: the device keeps its rate. Other programs share it, a change
+     * stops it for about half a second, and audioDeviceIOProc follows it.
+     */
+    if (coreaudio_get_rate(deviceID)) {
+        streamBasicDescription.mSampleRate = coreaudio_get_rate(deviceID);
+    }
+
     /* set Samplerate */
     status = coreaudio_set_streamformat(deviceID, &streamBasicDescription);
     if (status == kAudioHardwareBadObjectError) {

@@ -59,6 +59,10 @@ typedef struct SpSlot {
 #endif
     int64_t show_due;   /* due, or the due of the frame it replaces (sp_pair_updates) */
     bool superseded;    /* replaced by the next frame (sp_pair_updates) */
+    /* the UI evals' faults (spacebox-ui-probe-gl.h): kept in its slot, never
+     * shown (hold-slot); not shown before this time (late-enqueue; 0 = none) */
+    bool probe_held;
+    int64_t probe_late;
 } SpSlot;
 typedef struct SpPresenter {
     SDL_Window *window;
@@ -469,6 +473,8 @@ static bool sp_fence_done(GLsync fence)
     return r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED;
 }
 
+#include "spacebox-ui-probe-gl.h"
+
 /*
  * The record of video frames: the frame code in the frame about to be shown,
  * at the top of the video's rectangle (the control's video-rect, in the
@@ -642,7 +648,7 @@ static void sp_pair_updates(SpPresenter *p, int64_t refresh_us)
     for (int i = 0; i < SP_SLOTS; i++) {
         SpSlot *s = &p->slots[i];
 
-        if (s->state != SP_READY) {
+        if (s->state != SP_READY || s->probe_held) {
             continue;
         }
         s->show_due = s->due;
@@ -674,7 +680,7 @@ static void sp_pair_updates(SpPresenter *p, int64_t refresh_us)
 
 static bool sp_has_ready(SpPresenter *p)
 {
-    for (int i = 0; i < SP_SLOTS; i++) if (p->slots[i].state == SP_READY) return true;
+    for (int i = 0; i < SP_SLOTS; i++) if (p->slots[i].state == SP_READY && !p->slots[i].probe_held) return true;
     return false;
 }
 
@@ -727,10 +733,26 @@ static void *sp_present_thread(void *opaque)
     glGenFramebuffers(1, &readfb);
     for (;;) {
         qemu_mutex_lock(&p->lock);
-        while (!p->stop && (native ? !sp_has_ready(p) : p->tick == seen)) qemu_cond_wait(&p->wake, &p->lock);
+        while (!p->stop && (native ? !sp_has_ready(p) : p->tick == seen)) {
+            if (!sp_probe_pending()) {
+                qemu_cond_wait(&p->wake, &p->lock);
+                continue;
+            }
+            /* the UI evals' probe: the readback of the last swap before an idle time is handed over now, not at
+             * the next swap (which may never come): every 2 ms while one waits */
+            qemu_mutex_unlock(&p->lock);
+            sp_probe_harvest(false);
+            qemu_mutex_lock(&p->lock);
+            if (sp_probe_pending()) {
+                qemu_cond_timedwait(&p->wake, &p->lock, 2);
+            }
+        }
         if (p->stop) { qemu_mutex_unlock(&p->lock); break; }
         seen = p->tick;
         qemu_mutex_unlock(&p->lock);
+        /* the UI evals' probe: readbacks done since, and a kept frame let go */
+        sp_probe_harvest(false);
+        sp_probe_release(p);
         int64_t check = g_get_monotonic_time();
         if (phase_file && check - last_control > 500000) {
             FILE *f = fopen(phase_file, "r");
@@ -756,6 +778,7 @@ static void *sp_present_thread(void *opaque)
         for (int i = 0; i < SP_SLOTS; i++) {
             SpSlot *s = &p->slots[i];
             if (s->state != SP_READY || s->superseded || !sp_fence_done(s->ready)) continue;
+            if (sp_probe_keeps(s, pick_now, &next_due)) continue;
 #ifdef CONFIG_WIN32
             if (!s->ready_at) s->ready_at = pick_now;
 #endif
@@ -872,7 +895,7 @@ static void *sp_present_thread(void *opaque)
         p->shown_due = s->show_due;
         if (s->ready) { glDeleteSync(s->ready); s->ready = NULL; }
         for (int i = 0; i < SP_SLOTS; i++) {
-            if (i != pick && p->slots[i].state == SP_READY &&
+            if (i != pick && p->slots[i].state == SP_READY && !p->slots[i].probe_held &&
                 p->slots[i].sequence < s->sequence) {
                 p->slots[i].state = SP_FREE;
                 p->discarded++;
@@ -880,6 +903,7 @@ static void *sp_present_thread(void *opaque)
             }
         }
         qemu_mutex_unlock(&p->lock);
+        sp_probe_delay();
         /* Only this thread touches the window's default framebuffer. */
         glBindFramebuffer(GL_READ_FRAMEBUFFER, readfb);
         glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
@@ -908,6 +932,7 @@ static void *sp_present_thread(void *opaque)
                           GL_COLOR_BUFFER_BIT,
                           win_w == s->fb.width && win_h == s->fb.height ? GL_NEAREST : GL_LINEAR);
         spacebox_capture_client_from(readfb, s->fb.width, s->fb.height);
+        sp_probe_corrupt(s, readfb, win_w, win_h);
 #else
         glViewport(0, 0, s->fb.width, s->fb.height);
         glDisable(GL_SCISSOR_TEST);
@@ -915,6 +940,7 @@ static void *sp_present_thread(void *opaque)
                           0, 0, s->fb.width, s->fb.height,
                           GL_COLOR_BUFFER_BIT, GL_NEAREST);
         spacebox_capture_client(s->fb.width, s->fb.height);
+        sp_probe_corrupt(s, readfb, s->fb.width, s->fb.height);
 #endif
         uint8_t probe_px[4] = { 0 };
         if (probe) {
@@ -1002,6 +1028,10 @@ static void *sp_present_thread(void *opaque)
             show_us = sp_present_show_time(now_host, out_host, swap_call, refresh_us,
                                            &vsync_us, &out_us);
         }
+        /* the UI evals' probe: this swap's readback (before the slot's
+         * consumed fence below, which covers it) */
+        sp_probe_after_swap(s, pick, readfb, p->presented + 1, swap_call, swapped,
+                            qpc_call, qpc_ret);
         if (probe) {
 #ifdef CONFIG_WIN32
             glBindBuffer(GL_PIXEL_PACK_BUFFER, probe_pbo);
@@ -1088,8 +1118,14 @@ static void *sp_present_thread(void *opaque)
             }
             qemu_mutex_unlock(&p->lock);
             spacebox_video_record_paused(pause_ms, swapped, g_get_monotonic_time());
+            if (qatomic_read(&spacebox_ui_probe_on)) {
+                g_autofree char *more = g_strdup_printf(",\"ms\":%d", pause_ms);
+
+                spacebox_ui_probe_fault("freeze", more);
+            }
         }
     }
+    sp_probe_end();
     glFinish();
     glDeleteFramebuffers(1, &readfb);
     SDL_GL_MakeCurrent(p->window, NULL);
@@ -1131,6 +1167,8 @@ void sdl2_gl_present_init(struct sdl2_console *scon)
         return;
     }
     scon->presenter = p;
+    sp_probe_presenter = p;
+    spacebox_ui_probe_slots = sp_probe_slots_of;
     sp_present_follow_window(p);
     sp_display_start(p);
     qemu_thread_create(&p->thread, "sp-present", sp_present_thread, p, QEMU_THREAD_JOINABLE);
@@ -1149,7 +1187,7 @@ static SpSlot *sp_present_acquire(struct sdl2_console *scon, int w, int h)
     if (!pick) {
         for (int i = 0; i < SP_SLOTS; i++) {
             SpSlot *s = &p->slots[i];
-            if (s->state == SP_READY && (!pick || s->sequence < pick->sequence)) pick = s;
+            if (s->state == SP_READY && !s->probe_held && (!pick || s->sequence < pick->sequence)) pick = s;
         }
         if (pick) p->discarded++;
     }
@@ -1198,14 +1236,19 @@ static void sp_present_submit(struct sdl2_console *scon, SpSlot *s, int src_w, i
     spacebox_frame_step_us = 0;
 #endif
     s->state = SP_READY;
+    bool held = sp_probe_submitted(s);
+    uint64_t seq = s->sequence;
     qemu_cond_signal(&p->wake);
     qemu_mutex_unlock(&p->lock);
+    sp_probe_submit_lines(held, seq);
 }
 
 void sdl2_gl_present_destroy(struct sdl2_console *scon)
 {
     SpPresenter *p = scon->presenter;
     if (!p) return;
+    spacebox_ui_probe_slots = NULL;
+    sp_probe_presenter = NULL;
     sp_display_stop(p);
     qemu_mutex_lock(&p->lock); p->stop = true; qemu_cond_signal(&p->wake); qemu_mutex_unlock(&p->lock);
     qemu_thread_join(&p->thread);

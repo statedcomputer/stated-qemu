@@ -1,11 +1,22 @@
 /* Experimental Mac presenter: private bounded snapshots, shared GL contexts.
  * Guest processing never waits for display refresh or a consumer GL fence.
- * The display-link callback only signals a condition variable. */
+ * The display-link callback only signals a condition variable.
+ * On Windows the same presenter, with the display's timing from Windows (the
+ * parts under CONFIG_WIN32 below: a thread that waits for the vertical blank
+ * plays the display link's part). */
+#if defined(CONFIG_DARWIN) || defined(CONFIG_WIN32)
+#define SPACEBOX_PRESENTER 1
 #ifdef CONFIG_DARWIN
 #include <CoreVideo/CoreVideo.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <mach/mach_time.h>
 #include <pthread/qos.h>
+#else
+#define COBJMACROS
+#include <dxgi.h>
+#include <dwmapi.h>
+#include <SDL_syswm.h>
+#endif
 #include "qemu/thread.h"
 #include "qemu/atomic.h"
 #include "ui/spacebox-video-record.h"
@@ -17,6 +28,10 @@
 /* hw/display/virtio-gpu-remote.c: when to show the frame being submitted, 0 = at once */
 extern int64_t spacebox_frame_due_us;
 extern int64_t spacebox_frame_gap_us;
+#ifdef CONFIG_WIN32
+extern int64_t spacebox_present_refresh_us;
+extern int64_t spacebox_frame_step_us;
+#endif
 enum SpSlotState { SP_FREE, SP_WRITING, SP_READY, SP_READING, SP_DISPLAYED };
 typedef struct SpSlot {
     egl_fb fb;
@@ -26,12 +41,22 @@ typedef struct SpSlot {
     int64_t submitted;
     int64_t due;    /* show no earlier than this, 0 = at once */
     int64_t gap;    /* usual spacing of the stream this frame belongs to, 0 = none */
+#ifdef CONFIG_WIN32
+    int64_t step;   /* ... its mean spacing (spacebox_frame_step_us), 0 = none */
+#endif
     /* the record of video frames: the tickets of the video pictures the frame
      * shows, and the size of the picture it was made from (the scanout) */
     uint64_t tickets[SP_REC_TICKETS];
     unsigned ntickets;
     int64_t flush_dev, flush_read;  /* its flush's message: sent, read */
+#ifdef CONFIG_WIN32
+    int64_t flush_rx;   /* ... and run by the main loop (the record's) */
+    int64_t ready_at;   /* when the presenter first found the GPU done with it */
+#endif
     int src_w, src_h;
+#ifdef CONFIG_WIN32
+    int win_w, win_h;   /* the window's drawable it is shown in */
+#endif
     int64_t show_due;   /* due, or the due of the frame it replaces (sp_pair_updates) */
     bool superseded;    /* replaced by the next frame (sp_pair_updates) */
 } SpSlot;
@@ -41,18 +66,28 @@ typedef struct SpPresenter {
     QemuThread thread;
     QemuMutex lock;
     QemuCond wake;
+#ifdef CONFIG_DARWIN
     CVDisplayLinkRef link;
     CGDirectDisplayID display;  /* the display the link follows: the window's */
+#else
+    QemuThread vblank;          /* waits for the vertical blanks (the link's part) */
+    bool vblank_stop;
+    IDXGIFactory1 *dxgi;
+    IDXGIOutput *dxgi_output;   /* the display the thread follows: the window's (lock) */
+    HMONITOR monitor;
+#endif
     int64_t display_checked;
     bool stop;
     uint64_t tick, sequence, presented, discarded, busy, superseded;
     int64_t shown_due;  /* the show_due of the frame on screen, 0 = none */
-    /* the last tick of the display link (host time, mach_absolute_time):
-     * the refresh it came at and the refresh it prepares for */
+    /* the last tick of the display link (host time, mach_absolute_time;
+     * on Windows QueryPerformanceCounter): the refresh it came at and the
+     * refresh it prepares for */
     uint64_t tick_now_host, tick_out_host;
     SpSlot slots[SP_SLOTS];
 } SpPresenter;
 
+#ifdef CONFIG_DARWIN
 static CVReturn sp_present_tick(CVDisplayLinkRef link, const CVTimeStamp *now,
                                const CVTimeStamp *out, CVOptionFlags in,
                                CVOptionFlags *flags, void *opaque)
@@ -94,22 +129,6 @@ static int64_t sp_present_host_us(uint64_t host)
     return (int64_t)(host * tb.numer / tb.denom / 1000) + off;
 }
 
-static int64_t sp_present_show_time(uint64_t now_host, uint64_t out_host,
-                                    int64_t call, int64_t refresh_us,
-                                    int64_t *vsync, int64_t *out)
-{
-    int64_t k;
-
-    if (!now_host || !out_host || refresh_us <= 0) {
-        *vsync = *out = 0;
-        return 0;
-    }
-    *vsync = sp_present_host_us(now_host);
-    *out = sp_present_host_us(out_host);
-    k = call > *vsync ? (call - *vsync) / refresh_us : 0;
-    return *out + k * refresh_us;
-}
-
 /* The display link follows the display that shows the window (checked every
  * two seconds, on the thread that submits frames, which may call SDL). */
 static void sp_present_follow_window(SpPresenter *p)
@@ -142,6 +161,305 @@ static void sp_present_follow_window(SpPresenter *p)
             return;
         }
     }
+}
+
+/* the display link's nominal refresh, 0 = not known */
+static int64_t sp_display_refresh_us(SpPresenter *p)
+{
+    CVTime period = CVDisplayLinkGetNominalOutputVideoRefreshPeriod(p->link);
+
+    if (!(period.flags & kCVTimeIsIndefinite) && period.timeScale > 0 && period.timeValue > 0) {
+        return period.timeValue * 1000000 / period.timeScale;
+    }
+    return 0;
+}
+
+static void sp_present_thread_priority(void)
+{
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+}
+
+/* the counter of the Windows record (qpc_call, qpc_ret): none here */
+static int64_t sp_present_qpc(void)
+{
+    return 0;
+}
+
+static bool sp_display_open(SpPresenter *p)
+{
+    CVReturn rc = CVDisplayLinkCreateWithCGDisplay(CGMainDisplayID(), &p->link);
+
+    if (rc) {
+        fprintf(stderr, "[SPACEBOX-PRESENT-ERROR] display link: %d\n", rc);
+        return false;
+    }
+    p->display = CGMainDisplayID();
+    return true;
+}
+
+static void sp_display_start(SpPresenter *p)
+{
+    CVDisplayLinkSetOutputCallback(p->link, sp_present_tick, p);
+}
+
+static void sp_display_run(SpPresenter *p)
+{
+    CVDisplayLinkStart(p->link);
+    fprintf(stderr, "[SPACEBOX-PRESENT] mode=thread slots=%d display=%u nonblocking_producer=1\n", SP_SLOTS, CGMainDisplayID());
+}
+
+static void sp_display_stop(SpPresenter *p)
+{
+    CVDisplayLinkStop(p->link);
+}
+
+static void sp_display_release(SpPresenter *p)
+{
+    CVDisplayLinkRelease(p->link);
+}
+#else
+/*
+ * Windows: the display's vertical blank from DXGI (IDXGIOutput::WaitForVBlank
+ * of the output that shows the window), waited for by a thread of its own that
+ * plays the display link's part, and the refresh and the time of the vertical
+ * blank from the DWM's composition timing (DwmGetCompositionTimingInfo); host
+ * times are QueryPerformanceCounter's counts. The refresh that what is made
+ * now is shown at (the link's "out") is taken as the next one.
+ */
+static int64_t sp_qpc_us(uint64_t c)
+{
+    static LARGE_INTEGER f;
+
+    if (!f.QuadPart) {
+        QueryPerformanceFrequency(&f);
+    }
+    return (int64_t)(c / f.QuadPart) * 1000000 + (int64_t)(c % f.QuadPart) * 1000000 / f.QuadPart;
+}
+
+static int64_t sp_present_qpc(void)
+{
+    LARGE_INTEGER c;
+
+    QueryPerformanceCounter(&c);
+    return c.QuadPart;
+}
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+/*
+ * The presenter's short waits (for a frame's time, away from the DWM's
+ * composition): a timed wait of a condition sleeps by the system's timer,
+ * which on BF2 woke the presenter up to 15 ms late in spite of QEMU's
+ * timeBeginPeriod, past the refresh that it waited for (a 30/s video held
+ * frames a refresh more: 3.7% judder). A high-resolution waitable timer keeps
+ * to the time.
+ */
+static void sp_present_sleep_us(int64_t us)
+{
+    static __thread HANDLE timer;
+    LARGE_INTEGER due = { .QuadPart = -us * 10 };
+
+    if (us <= 0) {
+        return;
+    }
+    if (!timer) {
+        timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    }
+    if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) {
+        WaitForSingleObject(timer, INFINITE);
+    } else {
+        g_usleep(us);
+    }
+}
+
+static int64_t sp_present_host_us(uint64_t host)
+{
+    static int64_t off;     /* g_get_monotonic_time() - the host time in us */
+    static int64_t off_at;
+    int64_t now = g_get_monotonic_time();
+
+    if (!off_at || now - off_at > G_USEC_PER_SEC) {
+        /* both clocks read at once; again each second */
+        off = now - sp_qpc_us(sp_present_qpc());
+        off_at = now;
+    }
+    return sp_qpc_us(host) + off;
+}
+
+static void *sp_present_vblank_thread(void *opaque)
+{
+    SpPresenter *p = opaque;
+
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    while (!qatomic_read(&p->vblank_stop)) {
+        IDXGIOutput *o;
+        DWM_TIMING_INFO ti = { .cbSize = sizeof(ti) };
+        uint64_t now, vblank, period = 0;
+        HRESULT hr = E_FAIL;
+
+        qemu_mutex_lock(&p->lock);
+        o = p->dxgi_output;
+        if (o) {
+            IDXGIOutput_AddRef(o);
+        }
+        qemu_mutex_unlock(&p->lock);
+        if (o) {
+            hr = IDXGIOutput_WaitForVBlank(o);
+            IDXGIOutput_Release(o);
+        }
+        if (FAILED(hr) && FAILED(DwmFlush())) {
+            /* no display to wait for (none, or locked): the nominal refresh */
+            g_usleep(16667);
+        }
+        now = sp_present_qpc();
+        vblank = now;
+        if (SUCCEEDED(DwmGetCompositionTimingInfo(NULL, &ti)) && ti.qpcRefreshPeriod) {
+            period = ti.qpcRefreshPeriod;
+            /* the DWM's time of this vertical blank, when it has it already */
+            if (ti.qpcVBlank <= now && now - ti.qpcVBlank < period / 2) {
+                vblank = ti.qpcVBlank;
+            }
+        }
+        qemu_mutex_lock(&p->lock);
+        p->tick++;
+        p->tick_now_host = vblank;
+        p->tick_out_host = period ? vblank + period : 0;
+        qemu_cond_signal(&p->wake);
+        qemu_mutex_unlock(&p->lock);
+    }
+    return NULL;
+}
+
+/* The thread follows the display that shows the window (checked every two
+ * seconds, on the thread that submits frames, which may call SDL). */
+static void sp_present_follow_window(SpPresenter *p)
+{
+    int64_t now = g_get_monotonic_time();
+    SDL_SysWMinfo wm;
+    HMONITOR mon;
+    IDXGIAdapter1 *a;
+    IDXGIOutput *o;
+
+    if (now - p->display_checked < 2 * G_USEC_PER_SEC) {
+        return;
+    }
+    p->display_checked = now;
+    SDL_VERSION(&wm.version);
+    if (!p->dxgi || !SDL_GetWindowWMInfo(p->window, &wm) || wm.subsystem != SDL_SYSWM_WINDOWS) {
+        return;
+    }
+    mon = MonitorFromWindow(wm.info.win.window, MONITOR_DEFAULTTONEAREST);
+    if (mon == p->monitor) {
+        return;
+    }
+    for (UINT i = 0; IDXGIFactory1_EnumAdapters1(p->dxgi, i, &a) == S_OK; i++) {
+        for (UINT j = 0; IDXGIAdapter1_EnumOutputs(a, j, &o) == S_OK; j++) {
+            DXGI_OUTPUT_DESC d;
+
+            if (SUCCEEDED(IDXGIOutput_GetDesc(o, &d)) && d.Monitor == mon) {
+                IDXGIOutput *old;
+                g_autofree char *name = g_utf16_to_utf8((const gunichar2 *)d.DeviceName, -1,
+                                                        NULL, NULL, NULL);
+
+                qemu_mutex_lock(&p->lock);
+                old = p->dxgi_output;
+                p->dxgi_output = o;
+                p->monitor = mon;
+                qemu_mutex_unlock(&p->lock);
+                if (old) {
+                    IDXGIOutput_Release(old);
+                }
+                IDXGIAdapter1_Release(a);
+                fprintf(stderr, "[SPACEBOX-PRESENT] the window is on display %s: "
+                        "the vertical blank follows it\n", name ? name : "?");
+                return;
+            }
+            IDXGIOutput_Release(o);
+        }
+        IDXGIAdapter1_Release(a);
+    }
+}
+
+/* the nominal refresh of the window's display (its active mode, as the Mac's
+ * display link's nominal one), else the DWM's, which it measures: 16.9 to
+ * 20.5 ms on BF2's 59.94 Hz display while the sink started; 0 = not known */
+static int64_t sp_display_refresh_us(SpPresenter *p)
+{
+    DWM_TIMING_INFO ti = { .cbSize = sizeof(ti) };
+    unsigned mhz = sdl2_win_refresh_mhz(p->monitor);
+
+    if (mhz) {
+        return (1000000000LL + mhz / 2) / mhz;
+    }
+    if (SUCCEEDED(DwmGetCompositionTimingInfo(NULL, &ti)) && ti.qpcRefreshPeriod) {
+        return sp_qpc_us(ti.qpcRefreshPeriod);
+    }
+    return 0;
+}
+
+/* the Mac's QoS class user-initiated: above the guest's work, below the
+ * thread that waits for the vertical blank */
+static void sp_present_thread_priority(void)
+{
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+}
+
+static bool sp_display_open(SpPresenter *p)
+{
+    HRESULT hr = CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&p->dxgi);
+
+    if (FAILED(hr)) {
+        /* the thread still ticks, at the DWM's composition or the nominal refresh */
+        fprintf(stderr, "[SPACEBOX-PRESENT-ERROR] DXGI factory: 0x%lx\n", (unsigned long)hr);
+        p->dxgi = NULL;
+    }
+    return true;
+}
+
+static void sp_display_start(SpPresenter *p)
+{
+}
+
+static void sp_display_run(SpPresenter *p)
+{
+    qemu_thread_create(&p->vblank, "sp-vblank", sp_present_vblank_thread, p, QEMU_THREAD_JOINABLE);
+    fprintf(stderr, "[SPACEBOX-PRESENT] mode=thread slots=%d display=dxgi refresh_us=%lld nonblocking_producer=1\n",
+            SP_SLOTS, (long long)sp_display_refresh_us(p));
+}
+
+static void sp_display_stop(SpPresenter *p)
+{
+    qatomic_set(&p->vblank_stop, true);
+    qemu_thread_join(&p->vblank);
+}
+
+static void sp_display_release(SpPresenter *p)
+{
+    if (p->dxgi_output) {
+        IDXGIOutput_Release(p->dxgi_output);
+    }
+    if (p->dxgi) {
+        IDXGIFactory1_Release(p->dxgi);
+    }
+}
+#endif
+
+static int64_t sp_present_show_time(uint64_t now_host, uint64_t out_host,
+                                    int64_t call, int64_t refresh_us,
+                                    int64_t *vsync, int64_t *out)
+{
+    int64_t k;
+
+    if (!now_host || !out_host || refresh_us <= 0) {
+        *vsync = *out = 0;
+        return 0;
+    }
+    *vsync = sp_present_host_us(now_host);
+    *out = sp_present_host_us(out_host);
+    k = call > *vsync ? (call - *vsync) / refresh_us : 0;
+    return *out + k * refresh_us;
 }
 
 static bool sp_fence_done(GLsync fence)
@@ -195,6 +513,109 @@ static int sp_present_code(SpSlot *s, bool *ok, int64_t *read_us)
     *read_us = g_get_monotonic_time() - t0;
     return code;
 }
+
+#ifdef CONFIG_WIN32
+/*
+ * Windows: the record's read of the frame code (sp_present_code) is started
+ * into a pixel buffer before the swap and finished after it. Read at once,
+ * it waited for the GPU between the pick and the swap: 2.1 ms on average and
+ * up to 8.6 ms on BF2 (0.4 ms on the Mac), which moved the swap itself.
+ */
+static GLuint sp_code_pbo;
+static int sp_code_width;
+static int64_t sp_code_us;
+
+static bool sp_present_code_start(SpSlot *s)
+{
+    int x, y, w, h;
+    int64_t t0 = g_get_monotonic_time();
+
+    sp_code_width = 0;
+    if (!spacebox_video_rect(&x, &y, &w, &h) || !s->src_w || !s->src_h) {
+        return false;
+    }
+    double sx = (double)s->fb.width / s->src_w, sy = (double)s->fb.height / s->src_h;
+    int left = (int)(x * sx), width = (int)(w * sx);
+    double cell = w / (double)SP_CODE_CELLS;
+
+    if (width < SP_CODE_CELLS || left < 0 || left + width > s->fb.width ||
+        (y + cell) * sy > s->fb.height) {
+        return false;
+    }
+    if (!sp_code_pbo) {
+        glGenBuffers(1, &sp_code_pbo);
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, sp_code_pbo);
+    glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)width * 4 * 3, NULL, GL_STREAM_READ);
+    for (int k = 0; k < 3; k++) {
+        int row = (int)((y + cell * (3 + k) / 8) * sy);
+
+        glReadPixels(left, s->fb.height - 1 - row, width, 1, GL_RGBA, GL_UNSIGNED_BYTE,
+                     (void *)(uintptr_t)((size_t)k * width * 4));
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    sp_code_width = width;
+    sp_code_us = g_get_monotonic_time() - t0;
+    return true;
+}
+
+static int sp_present_code_finish(bool *ok, int64_t *read_us)
+{
+    const uint8_t *rows[3];
+    int64_t t0 = g_get_monotonic_time();
+    int code = -1;
+
+    *ok = false;
+    *read_us = -1;
+    if (!sp_code_width) {
+        return -1;
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, sp_code_pbo);
+    const uint8_t *m = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)sp_code_width * 4 * 3,
+                                        GL_MAP_READ_BIT);
+    if (m) {
+        for (int k = 0; k < 3; k++) {
+            rows[k] = m + (size_t)k * sp_code_width * 4;
+        }
+        code = spacebox_frame_code_read(rows, 3, sp_code_width, ok);
+        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    *read_us = sp_code_us + g_get_monotonic_time() - t0;
+    return code;
+}
+#endif
+
+#ifdef CONFIG_WIN32
+/*
+ * Windows: a swap from 3 ms before a vertical blank to SP_WIN_AFTER_BLANK_US
+ * after it waits until then (the DWM's composition, below), and a swap is
+ * shown at the composition after it whenever in the refresh it comes, as
+ * long as the GPU has done the frame by then. A frame's time moves through
+ * the refresh as the guest's clock and the display's part (a 30/s video on
+ * BF2's 59.95 Hz display, over about 40 s), and a swap late in it missed the
+ * composition while the GPU was busy (a 3840x2160 HEVC Main 10 video at 30/s
+ * on BF2: frames swapped 10 ms or more after a blank shown a refresh late,
+ * 1.6% judder, by PresentMon; the Windows client's G5c). So a paced frame is
+ * swapped at the start of the window of its time, SP_WIN_AFTER_BLANK_US after
+ * the blank before it: the composition that its time leads to (a time in the
+ * last 3 ms of a refresh, which waited past the next blank, now one sooner),
+ * with the most time for the GPU. due: the frame's time (0: at once); blank:
+ * the last vertical blank.
+ */
+#define SP_WIN_AFTER_BLANK_US 4000
+static int64_t sp_present_window(int64_t due, int64_t blank, int64_t refresh_us)
+{
+    int64_t k;
+
+    if (!due || !blank || refresh_us <= 0) {
+        return due;
+    }
+    k = due - blank - SP_WIN_AFTER_BLANK_US;
+    k = k >= 0 ? k / refresh_us : -((-k + refresh_us - 1) / refresh_us);
+    return blank + SP_WIN_AFTER_BLANK_US + k * refresh_us;
+}
+#endif
 
 /*
  * Two paced frames of a stream one refresh apart, where the frame after them
@@ -275,18 +696,28 @@ static void *sp_present_thread(void *opaque)
     const char *stats_env = getenv("SPACEBOX_PRESENT_STATS");
     int64_t stats_us = stats_env ? (int64_t)MAX(atoi(stats_env), 1) * 1000000 : 0;
     int64_t refresh_us = 8333, last_swap = 0, held_max = 0, phase_adj = 0;
+#ifdef CONFIG_WIN32
+    int64_t last_window = 0;    /* the window of the last swap (sp_present_window) */
+    GLuint probe_pbo = 0;
+#endif
     /* where between two refreshes a frame's time is kept: this fraction of a
      * refresh before the one it is shown at (SPACEBOX_PRESENT_PHASE_TARGET) */
     double phase_target = getenv("SPACEBOX_PRESENT_PHASE_TARGET") ? atof(getenv("SPACEBOX_PRESENT_PHASE_TARGET")) : 0.5;
     bool waited_for_due = false;
     uint64_t held[7] = { 0 };
     {
-        CVTime period = CVDisplayLinkGetNominalOutputVideoRefreshPeriod(p->link);
-        if (!(period.flags & kCVTimeIsIndefinite) && period.timeScale > 0 && period.timeValue > 0) {
-            refresh_us = period.timeValue * 1000000 / period.timeScale;
+        int64_t nominal = sp_display_refresh_us(p);
+        if (nominal > 0) {
+            refresh_us = nominal;
         }
     }
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+#ifdef CONFIG_WIN32
+    qatomic_set(&spacebox_present_refresh_us, refresh_us);   /* the pacing's (virtio-gpu-remote.c) */
+#endif
+    sp_present_thread_priority();
+#ifdef CONFIG_WIN32
+    sdl2_win_gl_on_window();    /* the window's device context is this thread's */
+#endif
     if (SDL_GL_MakeCurrent(p->window, p->output)) {
         fprintf(stderr, "[SPACEBOX-PRESENT-ERROR] make_current: %s\n", SDL_GetError());
         return NULL;
@@ -318,17 +749,35 @@ static void *sp_present_thread(void *opaque)
         int pick = -1, oldest = -1, newest = -1, n_due = 0;
         bool stream = true;
         int64_t pick_now = g_get_monotonic_time(), next_due = 0;
+#ifdef CONFIG_WIN32
+        int64_t win_blank = p->tick_now_host ? sp_present_host_us(p->tick_now_host) : 0;
+#endif
         sp_pair_updates(p, refresh_us);
         for (int i = 0; i < SP_SLOTS; i++) {
             SpSlot *s = &p->slots[i];
             if (s->state != SP_READY || s->superseded || !sp_fence_done(s->ready)) continue;
+#ifdef CONFIG_WIN32
+            if (!s->ready_at) s->ready_at = pick_now;
+#endif
             int64_t due = s->show_due ? s->show_due + phase_adj : 0;
+#ifdef CONFIG_WIN32
+            due = sp_present_window(due, win_blank, refresh_us);
+#endif
             if (due > pick_now) {
                 if (!next_due || due < next_due) next_due = due;
                 continue;
             }
             n_due++;
+#ifdef CONFIG_WIN32
+            /*
+             * Frames with a time whose spacing is not known yet (the first 16
+             * of a video) are shown in order too: at one swap a refresh (below)
+             * the newest one would hide those before it.
+             */
+            if (!s->due) stream = false;
+#else
             if (!s->due || !s->gap) stream = false;
+#endif
             if (oldest < 0 || s->sequence < p->slots[oldest].sequence) oldest = i;
             if (newest < 0 || s->sequence > p->slots[newest].sequence) newest = i;
         }
@@ -347,8 +796,51 @@ static void *sp_present_thread(void *opaque)
              */
             SpSlot *s = &p->slots[oldest];
             int64_t k = MAX((s->gap + refresh_us / 2) / refresh_us, 1);
+#ifdef CONFIG_WIN32
+            /*
+             * Windows: the least spacing of the stream, its mean spacing in
+             * whole refreshes rounded down (with a quarter of a refresh for the
+             * two clocks). Of a rate that is a whole number of refreshes (30/s
+             * and 60/s on BF2's 59.95 Hz) that is the usual spacing as above;
+             * of one that is not, the shorter of the two spacings that the
+             * guest alternates (24/s: 2 and 3 refreshes, 2.5 a frame). The
+             * usual spacing (the median: 3 refreshes there) held a frame due 2
+             * refreshes after the last one a refresh longer, and the frame
+             * after it, due already, followed a refresh later: 2, 3, 4 and 1
+             * refreshes apart, judder in 18% of a 24/s YouTube video's frames
+             * by PresentMon (the Windows client's G5d).
+             */
+            if (s->step) {
+                k = MAX((s->step + refresh_us / 4) / refresh_us, 1);
+            }
+            /*
+             * ... and never more than the guest's own spacing of this frame's
+             * time from that of the frame on screen. An update that shows no
+             * new picture of the video (a 24/s YouTube video in the guest's
+             * Chromium: about one update in four, a refresh before or after a
+             * frame) counted as the stream's last frame, and the frame due a
+             * refresh after it waited a refresh more: 4 refreshes between
+             * frames, judder in 6 to 20% of the frames by PresentMon (the
+             * Windows client's G5g). Frames whose times are the usual spacing
+             * apart, late or not, are held as before.
+             */
+            if (s->show_due && p->shown_due && s->show_due > p->shown_due) {
+                k = MIN(k, MAX((s->show_due - p->shown_due + refresh_us / 2) / refresh_us, 1));
+            }
+#endif
             if (n_due >= 2 && k > 1) k--;
+#ifdef CONFIG_WIN32
+            /*
+             * Windows: k windows after the last swap's. The swap returns at the
+             * DWM's composition, with the wake-up 0.5 to 6 ms after the blank on
+             * BF2, and counted from there the spacing put the next swap late
+             * in its refresh, where it missed the composition while the GPU
+             * was busy (sp_present_window).
+             */
+            int64_t earliest = last_window ? last_window + k * refresh_us : 0;
+#else
             int64_t earliest = last_swap ? last_swap + (k - 1) * refresh_us + refresh_us / 8 : 0;
+#endif
             if (earliest > pick_now) {
                 if (!next_due || earliest < next_due) next_due = earliest;
             } else {
@@ -358,6 +850,14 @@ static void *sp_present_thread(void *opaque)
         if (pick < 0) {
             if (next_due) {
                 waited_for_due = n_due == 0;
+#ifdef CONFIG_WIN32
+                if (next_due - pick_now < 25000) {
+                    /* a frame's time is near: kept to it (new frames wait as long) */
+                    qemu_mutex_unlock(&p->lock);
+                    sp_present_sleep_us(next_due - pick_now);
+                    continue;
+                }
+#endif
                 qemu_cond_timedwait(&p->wake, &p->lock, (int)MAX((next_due - pick_now + 500) / 1000, 1));
             } else if (native) {
                 qemu_cond_timedwait(&p->wake, &p->lock, 1);
@@ -387,22 +887,59 @@ static void *sp_present_thread(void *opaque)
         glReadBuffer(GL_COLOR_ATTACHMENT0);
         bool recording = qatomic_read(&spacebox_video_record_on), code_ok = false;
         int64_t code_us = -1;
+#ifdef CONFIG_WIN32
+        bool code_started = recording && sp_present_code_start(s);
+        int code = -1;
+#else
         int code = recording ? sp_present_code(s, &code_ok, &code_us) : -1;
+#endif
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         glDrawBuffer(GL_BACK);
+#ifdef CONFIG_WIN32
+        /*
+         * The slot holds the guest's picture at its own size (sdl2-gl.c),
+         * scaled to the window here; the capture hook takes the picture
+         * before it is scaled (spacebox-capture.h).
+         */
+        int win_w = s->win_w, win_h = s->win_h;
+        glViewport(0, 0, win_w, win_h);
+        glDisable(GL_SCISSOR_TEST);
+        glBlitFramebuffer(0, 0, s->fb.width, s->fb.height, 0, 0, win_w, win_h,
+                          GL_COLOR_BUFFER_BIT,
+                          win_w == s->fb.width && win_h == s->fb.height ? GL_NEAREST : GL_LINEAR);
+        spacebox_capture_client_from(readfb, s->fb.width, s->fb.height);
+#else
         glViewport(0, 0, s->fb.width, s->fb.height);
         glDisable(GL_SCISSOR_TEST);
         glBlitFramebuffer(0, 0, s->fb.width, s->fb.height,
                           0, 0, s->fb.width, s->fb.height,
                           GL_COLOR_BUFFER_BIT, GL_NEAREST);
         spacebox_capture_client(s->fb.width, s->fb.height);
+#endif
         uint8_t probe_px[4] = { 0 };
         if (probe) {
             /* test aid: the colour at the centre of each frame shown */
             glBindFramebuffer(GL_READ_FRAMEBUFFER, readfb);
+#ifdef CONFIG_WIN32
+            /*
+             * Windows: into a pixel buffer, read after the swap (as the frame
+             * code): read at once it waited here for the GPU, 5 to 8 ms of a
+             * busy one on BF2, which put the swap late in its refresh
+             * (sp_present_window).
+             */
+            if (!probe_pbo) {
+                glGenBuffers(1, &probe_pbo);
+            }
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, probe_pbo);
+            glBufferData(GL_PIXEL_PACK_BUFFER, 4, NULL, GL_STREAM_READ);
+            glReadPixels(s->fb.width / 2, s->fb.height / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+#else
             glReadPixels(s->fb.width / 2, s->fb.height / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, probe_px);
+#endif
         }
         int64_t swap_call = g_get_monotonic_time(), vsync_us = 0, out_us = 0, show_us = 0;
+        int64_t qpc_call = sp_present_qpc(), qpc_ret;
         uint64_t now_host = 0, out_host = 0;
         if (recording) {
             qemu_mutex_lock(&p->lock);
@@ -410,13 +947,71 @@ static void *sp_present_thread(void *opaque)
             out_host = p->tick_out_host;
             qemu_mutex_unlock(&p->lock);
         }
+#ifdef CONFIG_WIN32
+        {
+            /*
+             * A present close before the DWM's composition (2 ms after a
+             * vertical blank on BF2) may come after it and be hidden by the
+             * next frame, and one just after it waits a refresh more: none
+             * from 3 ms before a blank to 4 ms after it (the composition
+             * began 0.5 to 2.5 ms after the blank, and a present 1.7 ms
+             * before one missed it).
+             */
+            int64_t blank, t = g_get_monotonic_time(), at = 0;
+
+            qemu_mutex_lock(&p->lock);
+            blank = p->tick_now_host ? sp_present_host_us(p->tick_now_host) : 0;
+            qemu_mutex_unlock(&p->lock);
+            if (blank && t > blank) {
+                /* the last blank by the refresh: the waiter's may be late */
+                blank += (t - blank) / refresh_us * refresh_us;
+            }
+            if (blank && t - blank < SP_WIN_AFTER_BLANK_US) {
+                at = blank + SP_WIN_AFTER_BLANK_US;
+            } else if (blank && t - blank > refresh_us - 3000) {
+                at = blank + refresh_us + SP_WIN_AFTER_BLANK_US;
+            }
+            if (at > t) {
+                sp_present_sleep_us(at - t);
+                swap_call = g_get_monotonic_time();
+                qpc_call = sp_present_qpc();
+            }
+            last_window = sp_present_window(swap_call, blank, refresh_us);
+        }
+        spacebox_swap(p->window, win_w, win_h);
+        /*
+         * Here the swap returns at once and the DWM shows the window's last
+         * present at its next composition (2 ms after a vertical blank on
+         * BF2), at the blank after that. Waiting for that composition, as
+         * the Mac's swap waits for its refresh, gives the presenter's times
+         * and its phase (above) their meaning, and no second frame reaches
+         * the DWM before it has taken this one.
+         */
+        DwmFlush();
+#else
         spacebox_swap(p->window, s->fb.width, s->fb.height);
+#endif
         int64_t swapped = g_get_monotonic_time();
+        qpc_ret = sp_present_qpc();
+#ifdef CONFIG_WIN32
+        if (code_started) {
+            code = sp_present_code_finish(&code_ok, &code_us);
+        }
+#endif
         if (recording) {
             show_us = sp_present_show_time(now_host, out_host, swap_call, refresh_us,
                                            &vsync_us, &out_us);
         }
         if (probe) {
+#ifdef CONFIG_WIN32
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, probe_pbo);
+            const uint8_t *m = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, 4, GL_MAP_READ_BIT);
+            if (m) {
+                memcpy(probe_px, m, 4);
+                glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+            }
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+#endif
             fprintf(probe, "%lld %u %u %u\n", (long long)g_get_monotonic_time(), probe_px[0], probe_px[1], probe_px[2]);
         }
         GLsync consumed = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
@@ -471,10 +1066,17 @@ static void *sp_present_thread(void *opaque)
         }
         qemu_mutex_unlock(&p->lock);
         if (recording) {
+#ifdef CONFIG_WIN32
+            int64_t t_flush_rx = s->flush_rx, t_sub = s->submitted, t_ready = s->ready_at;
+            int64_t t_pick = pick_now;
+#else
+            int64_t t_flush_rx = 0, t_sub = 0, t_ready = 0, t_pick = 0;
+#endif
             spacebox_video_record_swap(presented, swapped, code, code_ok, s->tickets,
                                        s->ntickets, coalesced, code_us, show_us,
                                        swap_call, vsync_us, out_us, pick_due,
-                                       s->flush_dev, s->flush_read);
+                                       s->flush_dev, s->flush_read, qpc_call, qpc_ret,
+                                       t_flush_rx, t_sub, t_ready, t_pick);
         }
         int pause_ms = qatomic_xchg(&spacebox_present_pause_ms, 0);
         if (pause_ms) {
@@ -498,10 +1100,18 @@ void sdl2_gl_present_init(struct sdl2_console *scon)
 {
     const char *mode = getenv("SPACEBOX_PRESENT_MODE");
     if (!mode || strcmp(mode, "thread")) return;
+#ifdef CONFIG_WIN32
+    if (!sdl2_win_gl_offscreen_open(scon->real_window)) {
+        return;     /* no presenter: the window's frames from this thread */
+    }
+#endif
     SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
     scon->renderctx = SDL_GL_CreateContext(scon->real_window);
     if (!scon->renderctx) {
         fprintf(stderr, "[SPACEBOX-PRESENT-ERROR] producer context: %s\n", SDL_GetError());
+#ifdef CONFIG_WIN32
+        sdl2_win_gl_offscreen_close();
+#endif
         SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
         return;
     }
@@ -511,21 +1121,20 @@ void sdl2_gl_present_init(struct sdl2_console *scon)
     p->output = scon->winctx;
     qemu_mutex_init(&p->lock);
     qemu_cond_init(&p->wake);
-    CVReturn rc = CVDisplayLinkCreateWithCGDisplay(CGMainDisplayID(), &p->link);
-    if (rc) {
-        fprintf(stderr, "[SPACEBOX-PRESENT-ERROR] display link: %d\n", rc);
+    if (!sp_display_open(p)) {
         SDL_GL_DeleteContext(scon->renderctx); scon->renderctx = NULL;
+#ifdef CONFIG_WIN32
+        sdl2_win_gl_offscreen_close();
+#endif
         SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
         qemu_cond_destroy(&p->wake); qemu_mutex_destroy(&p->lock); g_free(p);
         return;
     }
     scon->presenter = p;
-    p->display = CGMainDisplayID();
     sp_present_follow_window(p);
-    CVDisplayLinkSetOutputCallback(p->link, sp_present_tick, p);
+    sp_display_start(p);
     qemu_thread_create(&p->thread, "sp-present", sp_present_thread, p, QEMU_THREAD_JOINABLE);
-    CVDisplayLinkStart(p->link);
-    fprintf(stderr, "[SPACEBOX-PRESENT] mode=thread slots=%d display=%u nonblocking_producer=1\n", SP_SLOTS, CGMainDisplayID());
+    sp_display_run(p);
 }
 
 static SpSlot *sp_present_acquire(struct sdl2_console *scon, int w, int h)
@@ -570,6 +1179,11 @@ static void sp_present_submit(struct sdl2_console *scon, SpSlot *s, int src_w, i
     s->flush_read = spacebox_frame_flush_read;
     s->src_w = src_w;
     s->src_h = src_h;
+#ifdef CONFIG_WIN32
+    SDL_GL_GetDrawableSize(p->window, &s->win_w, &s->win_h);
+    s->flush_rx = spacebox_frame_flush_rx;
+    s->ready_at = 0;
+#endif
     qemu_mutex_lock(&p->lock);
     s->ready = fence;
     s->sequence = ++p->sequence;
@@ -579,6 +1193,10 @@ static void sp_present_submit(struct sdl2_console *scon, SpSlot *s, int src_w, i
     s->superseded = false;
     spacebox_frame_due_us = 0;
     spacebox_frame_gap_us = 0;
+#ifdef CONFIG_WIN32
+    s->step = spacebox_frame_step_us;
+    spacebox_frame_step_us = 0;
+#endif
     s->state = SP_READY;
     qemu_cond_signal(&p->wake);
     qemu_mutex_unlock(&p->lock);
@@ -588,7 +1206,7 @@ void sdl2_gl_present_destroy(struct sdl2_console *scon)
 {
     SpPresenter *p = scon->presenter;
     if (!p) return;
-    CVDisplayLinkStop(p->link);
+    sp_display_stop(p);
     qemu_mutex_lock(&p->lock); p->stop = true; qemu_cond_signal(&p->wake); qemu_mutex_unlock(&p->lock);
     qemu_thread_join(&p->thread);
     SDL_GL_MakeCurrent(scon->real_window, scon->renderctx);
@@ -598,7 +1216,10 @@ void sdl2_gl_present_destroy(struct sdl2_console *scon)
         if (p->slots[i].consumed) glDeleteSync(p->slots[i].consumed);
         egl_fb_destroy(&p->slots[i].fb);
     }
-    CVDisplayLinkRelease(p->link);
+    sp_display_release(p);
+#ifdef CONFIG_WIN32
+    sdl2_win_gl_offscreen_close();
+#endif
     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
     SDL_GL_DeleteContext(scon->renderctx); scon->renderctx = NULL;
     qemu_cond_destroy(&p->wake); qemu_mutex_destroy(&p->lock);

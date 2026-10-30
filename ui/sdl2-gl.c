@@ -59,8 +59,14 @@ static void sdl2_gl_render_surface(struct sdl2_console *scon)
     sdl2_set_scanout_mode(scon, false);
 
     SDL_GL_GetDrawableSize(scon->real_window, &ww, &wh);
-#ifdef CONFIG_DARWIN
+#ifdef SPACEBOX_PRESENTER
     if (scon->presenter) {
+#ifdef CONFIG_WIN32
+        /* the guest's picture at its own size (the presenter scales it to
+         * the window; spacebox-capture.h) */
+        ww = surface_width(scon->surface);
+        wh = surface_height(scon->surface);
+#endif
         SpSlot *slot = sp_present_acquire(scon, ww, wh);
         if (!slot) return;
         glBindFramebuffer(GL_FRAMEBUFFER, slot->fb.framebuffer);
@@ -261,8 +267,14 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
     SDL_GL_MakeCurrent(scon->real_window, scon->renderctx ? scon->renderctx : scon->winctx);
 
     SDL_GL_GetDrawableSize(scon->real_window, &ww, &wh);
-#ifdef CONFIG_DARWIN
+#ifdef SPACEBOX_PRESENTER
     if (scon->presenter) {
+#ifdef CONFIG_WIN32
+        /* the guest's picture at its own size (the presenter scales it to
+         * the window; spacebox-capture.h) */
+        ww = scon->guest_fb.width;
+        wh = scon->guest_fb.height;
+#endif
         SpSlot *slot = sp_present_acquire(scon, ww, wh);
         if (!slot) return;
         egl_fb_blit(&slot->fb, &scon->guest_fb, !scon->y0_top);

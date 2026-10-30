@@ -90,10 +90,21 @@ void sp_sink_gpu(bool on);
  * handed over, at a transition (at: what happens) */
 void sp_video_pending_log(const char *at);
 
+/* the sockets of the link: a Unix socket's path or HOST:PORT (TCP); also
+ * the scroll socket of ui/spacebox-scroll-win.c */
+bool sp_addr_is_tcp(const char *a);
+int sp_sock_listen(const char *a);
+int sp_sock_connect(const char *a);
+void sp_sock_tune(int fd);
+
 /* virtio-gpu-remote-record.c: the record of video frames */
 void sp_record_realize(void);
 bool sp_record_control(const char *text);
 void sp_record_cmd(struct virtio_gpu_ctrl_command *cmd);
+#ifdef CONFIG_WIN32
+/* a stretch of the main loop (this clock) that held the link's messages */
+void sp_record_busy(const char *what, int64_t t0, int64_t t1);
+#endif
 
 /* called by ui/sdl2.c, which declares them itself */
 void spacebox_gpu_toggle(void);

@@ -1,11 +1,12 @@
 #include "qemu/timer.h"
+#include "ui/spacebox-hook.h"
 
 /* Launcher command for this application's own visible window. */
 static void spacebox_window_request(struct sdl2_console *scon)
 {
     const char *path = getenv("SPACEBOX_WINDOW_REQUEST");
-    if (!path || !scon->real_window || access(path, F_OK)) return;
-    unlink(path);
+    g_autofree char *text = NULL;
+    if (!path || !scon->real_window || access(path, F_OK) || !spacebox_hook_take(path, &text)) return;
     SDL_RaiseWindow(scon->real_window);
     int w, h, pw, ph;
     SDL_GetWindowSize(scon->real_window, &w, &h);
@@ -172,13 +173,13 @@ static void spacebox_input_test(struct sdl2_console *scon)
 {
     const char *path = getenv("SPACEBOX_INPUT_TEST");
     if (!path || !scon->real_window) return;
-    FILE *f = fopen(path, "r");
-    if (!f) return;
+    g_autofree char *text = NULL;
+    if (!spacebox_hook_take(path, &text)) return;
     char line[256] = "", command[24];
     int a = 0, b = 0, mod = 0;
-    if (!fgets(line, sizeof(line), f)) line[0] = 0;
-    fclose(f);
-    unlink(path);
+    /* its first line, as fgets reads it */
+    const char *nl = strchr(text, '\n');
+    g_strlcpy(line, text, MIN(sizeof(line), (nl ? (size_t)(nl - text) + 1 : strlen(text)) + 1));
     int count = sscanf(line, "%23s %d %d %d", command, &a, &b, &mod);
     if (count < 1) return;
     if (!strcmp(command, "type")) {

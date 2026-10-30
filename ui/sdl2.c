@@ -35,8 +35,16 @@
 #include "qemu/log.h"
 #include "qemu-main.h"
 
-#ifdef CONFIG_DARWIN
+#if defined(CONFIG_DARWIN) || defined(CONFIG_WIN32)
 void spacebox_scroll_tick(SDL_Window *window);
+#endif
+#ifdef CONFIG_WIN32
+/* ui/spacebox-scroll-win.c: true when the wheel event went to the guest's
+ * scroll agent */
+bool spacebox_scroll_wheel(const SDL_MouseWheelEvent *wev);
+#ifdef CONFIG_OPENGL
+#include <epoxy/wgl.h>
+#endif
 #endif
 
 static int sdl2_num_outputs;
@@ -91,6 +99,176 @@ static int spacebox_pixel_scale(void)
 #endif
 }
 
+#ifdef CONFIG_WIN32
+/*
+ * Windows: with SPACEBOX_RETINA_SCALE set (any value) the process is per-
+ * monitor DPI aware and SDL scales by the monitor's DPI, as macOS does for a
+ * Retina display: the window's size is in points (pixels at 96 per inch),
+ * its drawable in physical pixels; at 200% and above the guest gets the
+ * drawable's size, below 200% what the Mac's sink gives it on a display
+ * without Retina, twice the points (spacebox_update_ui_info).
+ * The scale is the drawable's width over the window's (1.5 at 150%), read
+ * again at each change of the window; before there is a window, the scale of
+ * the main display.
+ */
+static double spacebox_win_scale = 1;
+/* the keyboard is grabbed (spacebox_win_kbd_grab) */
+static bool spacebox_kbd_grab, spacebox_kbd_saved;
+
+static bool spacebox_win_dpi(void)
+{
+    return getenv("SPACEBOX_RETINA_SCALE") != NULL;
+}
+
+/*
+ * The refresh of a monitor in mHz, as its active mode has it (a fraction:
+ * 59.94 Hz is 59940/1000 on BF2's display), from Windows' display
+ * configuration; 0 when not known. SDL gives whole Hertz, and Windows' 59 for
+ * 59.94: told 59 Hz, the guest's compositor drew at 59 a second and a video of
+ * 60 frames a second lost about one frame each second (turn G5a). The Mac's
+ * sink tells the guest its display's own refresh in the same way.
+ */
+unsigned sdl2_win_refresh_mhz(void *monitor)
+{
+    MONITORINFOEXW mi = { .cbSize = sizeof(mi) };
+    UINT32 np = 0, nm = 0;
+    DISPLAYCONFIG_PATH_INFO *paths;
+    DISPLAYCONFIG_MODE_INFO *modes;
+    unsigned mhz = 0;
+
+    if (!monitor || !GetMonitorInfoW(monitor, (MONITORINFO *)&mi) ||
+        GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) != ERROR_SUCCESS) {
+        return 0;
+    }
+    paths = g_new0(DISPLAYCONFIG_PATH_INFO, np);
+    modes = g_new0(DISPLAYCONFIG_MODE_INFO, nm);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths, &nm, modes, NULL) == ERROR_SUCCESS) {
+        for (UINT32 i = 0; i < np && !mhz; i++) {
+            DISPLAYCONFIG_SOURCE_DEVICE_NAME src = {
+                .header = {
+                    .type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                    .size = sizeof(src),
+                    .adapterId = paths[i].sourceInfo.adapterId,
+                    .id = paths[i].sourceInfo.id,
+                },
+            };
+            DISPLAYCONFIG_RATIONAL r = paths[i].targetInfo.refreshRate;
+
+            if (DisplayConfigGetDeviceInfo(&src.header) == ERROR_SUCCESS &&
+                !wcscmp(src.viewGdiDeviceName, mi.szDevice) && r.Denominator) {
+                mhz = (unsigned)(((uint64_t)r.Numerator * 1000 + r.Denominator / 2) / r.Denominator);
+            }
+        }
+    }
+    g_free(paths);
+    g_free(modes);
+    return mhz;
+}
+
+static unsigned spacebox_win_window_refresh_mhz(SDL_Window *window)
+{
+    SDL_SysWMinfo wm;
+
+    SDL_VERSION(&wm.version);
+    if (!SDL_GetWindowWMInfo(window, &wm) || wm.subsystem != SDL_SYSWM_WINDOWS) {
+        return 0;
+    }
+    return sdl2_win_refresh_mhz(MonitorFromWindow(wm.info.win.window, MONITOR_DEFAULTTONEAREST));
+}
+
+/* the guest's pixels for a point: the Mac's 2 up to a scale of 200%, the
+ * monitor's scale above it (spacebox_update_ui_info) */
+static double spacebox_win_guest_scale(void)
+{
+    return spacebox_win_scale > 1.99 ? spacebox_win_scale : 2.0;
+}
+
+static int spacebox_points(int pixels)
+{
+    return (int)lround(pixels / (spacebox_win_dpi() ? spacebox_win_guest_scale() : 1.0));
+}
+
+/*
+ * Keys of a Windows keyboard that SDL drops or Windows takes:
+ * - Print Screen: Windows 11 opens its screen capture with it, and SDL's own
+ *   hook of a grabbed keyboard (the Windows keys, Alt, Ctrl, Tab, Esc) does
+ *   not take it; while the keyboard is grabbed this hook does, for the guest.
+ * - Han/Eng and Hanja of a Korean keyboard (scan codes 0x72 and 0x71, 0xf2
+ *   and 0xf1 with the break bit): SDL 2 has no scan code for them and drops
+ *   them; they become SDL's LANG1 and LANG2 (QEMU's lang1 and lang2, the
+ *   guest's KEY_HANGEUL and KEY_HANJA). The keys have no break code, so each
+ *   press is a press and a release at once, as Linux's own keyboard driver
+ *   makes them. (A layout that makes the right Alt and Ctrl these keys gives
+ *   the scan codes of Alt and Ctrl, which SDL has: the guest gets those keys.)
+ */
+static HHOOK spacebox_print_hook_handle;
+
+static void spacebox_win_key(SDL_Scancode code, bool down)
+{
+    SDL_Event ev = {0};
+    SDL_Window *focus = SDL_GetKeyboardFocus();
+
+    ev.type = down ? SDL_KEYDOWN : SDL_KEYUP;
+    ev.key.windowID = focus ? SDL_GetWindowID(focus) : 0;
+    ev.key.state = down ? SDL_PRESSED : SDL_RELEASED;
+    ev.key.keysym.scancode = code;
+    ev.key.keysym.sym = SDL_GetKeyFromScancode(code);
+    SDL_PushEvent(&ev);
+}
+
+static LRESULT CALLBACK spacebox_print_proc(int code, WPARAM wp, LPARAM lp)
+{
+    KBDLLHOOKSTRUCT *k = (KBDLLHOOKSTRUCT *)lp;
+
+    if (code == HC_ACTION && k->vkCode == VK_SNAPSHOT && SDL_GetKeyboardFocus()) {
+        spacebox_win_key(SDL_SCANCODE_PRINTSCREEN, wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN);
+        return 1;
+    }
+    return CallNextHookEx(NULL, code, wp, lp);
+}
+
+static void spacebox_win_print_hook(bool on)
+{
+    if (on && !spacebox_print_hook_handle) {
+        spacebox_print_hook_handle = SetWindowsHookExW(WH_KEYBOARD_LL, spacebox_print_proc,
+                                                       GetModuleHandleW(NULL), 0);
+    } else if (!on && spacebox_print_hook_handle) {
+        UnhookWindowsHookEx(spacebox_print_hook_handle);
+        spacebox_print_hook_handle = NULL;
+    }
+}
+
+/* hw/display/virtio-gpu-remote.c: the stop script's request (it detaches first). */
+bool spacebox_sink_stop_request(uint64_t id, int64_t pid);
+static UINT spacebox_stop_msg;   /* "SpaceboxSinkStop": WPARAM the request, LPARAM the pid */
+
+static void SDLCALL spacebox_win_message(void *data, void *hwnd, unsigned int msg,
+                                         Uint64 wp, Sint64 lp)
+{
+    int sc = (lp >> 16) & 0xff;
+
+    if (spacebox_stop_msg && msg == spacebox_stop_msg) {
+        if (!spacebox_sink_stop_request(wp, lp)) {
+            shutdown_action = SHUTDOWN_ACTION_POWEROFF;
+            qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+        }
+        return;
+    }
+
+    if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && (sc & 0x7f) >= 0x71 && (sc & 0x7f) <= 0x72) {
+        SDL_Scancode code = (sc & 0x7f) == 0x72 ? SDL_SCANCODE_LANG1 : SDL_SCANCODE_LANG2;
+
+        spacebox_win_key(code, true);
+        spacebox_win_key(code, false);
+    }
+}
+#else
+static int spacebox_points(int pixels)
+{
+    return pixels / spacebox_pixel_scale();
+}
+#endif
+
 static void spacebox_update_ui_info(struct sdl2_console *scon)
 {
     if (!scon->real_window || !dpy_ui_info_supported(scon->dcl.con)) return;
@@ -100,6 +278,40 @@ static void spacebox_update_ui_info(struct sdl2_console *scon)
     SDL_GetWindowSize(scon->real_window, &width, &height);
     info.width = width * spacebox_pixel_scale();
     info.height = height * spacebox_pixel_scale();
+#ifdef CONFIG_WIN32
+    if (spacebox_win_dpi()) {
+        int pw, ph;
+
+        /* the window's size in physical pixels */
+        SDL_GL_GetDrawableSize(scon->real_window, &pw, &ph);
+        if (pw > 0 && ph > 0 && width > 0) {
+            spacebox_win_scale = (double)pw / width;
+            info.width = pw;
+            info.height = ph;
+        }
+        if (spacebox_win_scale > 1.99) {
+            /* the density for the guest's compositor: the Mac's 220 per inch at 2x */
+            info.width_mm = info.width * 254 / 10 / (110 * spacebox_win_scale);
+            info.height_mm = info.height * 254 / 10 / (110 * spacebox_win_scale);
+        } else {
+            /*
+             * A display below 200%: what the Mac's sink gives the guest on a
+             * display without Retina (spacebox_pixel_scale: twice the
+             * window's points, 220 per inch), shown scaled to the window
+             * (whose size in points is then half the guest's surface:
+             * spacebox_points); at 200% that is the window's own pixels, as
+             * on a Retina display. The guest's desktop keeps the scale 2 (its
+             * agent), so with the window's own pixels at 100% it would have
+             * half the window's points (the user's answer of 2026-10-26: as
+             * the Mac, at 125% to 175% too).
+             */
+            info.width = width * spacebox_win_guest_scale();
+            info.height = height * spacebox_win_guest_scale();
+            info.width_mm = info.width * 254 / 10 / 220;
+            info.height_mm = info.height * 254 / 10 / 220;
+        }
+    }
+#endif
     if (spacebox_pixel_scale() == 2) {
         /*
          * Tell the guest how dense the pixels are (220 per inch) through the
@@ -113,6 +325,15 @@ static void spacebox_update_ui_info(struct sdl2_console *scon)
     if (SDL_GetCurrentDisplayMode(SDL_GetWindowDisplayIndex(scon->real_window), &dm) == 0 && dm.refresh_rate > 0) {
         info.refresh_rate = dm.refresh_rate * 1000;
     }
+#ifdef CONFIG_WIN32
+    {
+        unsigned mhz = spacebox_win_window_refresh_mhz(scon->real_window);
+
+        if (mhz) {
+            info.refresh_rate = mhz;
+        }
+    }
+#endif
     dpy_set_ui_info(scon->dcl.con, &info, true);
     fprintf(stderr, "[SPACEBOX-DISPLAY-INFO] pixels=%ux%u refresh_mhz=%u\n",
             info.width, info.height, info.refresh_rate);
@@ -151,10 +372,26 @@ void sdl2_window_create(struct sdl2_console *scon)
         SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
     }
 #endif
+#ifdef CONFIG_WIN32
+    if (spacebox_win_dpi()) {
+        float ddpi;
+
+        flags |= SDL_WINDOW_ALLOW_HIGHDPI;
+        if (spacebox_win_scale == 1 && !SDL_GetDisplayDPI(0, &ddpi, NULL, NULL) && ddpi > 0) {
+            spacebox_win_scale = ddpi / 96.0;
+        }
+    }
+    if (scon->opengl && scon->opts->gl != DISPLAY_GL_MODE_ES) {
+        /* a core context of 4.x, as the Mac's core profile (4.1 there) */
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+    }
+#endif
     scon->real_window = SDL_CreateWindow("", SDL_WINDOWPOS_UNDEFINED,
                                          SDL_WINDOWPOS_UNDEFINED,
-                                         surface_width(scon->surface) / spacebox_pixel_scale(),
-                                         surface_height(scon->surface) / spacebox_pixel_scale(),
+                                         spacebox_points(surface_width(scon->surface)),
+                                         spacebox_points(surface_height(scon->surface)),
                                          flags);
     /*
      * Spacebox: SDL turns text input on by itself on desktop platforms. With it
@@ -178,6 +415,21 @@ void sdl2_window_create(struct sdl2_console *scon)
         SDL_SetHint(SDL_HINT_RENDER_BATCHING, "1");
 
         scon->winctx = SDL_GL_CreateContext(scon->real_window);
+#ifdef CONFIG_WIN32
+        if (scon->winctx) {
+            int profile = 0, major = 0, minor = 0;
+
+            SDL_GL_GetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, &profile);
+            SDL_GL_GetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, &major);
+            SDL_GL_GetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, &minor);
+            fprintf(stderr, "[SPACEBOX-GL] window context: %s, %s, %s; profile %s, asked %d.%d\n",
+                    (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER),
+                    (const char *)glGetString(GL_VERSION),
+                    profile == SDL_GL_CONTEXT_PROFILE_CORE ? "core" : "not core", major, minor);
+        } else {
+            fprintf(stderr, "[SPACEBOX-GL] no window context: %s\n", SDL_GetError());
+        }
+#endif
         const char *interval = getenv("SPACEBOX_SWAP_INTERVAL");
         int requested = interval ? atoi(interval) : 1;
         int rc = SDL_GL_SetSwapInterval(requested);
@@ -192,7 +444,11 @@ void sdl2_window_create(struct sdl2_console *scon)
         /* The SDL renderer is only used by sdl2-2D, when OpenGL is disabled */
         scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1, 0);
     }
+#ifdef CONFIG_WIN32
+    if (spacebox_win_dpi()) {
+#else
     if (spacebox_pixel_scale() == 2) {
+#endif
         int w, h, pw, ph;
         SDL_SetWindowPosition(scon->real_window, 100, 100);
         SDL_GetWindowSize(scon->real_window, &w, &h);
@@ -232,8 +488,8 @@ void sdl2_window_resize(struct sdl2_console *scon)
     }
 
     SDL_SetWindowSize(scon->real_window,
-                      surface_width(scon->surface) / spacebox_pixel_scale(),
-                      surface_height(scon->surface) / spacebox_pixel_scale());
+                      spacebox_points(surface_width(scon->surface)),
+                      spacebox_points(surface_height(scon->surface)));
     spacebox_update_ui_info(scon);
 }
 
@@ -260,9 +516,15 @@ static void sdl_update_caption(struct sdl2_console *scon)
     unsigned gen;
     const char *gpu = spacebox_gpu_caption(&gen);
 
+#ifdef CONFIG_WIN32
+    bool grabbed = gui_grab || spacebox_kbd_grab;
+#else
+    bool grabbed = gui_grab;
+#endif
+
     if (!runstate_is_running()) {
         status = " [Stopped]";
-    } else if (gui_grab) {
+    } else if (grabbed) {
         if (alt_grab) {
 #ifdef CONFIG_DARWIN
             status = " - Press ⌃⌥⇧G to exit grab";
@@ -373,6 +635,24 @@ static void sdl_grab_end(struct sdl2_console *scon)
     sdl_update_caption(scon);
 }
 
+#ifdef CONFIG_WIN32
+/*
+ * The keyboard is grabbed, so that the Windows keys, Alt+Tab and Print Screen
+ * go to the guest, by the hotkey Ctrl+Alt+G and in full screen, and released
+ * by the hotkey again, at the end of full screen and when the window loses
+ * the focus. It is not grabbed by the pointer's entering the window, which
+ * on an absolute tablet starts QEMU's grab (absolute_mouse_grab): the user's
+ * Alt+Tab and Windows keys stay the user's then.
+ */
+static void spacebox_win_kbd_grab(struct sdl2_console *scon, bool on)
+{
+    spacebox_kbd_grab = on;
+    SDL_SetWindowKeyboardGrab(scon->real_window, on ? SDL_TRUE : SDL_FALSE);
+    spacebox_win_print_hook(on);
+    sdl_update_caption(scon);
+}
+#endif
+
 static void absolute_mouse_grab(struct sdl2_console *scon)
 {
     int mouse_x, mouse_y;
@@ -446,10 +726,17 @@ static void toggle_full_screen(struct sdl2_console *scon)
                                 SDL_WINDOW_FULLSCREEN_DESKTOP);
         gui_saved_grab = gui_grab;
         sdl_grab_start(scon);
+#ifdef CONFIG_WIN32
+        spacebox_kbd_saved = spacebox_kbd_grab;
+        spacebox_win_kbd_grab(scon, true);
+#endif
     } else {
         if (!gui_saved_grab) {
             sdl_grab_end(scon);
         }
+#ifdef CONFIG_WIN32
+        spacebox_win_kbd_grab(scon, spacebox_kbd_saved);
+#endif
         SDL_SetWindowFullscreen(scon->real_window, 0);
     }
     sdl2_redraw(scon);
@@ -535,6 +822,27 @@ static void handle_keydown(SDL_Event *ev)
             break;
         case SDL_SCANCODE_G:
             scon->gui_keysym = true;
+#ifdef CONFIG_WIN32
+            /*
+             * The hotkey's grab is the keyboard's, which only the hotkey (and
+             * full screen) sets; the pointer's grab follows it. On an absolute
+             * tablet the pointer's moves in the window start the pointer's
+             * grab by themselves (absolute_mouse_grab), so toggling the two
+             * apart left them out of phase: the hotkey then grabbed one and
+             * released the other, and the title never showed a release.
+             */
+            if (!gui_fullscreen) {
+                bool on = !spacebox_kbd_grab;
+
+                spacebox_win_kbd_grab(scon, on);
+                if (on && !gui_grab) {
+                    sdl_grab_start(scon);
+                } else if (!on && gui_grab) {
+                    sdl_grab_end(scon);
+                }
+                break;
+            }
+#endif
             if (!gui_grab) {
                 sdl_grab_start(scon);
             } else if (!gui_fullscreen) {
@@ -676,6 +984,12 @@ static void handle_mousewheel(SDL_Event *ev)
     struct sdl2_console *scon = get_scon_from_window(ev->wheel.windowID);
     SDL_MouseWheelEvent *wev = &ev->wheel;
     InputButton btn;
+#ifdef CONFIG_WIN32
+    /* as the Mac's scroll events, which go to the agent before SDL has them */
+    if (scon && qemu_console_is_graphic(scon->dcl.con) && spacebox_scroll_wheel(wev)) {
+        return;
+    }
+#endif
     const char *trace=getenv("SPACEBOX_SCROLL_TRACE");
     if (trace) { FILE *f=fopen(trace,"a"); if(f) { fprintf(f,"{\"stage\":\"sdl\",\"host_us\":%lld,\"x\":%d,\"y\":%d,\"precise_x\":%.9g,\"precise_y\":%.9g,\"direction\":%u}\n",(long long)g_get_monotonic_time(),wev->x,wev->y,wev->preciseX,wev->preciseY,wev->direction); fclose(f); } }
 
@@ -745,6 +1059,11 @@ static void handle_windowevent(SDL_Event *ev)
         if (gui_grab && !gui_fullscreen) {
             sdl_grab_end(scon);
         }
+#ifdef CONFIG_WIN32
+        if (spacebox_kbd_grab && !gui_fullscreen) {
+            spacebox_win_kbd_grab(scon, false);
+        }
+#endif
         break;
     case SDL_WINDOWEVENT_RESTORED:
         update_displaychangelistener(&scon->dcl, GUI_REFRESH_INTERVAL_DEFAULT);
@@ -804,7 +1123,7 @@ void sdl2_poll_events(struct sdl2_console *scon)
             sdl_update_caption(scon);
         }
     }
-#ifdef CONFIG_DARWIN
+#if defined(CONFIG_DARWIN) || defined(CONFIG_WIN32)
     spacebox_scroll_tick(scon->real_window);
 #endif
     while (SDL_PollEvent(ev)) {
@@ -1001,6 +1320,16 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
         SDL_LogSetAllPriority(SDL_LOG_PRIORITY_VERBOSE);
     }
 
+#ifdef CONFIG_WIN32
+    if (spacebox_win_dpi()) {
+        SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+        SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "1");
+    }
+#endif
+#ifdef CONFIG_WIN32
+    spacebox_stop_msg = RegisterWindowMessageW(L"SpaceboxSinkStop");
+    SDL_SetWindowsMessageHook(spacebox_win_message, NULL);
+#endif
     if (SDL_Init(SDL_INIT_VIDEO)) {
         fprintf(stderr, "Could not initialize SDL(%s) - exiting\n",
                 SDL_GetError());
@@ -1011,6 +1340,10 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
 #endif
 #ifdef CONFIG_DARWIN
     /* Keep macOS application switching available with the absolute tablet. */
+    SDL_SetHint(SDL_HINT_GRAB_KEYBOARD, "0");
+#elif defined(CONFIG_WIN32)
+    /* The keyboard is grabbed apart from the pointer (spacebox_win_kbd_grab):
+     * with this hint each release of the pointer released it too. */
     SDL_SetHint(SDL_HINT_GRAB_KEYBOARD, "0");
 #else
     SDL_SetHint(SDL_HINT_GRAB_KEYBOARD, "1");
@@ -1118,6 +1451,14 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
     }
 
     atexit(sdl_cleanup);
+#if defined(CONFIG_WIN32) && defined(CONFIG_OPENGL)
+    /*
+     * The presenter's hidden window goes before SDL's own quit (registered
+     * later, so run earlier): left to sdl_cleanup with the sink's context
+     * current on it, the sink crashed inside SDL2.dll as it ended (turn G5a).
+     */
+    atexit(sdl2_win_gl_offscreen_close);
+#endif
 
     /* SDL's event polling (in dpy_refresh) must happen on the main thread. */
     qemu_main = NULL;
@@ -1138,4 +1479,105 @@ type_init(register_sdl1);
 
 #ifdef CONFIG_OPENGL
 module_dep("ui-opengl");
+#endif
+
+#if defined(CONFIG_WIN32) && defined(CONFIG_OPENGL)
+/*
+ * include/ui/sdl2.h: SDL's calls that make a context current, told to epoxy
+ * at each new context and, on a thread, at the first context made current
+ * there. epoxy's function pointers of WGL may in principle differ from
+ * context to context, and telling it resets every pointer, to be looked up
+ * again (wglGetProcAddress) at its next call. Every context of the sink is
+ * made by SDL on its window, with one pixel format of one driver, so the
+ * pointers are the same in all of them; telling epoxy at each change of the
+ * current context (the renderer changes contexts many times a frame) made
+ * the guest's drawing about 10 times slower on BF2's NVIDIA GL (the frames
+ * of hard-case: 1.3 s against 0.12 to 0.18 s for 120, the same 60 hashes
+ * either way). A new context is still told: without that the sink called a
+ * null pointer at its start.
+ */
+#undef SDL_GL_MakeCurrent
+#undef SDL_GL_CreateContext
+static __thread bool spacebox_gl_told;
+
+static void spacebox_gl_tell_epoxy(void)
+{
+    if (!spacebox_gl_told) {
+        epoxy_handle_external_wglMakeCurrent();
+        spacebox_gl_told = true;
+    }
+}
+
+/*
+ * The window's device context belongs to the presenter's thread while the
+ * presenter runs (ui/spacebox-presenter.h). WGL binds a context to the device
+ * context it is made current on, and the sink's thread changes its current
+ * context many times a frame (the renderer's contexts); bound to the window's
+ * device context while the presenter's thread swapped that window's buffers,
+ * the sink crashed inside NVIDIA's GL driver (nvoglv64.dll, on its own thread
+ * or the sink's) within a few plays of 3840 x 2160 video, and not in 12 such
+ * plays with the presenter off (turn G5a). CGL has no such binding on the
+ * Mac. So every other thread makes its contexts current, and makes them, on a
+ * hidden window of the window's pixel format; a GL context may be current on
+ * any drawable of its pixel format. Contexts made before the hidden window
+ * stay usable on it.
+ */
+static SDL_Window *spacebox_gl_offscreen;
+static __thread bool spacebox_gl_on_window;
+
+static SDL_Window *spacebox_gl_drawable(SDL_Window *window)
+{
+    return spacebox_gl_offscreen && !spacebox_gl_on_window ? spacebox_gl_offscreen : window;
+}
+
+bool sdl2_win_gl_offscreen_open(SDL_Window *window)
+{
+    /* SDL gives an OpenGL window the pixel format of the attributes now set,
+     * those the window was made with */
+    spacebox_gl_offscreen = SDL_CreateWindow("", 0, 0, 1, 1,
+                                             SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+    if (!spacebox_gl_offscreen) {
+        fprintf(stderr, "[SPACEBOX-GL] no hidden window for the sink's contexts: %s\n",
+                SDL_GetError());
+    }
+    return spacebox_gl_offscreen != NULL;
+}
+
+void sdl2_win_gl_offscreen_close(void)
+{
+    SDL_Window *w = spacebox_gl_offscreen;
+
+    spacebox_gl_offscreen = NULL;
+    if (w) {
+        SDL_GL_MakeCurrent(w, NULL);
+        SDL_DestroyWindow(w);
+    }
+}
+
+void sdl2_win_gl_on_window(void)
+{
+    spacebox_gl_on_window = true;
+}
+
+int sdl2_win_gl_make_current(SDL_Window *window, SDL_GLContext ctx)
+{
+    int r = SDL_GL_MakeCurrent(spacebox_gl_drawable(window), ctx);
+
+    if (!r && ctx) {
+        spacebox_gl_tell_epoxy();
+    }
+    return r;
+}
+
+SDL_GLContext sdl2_win_gl_create_context(SDL_Window *window)
+{
+    SDL_GLContext ctx = SDL_GL_CreateContext(spacebox_gl_drawable(window));
+
+    if (ctx) {
+        /* SDL made it current */
+        epoxy_handle_external_wglMakeCurrent();
+        spacebox_gl_told = true;
+    }
+    return ctx;
+}
 #endif

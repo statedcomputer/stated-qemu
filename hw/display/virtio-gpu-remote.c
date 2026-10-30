@@ -13,6 +13,8 @@
  *
  * SPACEBOX_GPU_REMOTE_SOURCE=<unix socket>  connect to a sink (retries)
  * SPACEBOX_GPU_REMOTE_SINK=<unix socket>    listen for one source
+ *                                           (either: HOST:PORT for TCP instead,
+ *                                           see sp_addr_is_tcp())
  * SPACEBOX_GPU_REMOTE_STATS=1               print traffic counters every 5 s
  * SPACEBOX_GPU_REMOTE_FENCE_WINDOW=<n>      source: answer up to n fenced commands
  *                                           before the sink has finished them
@@ -88,8 +90,10 @@
 #include <zstd.h>
 #endif
 
+#ifndef _WIN32
 #include <sys/socket.h>
 #include <sys/un.h>
+#endif
 
 #define SP_MAGIC 0x32475053u /* "SPG2" */
 #define SP_RESP_CAP_MAX (4u << 20)
@@ -303,6 +307,31 @@ static int64_t sp_aud_delay_us; /* sink: how much later sound is played, 0 = sil
  */
 int64_t spacebox_frame_due_us;
 int64_t spacebox_frame_gap_us;  /* usual spacing of recent updates, 0 = not a steady stream */
+#ifdef CONFIG_WIN32
+/*
+ * Windows: the refresh of the window's display (the presenter's, 0 = not known
+ * yet). The Mac's display (120 Hz) can show a frame half a 60/s video's
+ * spacing early or late; BF2's (59.95 Hz) is no faster than such a video, so
+ * the allowance's changes show there: a fall that brings frames sooner than a
+ * refresh apart leaves the presenter behind, and it drops frames to catch up
+ * (18 of a 60/s clip as the allowance of its start came down: PresentMon's
+ * record on BF2), and a rise holds frames a refresh more (below). So on
+ * Windows the allowance falls only by the slack that the stream's spacing
+ * leaves beyond a refresh a frame, which a 30/s video has and a 60/s one has
+ * not, and a video's start does not raise it to its maximum.
+ */
+int64_t spacebox_present_refresh_us;
+#define SP_WIN_VIDEO_US 150000  /* the least allowance while a video plays */
+/*
+ * Windows: the mean spacing of recent updates (the middle half of them), 0 =
+ * not a steady stream. The usual spacing is the median of the updates, which
+ * at a rate that is not a whole number of refreshes is one of the two
+ * spacings that the guest alternates (a 24/s video on a 59.95 Hz display: 2
+ * and 3 refreshes, 2.5 a frame); the presenter's least spacing on Windows is
+ * taken from this mean (ui/spacebox-presenter.h).
+ */
+int64_t spacebox_frame_step_us;
+#endif
 /*
  * When the user last pressed a key, clicked or scrolled (this machine's clock;
  * set here and by ui/spacebox-scroll.m). Pacing holds every frame back, the
@@ -335,6 +364,9 @@ static struct {
     int64_t expect;     /* the lateness expected of the updates behind the
                            writes in pieces that come, 0 = none */
     int64_t expect_max; /* ... the most of the 5 s line */
+#ifdef CONFIG_WIN32
+    int64_t slack;      /* the stream's spacing beyond a refresh a frame, summed */
+#endif
 } sp_pace = { .mode = -1, .input_us = -1 };
 
 /* what the pacing learns of the writes in pieces (sp_sink_pace_write) */
@@ -377,6 +409,9 @@ static void sp_sink_pace_frame(const SpHdr *h)
     }
     spacebox_frame_due_us = 0;
     spacebox_frame_gap_us = 0;
+#ifdef CONFIG_WIN32
+    spacebox_frame_step_us = 0;
+#endif
     if (!h->t_us || base == INT64_MAX) {
         return;
     }
@@ -385,8 +420,21 @@ static void sp_sink_pace_frame(const SpHdr *h)
         sp_pace.gap[sp_pace.gap_pos] = h->t_us - sp_pace.last_t_us;
         sp_pace.gap_pos = (sp_pace.gap_pos + 1) % G_N_ELEMENTS(sp_pace.gap);
         sp_pace.gap_n = MIN(sp_pace.gap_n + 1, G_N_ELEMENTS(sp_pace.gap));
+#ifdef CONFIG_WIN32
+        {
+            int64_t r = qatomic_read(&spacebox_present_refresh_us);
+
+            if (r > 0) {
+                sp_pace.slack += h->t_us - sp_pace.last_t_us - r;
+                sp_pace.slack = MAX(MIN(sp_pace.slack, G_USEC_PER_SEC), -G_USEC_PER_SEC);
+            }
+        }
+#endif
     } else {
         sp_pace.gap_n = sp_pace.gap_pos = 0; /* a pause: not a steady stream */
+#ifdef CONFIG_WIN32
+        sp_pace.slack = 0;
+#endif
     }
     sp_pace.last_t_us = h->t_us;
     late = MAX(read - h->t_us - base, 0);
@@ -425,6 +473,39 @@ static void sp_sink_pace_frame(const SpHdr *h)
             target = MAX(target, sp_pace.late_max[i]);
         }
     }
+#ifdef CONFIG_WIN32
+    /*
+     * A display of a video's rate (BF2: 59.95 Hz) shows each refresh of a rise
+     * of the allowance as a frame held a refresh more, past the judder bound,
+     * and a frame a little late as one held a refresh more, where the Mac's
+     * (120 Hz) shows it within the bound. By PresentMon's record on BF2:
+     * rising to the lateness of the page's loading before a video (its large
+     * transfers, 366 ms) held 22 frames so (1.1% of a 30/s clip of 64 s); the
+     * guest's own updates come late in a video's first half second, up to 133
+     * ms at 3840x2160; and an update waits in this sink after its read for a
+     * large write of the link before it (a 30/s video of 3840x2160: every
+     * eighth frame, up to 170 ms), which the lateness by the read does not
+     * see. On Windows a video's start takes the lateness of its own updates
+     * from this one on, the allowance stays at SP_WIN_VIDEO_US at least while
+     * the video plays, which covered those, and it rises a refresh a frame
+     * (below): 9 frames held a refresh more at the start. It takes their
+     * spacing too: the usual spacing of the page's updates before the video
+     * (100 ms or more) held its first frames that long apart in the presenter,
+     * a stall of 133 to 150 ms at a 2160p60 play's start (G5c).
+     */
+    if (qatomic_read(&spacebox_present_refresh_us) > 0) {
+        if (starting) {
+            memset(sp_pace.late_max, 0, sizeof(sp_pace.late_max));
+            memset(sp_pace.late_sec, 0, sizeof(sp_pace.late_sec));
+            sp_pace.late_sec[sec % 10] = sec;
+            sp_pace.late_max[sec % 10] = late;
+            sp_pace.gap_n = sp_pace.gap_pos = 0;
+            sp_pace.usual_gap = 0;
+        }
+        starting = false;
+        target = MAX(target, SP_WIN_VIDEO_US);
+    }
+#endif
     target = MIN(starting ? sp_pace.max_us : target, sp_pace.max_us);
     if (sp_aud_delay_us) {
         /*
@@ -468,15 +549,40 @@ static void sp_sink_pace_frame(const SpHdr *h)
     }
     step = sp_pace.expect > sp_pace.allowance ? gap / 2 : gap / 3;
     if (target > sp_pace.allowance) {
+#ifdef CONFIG_WIN32
+        int64_t r = qatomic_read(&spacebox_present_refresh_us);
+
+        sp_pace.allowance += MIN(target - sp_pace.allowance, r > 0 ? r : step);
+#else
         sp_pace.allowance += MIN(target - sp_pace.allowance, step);
+#endif
     } else {
-        sp_pace.allowance -= (sp_pace.allowance - target) / 64;
+        int64_t fall = (sp_pace.allowance - target) / 64;
+
+#ifdef CONFIG_WIN32
+        if (qatomic_read(&spacebox_present_refresh_us) > 0) {
+            fall = MIN(fall, MAX(sp_pace.slack, 0));
+            sp_pace.slack -= fall;
+        }
+#endif
+        sp_pace.allowance -= fall;
     }
     spacebox_frame_gap_us = 0;
     if (sp_pace.gap_n >= 16) {
         memcpy(sorted, sp_pace.gap, sp_pace.gap_n * sizeof(sorted[0]));
         qsort(sorted, sp_pace.gap_n, sizeof(sorted[0]), sp_cmp_i64);
         spacebox_frame_gap_us = sp_pace.usual_gap = sorted[sp_pace.gap_n / 2];
+#ifdef CONFIG_WIN32
+        {
+            unsigned lo = sp_pace.gap_n / 4, hi = sp_pace.gap_n - sp_pace.gap_n / 4;
+            int64_t sum = 0;
+
+            for (unsigned i = lo; i < hi; i++) {
+                sum += sorted[i];
+            }
+            spacebox_frame_step_us = sum / (hi - lo);
+        }
+#endif
     }
     if (late >= sp_pace.allowance) {
         sp_pace.late_frames++;
@@ -505,6 +611,9 @@ static void sp_sink_pace_reset(void)
     sp_pace.last_t_us = 0;
     sp_pace.expect = 0;
     memset(&sp_pw, 0, sizeof(sp_pw));
+#ifdef CONFIG_WIN32
+    sp_pace.slack = 0;
+#endif
     sp_rx_min = sp_rx_min_prev = INT64_MAX;
     sp_rx_min_t0 = 0;
     sp_aud_delay_us = 0;
@@ -1803,6 +1912,23 @@ static void sp_wait_run(SpWait *e)
         sp_wait_hold(f, -1);
     }
     e->msgs = NULL;
+#ifdef CONFIG_WIN32
+    /*
+     * The record: a command held here 20 ms or more, from its first message's
+     * read (the Windows client's G5e: a main-loop wait that the main loop did
+     * not cause)
+     */
+    if (m && g_get_monotonic_time() - m->t_read >= 20000) {
+        char what[64];
+
+        if (e->wlen) {
+            snprintf(what, sizeof(what), "held for its write of %" PRIu64 " bytes", e->wlen);
+        } else {
+            snprintf(what, sizeof(what), "held behind an earlier command");
+        }
+        sp_record_busy(what, m->t_read, g_get_monotonic_time());
+    }
+#endif
     sph.running = true;
     sph.at = after;
     sp_run_msgs(m);
@@ -2219,6 +2345,10 @@ static int sp_sink_admit(SpRxMsg *m)
     }
 }
 
+#ifdef CONFIG_WIN32
+static int64_t sp_rx_last_end;  /* when the main loop last ran the messages */
+#endif
+
 /* the main loop: the messages that the reader queued, in their order */
 static void sp_rx(void *opaque)
 {
@@ -2239,6 +2369,19 @@ static void sp_rx(void *opaque)
     qemu_mutex_unlock(&sp.rx_lock);
 
     sp.rx_busy = true;
+#ifdef CONFIG_WIN32
+    /*
+     * The record: a message read while the main loop ran something else than
+     * the link's messages, 20 ms or more of it (the Windows client's G5e)
+     */
+    if (m && sp_rx_last_end) {
+        int64_t now = g_get_monotonic_time(), from = MAX(m->t_read, sp_rx_last_end);
+
+        if (now - from >= 20000) {
+            sp_record_busy("main loop elsewhere", from, now);
+        }
+    }
+#endif
     while (m && !closed && sp.fd >= 0 && sp.conn_gen == gen) {
         SpHdr h;
         int64_t run = g_get_monotonic_time(), d = run - m->t_read;
@@ -2331,9 +2474,113 @@ static void sp_rx(void *opaque)
     sp_rx_free(m);
     sp_rx_now = sp_rx_run = 0;
     sp.rx_busy = false;
+#ifdef CONFIG_WIN32
+    sp_rx_last_end = g_get_monotonic_time();
+#endif
     if (closed && sp.conn_gen == gen) {
         sp_disconnected();
     }
+}
+
+#ifdef _WIN32
+/* the notifier is an event object on Windows, not a file descriptor */
+static void sp_rx_notified(EventNotifier *e)
+{
+    sp_rx(NULL);
+}
+#endif
+
+/*
+ * The address of a socket of the link (SPACEBOX_GPU_REMOTE_SINK, _SOURCE,
+ * _AUDIO, and SPACEBOX_SCROLL_SOCKET in ui/): a Unix socket's path, or
+ * HOST:PORT for TCP, a value with no '/' or '\\' that ends in ':' and digits.
+ * On Windows the local end of the SSH forward to the lab can be TCP on
+ * 127.0.0.1 (screen/windows/ of the spacebox repository); a path there is a
+ * Unix socket too (AF_UNIX, afunix.h).
+ */
+bool sp_addr_is_tcp(const char *a)
+{
+    const char *c = strrchr(a, ':');
+
+    if (!c || c == a || !c[1] || strpbrk(a, "/\\")) {
+        return false;
+    }
+    for (c++; *c; c++) {
+        if (!g_ascii_isdigit(*c)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* A stream of the link on TCP has no Nagle delay, as a Unix socket has none. */
+void sp_sock_tune(int fd)
+{
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof(ss);
+
+    if (getsockname(fd, (struct sockaddr *)&ss, &len) == 0 &&
+        (ss.ss_family == AF_INET || ss.ss_family == AF_INET6)) {
+        socket_set_nodelay(fd);
+    }
+}
+
+/* A socket listening on the address (a Unix socket's path is unlinked
+ * first); -1 with errno set when it cannot listen. */
+int sp_sock_listen(const char *a)
+{
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    int fd, e;
+
+    if (sp_addr_is_tcp(a)) {
+        Error *err = NULL;
+        SocketAddress *sa = socket_parse(a, &err);
+
+        fd = sa ? socket_listen(sa, 1, &err) : -1;
+        qapi_free_SocketAddress(sa);
+        if (fd < 0) {
+            error_report_err(err);
+            errno = EADDRNOTAVAIL;
+        }
+        return fd;
+    }
+    g_strlcpy(addr.sun_path, a, sizeof(addr.sun_path));
+    unlink(a);
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0 || bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
+        listen(fd, 1) < 0) {
+        e = errno;
+        if (fd >= 0) {
+            close(fd);
+        }
+        errno = e;
+        return -1;
+    }
+    return fd;
+}
+
+/* A stream connected to the address (blocking), or -1. */
+int sp_sock_connect(const char *a)
+{
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    int fd;
+
+    if (sp_addr_is_tcp(a)) {
+        SocketAddress *sa = socket_parse(a, NULL);
+
+        fd = sa ? socket_connect(sa, NULL) : -1;
+        qapi_free_SocketAddress(sa);
+        return fd;
+    }
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    g_strlcpy(addr.sun_path, a, sizeof(addr.sun_path));
+    if (fd < 0 || connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        return -1;
+    }
+    return fd;
 }
 
 static void sp_set_connected(int fd)
@@ -2344,6 +2591,7 @@ static void sp_set_connected(int fd)
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
 #endif
     (void)yes;
+    sp_sock_tune(fd);
     qemu_mutex_lock(&sp.tx_lock);
     sp.fd = fd;
     sp.hello_done = false;
@@ -3435,7 +3683,6 @@ static void sp_source_input(SpHdr *h, uint8_t *a)
 static void sp_source_connect(void *opaque)
 {
     VirtIOGPU *g = sp.g;
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
     int fd;
 
     if (sp.fd >= 0) {
@@ -3443,12 +3690,8 @@ static void sp_source_connect(void *opaque)
         sp_source_handle_ctrl(g, g->ctrl_vq);
         return;
     }
-    fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    g_strlcpy(addr.sun_path, sp.path, sizeof(addr.sun_path));
-    if (fd < 0 || connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        if (fd >= 0) {
-            close(fd);
-        }
+    fd = sp_sock_connect(sp.path);
+    if (fd < 0) {
         timer_mod(sp.retry, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 250);
         return;
     }
@@ -4090,10 +4333,24 @@ static void sp_sink_send_info(VirtIOGPU *g, bool caps)
     }
     di.hdr.type = VIRTIO_GPU_RESP_OK_DISPLAY_INFO;
     virtio_gpu_base_fill_display_info(VIRTIO_GPU_BASE(g), &di);
-    sp_send(SP_INFO, 0, &di, sizeof(di), NULL, 0, 2, 0, 0);
     ed.hdr.type = VIRTIO_GPU_RESP_OK_EDID;
     virtio_gpu_base_generate_edid(VIRTIO_GPU_BASE(g), 0, &ed);
+#ifdef _WIN32
+    /*
+     * The EDID first: the device shows the guest a new display when the
+     * display information changes (its event) and answers the guest's EDID
+     * query with the EDID it holds then. Sent after the display information,
+     * the EDID could come after that query, and the guest kept the EDID of
+     * the earlier size with the new display (its compositor then took a mode
+     * of that EDID, 5120x2160 at 50 Hz, about once in 20 entries into full
+     * screen).
+     */
     sp_send(SP_INFO, 0, &ed, sizeof(ed), NULL, 0, 3, 0, 0);
+    sp_send(SP_INFO, 0, &di, sizeof(di), NULL, 0, 2, 0, 0);
+#else
+    sp_send(SP_INFO, 0, &di, sizeof(di), NULL, 0, 2, 0, 0);
+    sp_send(SP_INFO, 0, &ed, sizeof(ed), NULL, 0, 3, 0, 0);
+#endif
 }
 
 void sp_sink_notify_event(uint32_t event_type)
@@ -4361,6 +4618,92 @@ bool spacebox_sink_close(void)
  * loop reads. A signal that comes while the sink already waits for the bye is
  * logged and changes nothing: SP_CLOSE_WAIT_MS bounds the wait.
  */
+#ifdef _WIN32
+/*
+ * Windows has no signals for this: a console's Ctrl+C and Ctrl+Break, the
+ * close of its console, the logoff and the shutdown come to a handler that
+ * the system calls on a thread of its own. QEMU's (os-win32.c) ends the
+ * process at once; this one, set later and so called first, hands the event
+ * to the main loop by a bottom half, which closes as a signal does. For the
+ * close, the logoff and the shutdown the system ends the process when the
+ * handler returns (at most 5 s after the event), so the handler waits up to
+ * 4.5 s for the bye first. (The stop script on Windows posts the window a
+ * stop request instead: spacebox_sink_stop_request, below.)
+ */
+static QEMUBH *sp_sig_bh;
+static int sp_sig_event;
+
+static void sp_sink_signal_read(void *opaque)
+{
+    int ev = qatomic_read(&sp_sig_event);
+
+    if (sp.closing) {
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink got console event %d while it "
+                "waits for the bye: no change\n", ev);
+        return;
+    }
+    fprintf(stderr, "[SPACEBOX-REMOTE] sink got console event %d: closing as "
+            "its window would\n", ev);
+    spacebox_sink_close();
+}
+
+static BOOL WINAPI sp_sink_console_event(DWORD ev)
+{
+    qatomic_set(&sp_sig_event, (int)ev);
+    qemu_bh_schedule(sp_sig_bh);
+    if (ev == CTRL_C_EVENT || ev == CTRL_BREAK_EVENT) {
+        return TRUE;
+    }
+    Sleep(4500);
+    return TRUE;
+}
+
+/*
+ * The stop script's request (screen/windows/sp-win.py): a message of its own
+ * posted to the sink's window (ui/sdl2.c), with the request's identifier and
+ * the process it is for. It closes as the window would; its line, logged
+ * only when this request starts the close, is the Windows form of the
+ * Mac's signal line (the check of a planned stop reads it). A request that
+ * comes while the sink already waits for the bye, by a click of the close
+ * box or an earlier request, is logged apart and changes nothing. Returns
+ * false when this is not a remote sink.
+ */
+bool spacebox_sink_stop_request(uint64_t id, int64_t pid)
+{
+    unsigned long own = GetCurrentProcessId();
+
+    if (sp.mode != SP_REMOTE_SINK) {
+        return false;
+    }
+    if (pid != (int64_t)own) {
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink got stop request %" PRIu64
+                " for pid %" PRId64 ", not this sink (pid %lu): ignored\n",
+                id, pid, own);
+        return true;
+    }
+    if (sp.closing) {
+        fprintf(stderr, "[SPACEBOX-REMOTE] sink got stop request %" PRIu64
+                " for pid %" PRId64 " while it waits for the bye: no change\n",
+                id, pid);
+        return true;
+    }
+    fprintf(stderr, "[SPACEBOX-REMOTE] sink got stop request %" PRIu64
+            " for pid %" PRId64 " (this sink): closing as its window would\n",
+            id, pid);
+    spacebox_sink_close();
+    return true;
+}
+
+/* From the main loop: QEMU sets its handlers after the devices are made. */
+static void sp_sink_signals_install(void *opaque)
+{
+    sp_sig_bh = qemu_bh_new(sp_sink_signal_read, NULL);
+    if (!SetConsoleCtrlHandler(sp_sink_console_event, TRUE)) {
+        error_report("spacebox remote gpu: no handler for console events; "
+                     "Ctrl+C ends the sink without a detach");
+    }
+}
+#else
 static int sp_sig_fd[2] = { -1, -1 };
 
 static void sp_sink_signal(int sig)
@@ -4412,6 +4755,7 @@ static void sp_sink_signals_install(void *opaque)
         sigaction(sigs[i], &act, NULL);
     }
 }
+#endif
 
 static void sp_input_event(DeviceState *dev, QemuConsole *src, InputEvent *evt)
 {
@@ -4534,7 +4878,9 @@ static void sp_disconnected(void)
             qemu_set_fd_handler(sp.listen_fd, NULL, NULL, NULL);
             close(sp.listen_fd);
             sp.listen_fd = -1;
-            unlink(sp.path);
+            if (!sp_addr_is_tcp(sp.path)) {
+                unlink(sp.path);
+            }
         }
         fprintf(stderr, "[SPACEBOX-REMOTE] sink detached: the source said bye; "
                 "connection closed, not listening, exiting\n");
@@ -4821,7 +5167,6 @@ static void sp_ach_close(void)
 
 static bool sp_ach_source_ready(void)
 {
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
     int64_t now = g_get_monotonic_time();
     int fd;
 
@@ -4838,15 +5183,11 @@ static bool sp_ach_source_ready(void)
         return false;
     }
     sp_ach.last_try = now;
-    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    fd = sp_sock_connect(sp_ach.path);
     if (fd < 0) {
         return false;
     }
-    g_strlcpy(addr.sun_path, sp_ach.path, sizeof(addr.sun_path));
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(fd);
-        return false;
-    }
+    sp_sock_tune(fd);
     qemu_socket_set_nonblock(fd);
 #ifdef SO_NOSIGPIPE
     {
@@ -4869,18 +5210,27 @@ void spacebox_remote_audio_out(int freq, int channels, const void *buf, size_t l
             .magic = SP_MAGIC, .type = SP_AUDIO, .a_len = len,
             .arg0 = freq, .arg1 = channels, .t_us = g_get_monotonic_time(),
         };
+        ssize_t n;
+#ifdef _WIN32
+        /* no sendmsg: the header and the sound in one send, as one write */
+        g_autofree uint8_t *one = g_malloc(sizeof(h) + len);
+
+        memcpy(one, &h, sizeof(h));
+        memcpy(one + sizeof(h), buf, len);
+        n = send(sp_ach.fd, one, sizeof(h) + len, 0);
+#else
         struct iovec iov[2] = {
             { .iov_base = &h, .iov_len = sizeof(h) },
             { .iov_base = (void *)buf, .iov_len = len },
         };
         struct msghdr m = { .msg_iov = iov, .msg_iovlen = 2 };
-        ssize_t n;
         int flags = 0;
 
 #ifdef MSG_NOSIGNAL
         flags |= MSG_NOSIGNAL;
 #endif
         n = sendmsg(sp_ach.fd, &m, flags);
+#endif
         if (n == (ssize_t)(sizeof(h) + len)) {
             sp_ach.sent++;
             return;
@@ -5159,6 +5509,7 @@ static void sp_ach_sink_accept(void *opaque)
         return;
     }
     sp_ach_close();     /* the newer connection wins */
+    sp_sock_tune(fd);
     qemu_socket_set_nonblock(fd);
     sp_ach.fd = fd;
     qemu_set_fd_handler(fd, sp_ach_sink_rx, NULL, NULL);
@@ -5166,19 +5517,14 @@ static void sp_ach_sink_accept(void *opaque)
 
 static void sp_ach_sink_listen(void)
 {
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
     const char *path = getenv("SPACEBOX_GPU_REMOTE_AUDIO");
 
     if (!path || !*path) {
         return;
     }
     sp_ach.rx = g_byte_array_new();
-    g_strlcpy(addr.sun_path, path, sizeof(addr.sun_path));
-    unlink(path);
-    sp_ach.listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sp_ach.listen_fd < 0 ||
-        bind(sp_ach.listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
-        listen(sp_ach.listen_fd, 1) < 0) {
+    sp_ach.listen_fd = sp_sock_listen(path);
+    if (sp_ach.listen_fd < 0) {
         warn_report("spacebox remote gpu: cannot listen for sound on %s", path);
         return;
     }
@@ -5206,6 +5552,14 @@ static void sp_dispatch(SpHdr *h, uint8_t *a, uint8_t *b)
             sp_state_ctrl_seen();
             sp_sink_ctrl(g, h, a, b);
             d = g_get_monotonic_time() - t0;
+#ifdef CONFIG_WIN32
+            if (d >= 10000) {
+                char what[32];
+
+                snprintf(what, sizeof(what), "command 0x%04x", type);
+                sp_record_busy(what, t0, t0 + d);
+            }
+#endif
             sp_busy.total += d;
             if (type == VIRTIO_GPU_CMD_SUBMIT_3D) {
                 sp_busy.submit += d;
@@ -5507,7 +5861,11 @@ void sp_remote_realize(VirtIOGPU *g, Error **errp)
         error_setg(errp, "spacebox remote gpu: no notifier for the link's reader");
         return;
     }
+#ifdef _WIN32
+    event_notifier_set_handler(&sp.rx_notify, sp_rx_notified);
+#else
     qemu_set_fd_handler(event_notifier_get_fd(&sp.rx_notify), sp_rx, NULL, NULL);
+#endif
     qemu_mutex_init(&sp.tx_lock);
     qemu_cond_init(&sp.tx_cond);
     g_queue_init(&sp.tx_queue);
@@ -5533,7 +5891,6 @@ void sp_remote_realize(VirtIOGPU *g, Error **errp)
         sp.retry = timer_new_ms(QEMU_CLOCK_REALTIME, sp_source_connect, NULL);
         timer_mod(sp.retry, qemu_clock_get_ms(QEMU_CLOCK_REALTIME));
     } else {
-        struct sockaddr_un addr = { .sun_family = AF_UNIX };
         const char *prof = getenv("SPACEBOX_GPU_REMOTE_PROFILE");
 
         if (prof && *prof && !sp_profile_load(prof, errp)) {
@@ -5543,12 +5900,8 @@ void sp_remote_realize(VirtIOGPU *g, Error **errp)
                                           NULL, g_free);
         sp.watch = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                          NULL, g_free);
-        g_strlcpy(addr.sun_path, sp.path, sizeof(addr.sun_path));
-        unlink(sp.path);
-        sp.listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (sp.listen_fd < 0 ||
-            bind(sp.listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
-            listen(sp.listen_fd, 1) < 0) {
+        sp.listen_fd = sp_sock_listen(sp.path);
+        if (sp.listen_fd < 0) {
             error_setg_errno(errp, errno, "spacebox remote gpu: cannot listen "
                              "on %s", sp.path);
             return;

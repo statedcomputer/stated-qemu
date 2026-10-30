@@ -29,7 +29,11 @@
  *         stop, the controls, the test pause
  * Every time is CLOCK_MONOTONIC in microseconds (this clock is
  * g_get_monotonic_time(), which on macOS does not count sleep: the
- * difference is taken at the record's start).
+ * difference is taken at the record's start). On Windows CLOCK_MONOTONIC is
+ * the QueryPerformanceCounter's (as winpthreads' clock_gettime, which
+ * virglrenderer reads there), and each swap line has the counter's own
+ * values at the swap's call and return (qpc_call, qpc_ret; qpc_hz in the
+ * record's start), the clock of PresentMon's events.
  *
  * Tickets come from virglrenderer (virgl_renderer_video_record): a picture's
  * ticket follows it into what the draws that read it write, so the scanout
@@ -72,7 +76,7 @@
 bool spacebox_video_record_on;
 uint64_t spacebox_frame_tickets[SP_REC_TICKETS];
 unsigned spacebox_frame_ntickets;
-int64_t spacebox_frame_flush_dev, spacebox_frame_flush_read;
+int64_t spacebox_frame_flush_dev, spacebox_frame_flush_read, spacebox_frame_flush_rx;
 int spacebox_present_pause_ms;
 
 typedef struct SpRecPic {
@@ -109,6 +113,19 @@ static struct {
     int64_t read_us, read_max, main_us;
 } rec;
 
+#ifdef _WIN32
+/* as winpthreads' clock_gettime(CLOCK_MONOTONIC), to the microsecond */
+static int64_t sp_rec_mono(void)
+{
+    LARGE_INTEGER f, c;
+    int64_t ns;
+
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    ns = ((c.QuadPart % f.QuadPart) * 1000000000 + (f.QuadPart >> 1)) / f.QuadPart;
+    return (int64_t)(c.QuadPart / f.QuadPart) * 1000000 + ns / 1000;
+}
+#else
 static int64_t sp_rec_mono(void)
 {
     struct timespec ts;
@@ -116,6 +133,7 @@ static int64_t sp_rec_mono(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
+#endif
 
 /* a time of this clock as CLOCK_MONOTONIC, or null */
 static void sp_rec_time(GString *s, const char *key, int64_t g)
@@ -258,10 +276,51 @@ static void sp_rec_drawn(void *opaque, uint64_t ticket, int64_t t)
     rec.main_us += g_get_monotonic_time() - t0;
 }
 
+#ifdef CONFIG_WIN32
+/*
+ * Windows: a guest command that held the main loop 10 ms or more (as
+ * virglrenderer names it), with the part of it that waited for video
+ * pictures, and the message it came in: what the main loop ran while the
+ * link's messages waited (the Windows client's G5e; screen/README.md)
+ */
+static void sp_rec_slow(void *opaque, const char *what, int64_t t0, int64_t t1,
+                        int64_t waited_us)
+{
+    GString *s = g_string_new("{\"k\":\"slow\"");
+
+    g_string_append_printf(s, ",\"what\":\"%s\"", what);
+    sp_rec_mtime(s, "t0", t0);
+    sp_rec_mtime(s, "t1", t1);
+    g_string_append_printf(s, ",\"waited_ms\":%.1f", waited_us / 1000.0);
+    sp_rec_time(s, "t_dev", rec.cmd_dev);
+    sp_rec_time(s, "t_read", rec.cmd_read);
+    g_string_append_c(s, '}');
+    sp_rec_put(s);
+}
+
+void sp_record_busy(const char *what, int64_t t0, int64_t t1)
+{
+    GString *s;
+
+    if (!spacebox_video_record_on) {
+        return;
+    }
+    s = g_string_new("{\"k\":\"busy\"");
+    g_string_append_printf(s, ",\"what\":\"%s\"", what);
+    sp_rec_time(s, "t0", t0);
+    sp_rec_time(s, "t1", t1);
+    g_string_append_c(s, '}');
+    sp_rec_put(s);
+}
+#endif
+
 static const struct virgl_renderer_video_record sp_rec_cbs = {
     .picture = sp_rec_picture,
     .decoded = sp_rec_decoded,
     .drawn = sp_rec_drawn,
+#ifdef CONFIG_WIN32
+    .slow = sp_rec_slow,
+#endif
 };
 
 /* ---- the sink's hooks ----------------------------------------------------- */
@@ -277,10 +336,11 @@ void sp_record_flush(uint32_t resource_id, bool begin)
 {
     if (!begin) {
         spacebox_frame_ntickets = 0;
-        spacebox_frame_flush_dev = spacebox_frame_flush_read = 0;
+        spacebox_frame_flush_dev = spacebox_frame_flush_read = spacebox_frame_flush_rx = 0;
     } else if (spacebox_video_record_on) {
         spacebox_frame_flush_dev = rec.cmd_dev;
         spacebox_frame_flush_read = rec.cmd_read;
+        spacebox_frame_flush_rx = rec.cmd_rx;
         int64_t t0 = g_get_monotonic_time();
 
         spacebox_frame_ntickets = virgl_renderer_resource_video_tickets(resource_id,
@@ -324,7 +384,9 @@ void spacebox_video_record_swap(uint64_t seq, int64_t t_swap, int code,
                                 unsigned n, uint64_t coalesced, int64_t read_us,
                                 int64_t t_show, int64_t t_call, int64_t t_vsync,
                                 int64_t t_out, int64_t t_due, int64_t t_flush_dev,
-                                int64_t t_flush_read)
+                                int64_t t_flush_read, int64_t qpc_call,
+                                int64_t qpc_ret, int64_t t_flush_rx,
+                                int64_t t_sub, int64_t t_ready, int64_t t_pick)
 {
     GString *s;
 
@@ -353,6 +415,16 @@ void spacebox_video_record_swap(uint64_t seq, int64_t t_swap, int code,
     sp_rec_time(s, "t_due_us", t_due);
     sp_rec_time(s, "t_flush_dev", t_flush_dev);
     sp_rec_time(s, "t_flush_read", t_flush_read);
+    if (qpc_call || qpc_ret) {
+        g_string_append_printf(s, ",\"qpc_call\":%" PRId64 ",\"qpc_ret\":%" PRId64,
+                               qpc_call, qpc_ret);
+    }
+    if (t_sub) {
+        sp_rec_time(s, "t_flush_rx", t_flush_rx);
+        sp_rec_time(s, "t_sub_us", t_sub);
+        sp_rec_time(s, "t_ready_us", t_ready);
+        sp_rec_time(s, "t_pick_us", t_pick);
+    }
     g_string_append_c(s, '}');
     sp_rec_put(s);
     for (unsigned i = 0; i < n; i++) {
@@ -470,13 +542,26 @@ static char *sp_rec_build(void)
             exe = g_strdup(buf);
         }
     }
+#elif defined(_WIN32)
+    {
+        wchar_t buf[4096];
+        DWORD n = GetModuleFileNameW(NULL, buf, G_N_ELEMENTS(buf));
+
+        if (n && n < G_N_ELEMENTS(buf)) {
+            exe = g_utf16_to_utf8(buf, n, NULL, NULL, NULL);
+        }
+    }
 #else
     exe = g_file_read_link("/proc/self/exe", NULL);
 #endif
     if (!exe) {
         return NULL;
     }
+#ifdef _WIN32
+    real = g_canonicalize_filename(exe, NULL);
+#else
     real = realpath(exe, NULL);
+#endif
     dir = g_path_get_dirname(real ? real : exe);
     name = g_path_get_basename(dir);
     return strcmp(name, "qemu-build") ? NULL : g_path_get_dirname(dir);
@@ -512,6 +597,16 @@ static void sp_rec_start(const char *path)
 
         build = g_strdup_printf(",\"sink_build\":\"%s\"", qb);
     }
+#ifdef _WIN32
+    {
+        LARGE_INTEGER hz;
+        g_autofree char *b2 = build;
+
+        QueryPerformanceFrequency(&hz);
+        build = g_strdup_printf("%s,\"qpc_hz\":%" PRId64, b2 ? b2 : "",
+                                (int64_t)hz.QuadPart);
+    }
+#endif
     more = g_strdup_printf(",\"path\":\"%s\",\"clock\":\"CLOCK_MONOTONIC\","
                            "\"video_rect\":%s,\"video_size\":%s,\"version\":1%s",
                            qpath, rect, size, build ? build : "");

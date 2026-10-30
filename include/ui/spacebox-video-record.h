@@ -24,6 +24,8 @@ extern unsigned spacebox_frame_ntickets;
 /* ... and the source's time and the read of the flush's message (the clock
  * of g_get_monotonic_time(), 0 = not known) */
 extern int64_t spacebox_frame_flush_dev, spacebox_frame_flush_read;
+/* ... and when the main loop ran it (written by the Windows presenter only) */
+extern int64_t spacebox_frame_flush_rx;
 /* the test pause: the presenter shows nothing for this many ms after its
  * next swap, once (0 = none); the presenter takes it */
 extern int spacebox_present_pause_ms;
@@ -34,14 +36,21 @@ bool spacebox_video_rect(int *x, int *y, int *w, int *h);
  * none), the frame's tickets, frames dropped since the last swap; the
  * refresh it is shown at (0 = not known), the swap's call, and the display
  * link's tick before it (its refresh and the one it prepares for), all on the
- * same clock */
+ * same clock; on Windows also the QueryPerformanceCounter's values at the
+ * swap's call and return, and the frame's way to the swap: the main loop's
+ * run of its flush, its submit to the presenter, the first time the
+ * presenter found the GPU done with it, the presenter's pick of it (0
+ * elsewhere: not written) */
 void spacebox_video_record_swap(uint64_t seq, int64_t t_swap, int code,
                                 bool code_ok, const uint64_t *tickets,
                                 unsigned n, uint64_t coalesced,
                                 int64_t read_us, int64_t t_show,
                                 int64_t t_call, int64_t t_vsync,
                                 int64_t t_out, int64_t t_due,
-                                int64_t t_flush_dev, int64_t t_flush_read);
+                                int64_t t_flush_dev, int64_t t_flush_read,
+                                int64_t qpc_call, int64_t qpc_ret,
+                                int64_t t_flush_rx, int64_t t_sub,
+                                int64_t t_ready, int64_t t_pick);
 /* the test pause, from its start to its end */
 void spacebox_video_record_paused(int ms, int64_t t0, int64_t t1);
 

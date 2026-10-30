@@ -80,6 +80,7 @@
 #include "audio/audio.h"
 #include "virtio-gpu-remote-formats.h"
 #include "virtio-gpu-remote.h"
+#include "ui/spacebox-sound.h"
 #include "ui/spacebox-ui-probe.h"
 #include "ui/spacebox-video-record.h"
 #include "system/runstate.h"
@@ -5245,7 +5246,14 @@ static void sp_hello(SpHdr *h)
  * If the buffer runs empty it waits for the target again. A surplus
  * (after a hold-up the delayed sound arrives at once; the two machines' clocks
  * drift) is worked off by playing 1% faster; only when three times the target
- * has piled up is the oldest part dropped.
+ * has piled up is the oldest part dropped. A surplus is what really waits, here
+ * and in the backend by the clock (spacebox_sound_queued_us): the lead is only
+ * how much the backend may be given. (The surplus was once read from the lead.
+ * The lead grows with each request that finds too little and never comes down,
+ * and from a lead of about 100 ms the sink played 1% faster for good, with no
+ * surplus at all: each second 10 ms of sound short, so a request that found
+ * nothing about once a second, heard as a click, while the buffer here showed
+ * 0 to 5 ms against the target of 80. Seen on 2026-10-29.)
  *
  * The target starts at SPACEBOX_AUDIO_BUFFER_MS (default 80). Each time the
  * buffer runs empty while sound is still arriving, the target goes up by 20 ms,
@@ -5273,6 +5281,7 @@ static struct {
     int64_t lead_us;        /* how far ahead of playback the backend is supplied */
     int64_t lead_raised;    /* when it last grew */
     uint64_t dev_starved_seen, dev_starved; /* requests that found too little */
+    int64_t queued_us;      /* given to the backend and not played yet, at the last sound that arrived */
     FILE *dump;
     uint64_t rx_bytes, played, dropped, underruns;
 } sp_aud;
@@ -5321,6 +5330,12 @@ static int64_t sp_aud_lead(int64_t now)
         uint64_t st = spacebox_coreaudio_starved_total();
 
         if (st != sp_aud.dev_starved_seen) {
+            /* a request that found too little played nothing: the backend's
+             * clock stood still for that long */
+            if (sp_aud.playing) {
+                sp_aud.t_start += (int64_t)(st - sp_aud.dev_starved_seen) *
+                                  spacebox_coreaudio_request_us();
+            }
             if (sp_aud.playing && now - sp_aud.t_start > 500000 &&
                 now - sp_aud.last_rx < 100000) {
                 sp_aud.dev_starved += st - sp_aud.dev_starved_seen;
@@ -5641,18 +5656,23 @@ static void sp_sink_audio(SpHdr *h, const uint8_t *a)
         sp_aud.playing = true;
         sp_aud.t_start = sp_aud.last_rx;
         sp_aud.fed = 0;
+#ifdef __APPLE__
+        sp_aud.dev_starved_seen = spacebox_coreaudio_starved_total();
+#endif
     }
     /* How much later the sound comes out: what is buffered on average here
-     * and in the backend (the lead), less the 20 ms the picture/sound offset
-     * was tuned with. A longer lead moves sound from this buffer into the
-     * backend; it does not make the sound later. */
+     * and in the backend, less the 20 ms the picture/sound offset was tuned
+     * with. A longer lead moves sound from this buffer into the backend; it
+     * does not make the sound later. */
     {
         int64_t bps = (int64_t)freq * frame;
         int64_t held = (int64_t)sp_aud.len * G_USEC_PER_SEC / bps;
         int64_t target_us = (int64_t)sp_aud.target * G_USEC_PER_SEC / bps;
-        int64_t more_lead = sp_aud_lead(sp_aud.last_rx) - SP_AUD_LEAD_OLD_US;
 
-        held += more_lead;
+        sp_aud_lead(sp_aud.last_rx);
+        sp_aud.queued_us = sp_aud.playing ?
+            spacebox_sound_queued_us(sp_aud.fed, bps, sp_aud.last_rx - sp_aud.t_start) : 0;
+        held = MAX(held + sp_aud.queued_us - SP_AUD_LEAD_OLD_US, 1);
         sp_aud.held_avg = sp_aud.held_avg ? sp_aud.held_avg + (held - sp_aud.held_avg) / 64 : held;
         /*
          * After a hold-up the sound that piled up arrives at once and the
@@ -5660,11 +5680,7 @@ static void sp_sink_audio(SpHdr *h, const uint8_t *a)
          * it is well above the target the sound is played 1% faster (see
          * sp_sink_audio_cb) until it is back.
          */
-        if (sp_aud.held_avg > target_us * 5 / 4) {
-            sp_aud.fast = true;
-        } else if (sp_aud.held_avg < target_us * 21 / 20) {
-            sp_aud.fast = false;
-        }
+        sp_aud.fast = spacebox_sound_fast(sp_aud.fast, sp_aud.held_avg, target_us);
         sp_aud_delay_us = MAX(sp_aud.held_avg - 20000, 1);
     }
 }
@@ -5952,12 +5968,12 @@ static void sp_stats(void *opaque)
                 " dropped_ms=%" PRIu64 " ran_dry=%" PRIu64 " buffered_ms=%zu target_ms=%d played_faster_ms=%" PRIu64
                 " device_requests=%" PRIu64 " device_got_nothing=%" PRIu64
                 " device_request_frames=%u least_waiting_frames=%u"
-                " got_nothing_while_playing=%" PRIu64 " lead_ms=%d\n",
+                " got_nothing_while_playing=%" PRIu64 " lead_ms=%d queued_ms=%d\n",
                 sp_aud.rx_bytes * 1000 / bps, sp_aud.played * 1000 / bps,
                 sp_aud.dropped * 1000 / bps, sp_aud.underruns, sp_aud.len * 1000 / bps,
                 sp_aud.target_ms, sp_aud.fast_ms, dev_requests, dev_starved,
                 dev_frames, dev_least == UINT32_MAX ? 0 : dev_least,
-                sp_aud.dev_starved, (int)(sp_aud.lead_us / 1000));
+                sp_aud.dev_starved, (int)(sp_aud.lead_us / 1000), (int)(sp_aud.queued_us / 1000));
         sp_aud.dev_starved = 0;
         sp_aud.fast_ms = 0;
         sp_aud.rx_bytes = sp_aud.played = sp_aud.dropped = sp_aud.underruns = 0;

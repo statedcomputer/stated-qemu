@@ -31,6 +31,8 @@ tests = {
   'test-int128': [],
   # all code tested by test-spacebox-frame-code is inside ui/spacebox-frame-code.h
   'test-spacebox-frame-code': [],
+  # all code tested by test-spacebox-sound is inside ui/spacebox-sound.h
+  'test-spacebox-sound': [],
   # all code tested by test-spacebox-ui-probe is inside ui/spacebox-ui-probe-px.h
   'test-spacebox-ui-probe': [zlib],
   'rcutorture': [],

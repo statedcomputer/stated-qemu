@@ -32,7 +32,8 @@ typedef struct {
     uint64_t fed;
     int64_t t_start, held_avg;
     bool playing, fast;
-    uint64_t fast_us, starved_while_playing, in, out;
+    uint64_t fast_us, starved_while_playing, in, out, played;     /* played: frames that the device took */
+    uint64_t played_start;
     int last_fast_s;
 } Sim;
 
@@ -43,7 +44,9 @@ static void hand_over(Sim *s, const Run *r, int64_t now)
     if (!s->playing) {
         return;
     }
-    allowed = (now - s->t_start + r->lead_us) * FREQ / 1000000 - (int64_t)(s->fed / FRAME);
+    /* the old rule's clock, or what the device played */
+    allowed = r->old_rule ? (now - s->t_start + r->lead_us) * FREQ / 1000000 - (int64_t)(s->fed / FRAME)
+                          : (int64_t)(s->played - s->played_start) + r->lead_us * FREQ / 1000000 - (int64_t)(s->fed / FRAME);
     while (allowed > 0 && s->backend < BACKEND_FRAMES && s->ring >= 1) {
         s->ring -= s->fast ? 1.01 : 1.0;
         s->ring = MAX(s->ring, 0);
@@ -64,13 +67,16 @@ static void arrive(Sim *s, const Run *r, int frames, int64_t now)
     if (!s->playing && s->ring >= TARGET_US * FREQ / 1000000) {
         s->playing = true;
         s->t_start = now;
+        s->played_start = s->played;
         s->fed = 0;
     }
     ring_us = (int64_t)s->ring * 1000000 / FREQ;
     if (r->old_rule) {
         held = ring_us + r->lead_us - LEAD_OLD_US;
     } else {
-        held = ring_us + (s->playing ? spacebox_sound_queued_us(s->fed, BPS, now - s->t_start) : 0);
+        int64_t played_us = (s->played - s->played_start) * 1000000 / FREQ;
+
+        held = ring_us + (s->playing ? spacebox_sound_queued_us(s->fed, BPS, played_us) : 0);
         held = MAX(held - LEAD_OLD_US, 1);
     }
     s->held_avg = s->held_avg ? s->held_avg + (held - s->held_avg) / 64 : held;
@@ -99,12 +105,9 @@ static Sim run(const Run *r)
         if (now >= next_request) {
             if (s.backend >= REQUEST_FRAMES) {
                 s.backend -= REQUEST_FRAMES;
+                s.played += REQUEST_FRAMES;
             } else if (s.playing && now - s.t_start > 500000) {
                 s.starved_while_playing++;
-                /* as sp_aud_lead: the backend's clock stood still */
-                if (!r->old_rule) {
-                    s.t_start += request_us;
-                }
             }
             next_request += request_us;
         }

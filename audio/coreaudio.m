@@ -316,6 +316,8 @@ static struct {
     uint64_t starved_total;     /* never reset */
     uint32_t frames, least_waiting;
     uint32_t request_us;        /* how much sound one request takes */
+    uint64_t played;            /* frames of the voice that left for the device, never reset */
+    uint32_t freq;              /* the voice's rate */
 } spacebox_ca = { .least_waiting = UINT32_MAX };
 
 uint64_t spacebox_coreaudio_starved_total(void);
@@ -328,6 +330,15 @@ uint32_t spacebox_coreaudio_request_us(void);
 uint32_t spacebox_coreaudio_request_us(void)
 {
     return qatomic_read(&spacebox_ca.request_us);
+}
+
+/* the time of what the device has really played, never reset */
+int64_t spacebox_coreaudio_played_us(void);
+int64_t spacebox_coreaudio_played_us(void)
+{
+    uint32_t freq = qatomic_read(&spacebox_ca.freq);
+
+    return freq ? (int64_t)(qatomic_read(&spacebox_ca.played) * 1000000 / freq) : 0;
 }
 
 void spacebox_coreaudio_stats(uint64_t *requests, uint64_t *starved,
@@ -405,10 +416,13 @@ static OSStatus audioDeviceIOProc(
                                               step, &core->phase);
 
         hw->pending_emul -= used * hw->info.bytes_per_frame;
+        qatomic_set(&spacebox_ca.played, spacebox_ca.played + used);
         len = 0;
     } else {
         len = frameCount * hw->info.bytes_per_frame;
+        qatomic_set(&spacebox_ca.played, spacebox_ca.played + frameCount);
     }
+    qatomic_set(&spacebox_ca.freq, hw->info.freq);
     while (len) {
         size_t write_len, start;
 

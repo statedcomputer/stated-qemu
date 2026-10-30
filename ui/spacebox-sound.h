@@ -9,9 +9,9 @@
 #include <stdint.h>
 
 /*
- * What the backend was given and has not played yet, us, by the clock: the time of what was fed, less the time since
- * playing began. The lead is only how much the backend may be given; when the sound that arrives is less, this is
- * less than the lead, and a surplus must not be read from the lead.
+ * What the backend was given and has not played yet, us: the time of what was fed, less the time that the device has
+ * played since playing began. The lead is only how much the backend may be given; when the sound that arrives is less,
+ * this is less than the lead, and a surplus must not be read from the lead.
  */
 static inline int64_t spacebox_sound_queued_us(uint64_t fed_bytes, uint64_t bytes_per_s, int64_t played_us)
 {

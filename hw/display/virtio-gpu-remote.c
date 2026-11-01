@@ -4399,7 +4399,6 @@ static void sp_sink_send_info(VirtIOGPU *g, bool caps)
     virtio_gpu_base_fill_display_info(VIRTIO_GPU_BASE(g), &di);
     ed.hdr.type = VIRTIO_GPU_RESP_OK_EDID;
     virtio_gpu_base_generate_edid(VIRTIO_GPU_BASE(g), 0, &ed);
-#ifdef _WIN32
     /*
      * The EDID first: the device shows the guest a new display when the
      * display information changes (its event) and answers the guest's EDID
@@ -4411,10 +4410,6 @@ static void sp_sink_send_info(VirtIOGPU *g, bool caps)
      */
     sp_send(SP_INFO, 0, &ed, sizeof(ed), NULL, 0, 3, 0, 0);
     sp_send(SP_INFO, 0, &di, sizeof(di), NULL, 0, 2, 0, 0);
-#else
-    sp_send(SP_INFO, 0, &di, sizeof(di), NULL, 0, 2, 0, 0);
-    sp_send(SP_INFO, 0, &ed, sizeof(ed), NULL, 0, 3, 0, 0);
-#endif
 }
 
 void sp_sink_notify_event(uint32_t event_type)

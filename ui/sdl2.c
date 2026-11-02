@@ -115,6 +115,25 @@ static double spacebox_win_scale = 1;
 /* the keyboard is grabbed (spacebox_win_kbd_grab) */
 static bool spacebox_kbd_grab, spacebox_kbd_saved;
 
+/*
+ * The size last told to the guest (spacebox_update_ui_info) and when, in ms
+ * of the monotonic clock. A guest that is told a new size may first show
+ * another mode for a moment: GNOME's compositor in the task's guest showed a
+ * mode it had held earlier (3840 x 2160, its full screen at 100%) for about
+ * 190 ms before the told one (turn G6e). QEMU's window follows each change of
+ * the guest's surface (sdl2_window_resize) and the window's new size is told
+ * to the guest, so the window took that mode's size in points and the guest
+ * was told it back: after a resize to 1280 x 800 points at 125% the window
+ * ended at 1920 x 1080 points, larger than the display. So the window does
+ * not follow a surface of another size than the one told while the guest may
+ * still be on its way to it (SPACEBOX_WIN_FOLLOW_MS after the tell); later
+ * changes of the guest's own (a mode chosen in the guest) are followed as
+ * before, and Ctrl+Alt+U gives the window the guest's size at any time.
+ */
+static int spacebox_win_told_w, spacebox_win_told_h;
+static int64_t spacebox_win_told_ms;
+#define SPACEBOX_WIN_FOLLOW_MS 2000
+
 static bool spacebox_win_dpi(void)
 {
     return getenv("SPACEBOX_RETINA_SCALE") != NULL;
@@ -332,6 +351,11 @@ static void spacebox_update_ui_info(struct sdl2_console *scon)
         if (mhz) {
             info.refresh_rate = mhz;
         }
+        if (info.width != spacebox_win_told_w || info.height != spacebox_win_told_h) {
+            spacebox_win_told_w = info.width;
+            spacebox_win_told_h = info.height;
+            spacebox_win_told_ms = g_get_monotonic_time() / 1000;
+        }
     }
 #endif
     dpy_set_ui_info(scon->dcl.con, &info, true);
@@ -457,6 +481,10 @@ void sdl2_window_create(struct sdl2_console *scon)
                 w, h, pw, ph, !!(SDL_GetWindowFlags(scon->real_window) & SDL_WINDOW_SHOWN));
     }
     spacebox_update_ui_info(scon);
+#ifdef CONFIG_WIN32
+    /* the placeholder's size: the guest's first surface is followed */
+    spacebox_win_told_ms = 0;
+#endif
     sdl_update_caption(scon);
 }
 
@@ -481,11 +509,41 @@ void sdl2_window_destroy(struct sdl2_console *scon)
     scon->real_window = NULL;
 }
 
+#ifdef CONFIG_WIN32
+static void spacebox_win_window_resize(struct sdl2_console *scon, bool asked);
+
+/* a change of the guest's surface (sdl2_gl_switch, sdl2_2d_switch) */
+void sdl2_window_resize(struct sdl2_console *scon)
+{
+    spacebox_win_window_resize(scon, false);
+}
+
+/* ASKED: Ctrl+Alt+U, the window to the guest's size whatever was told */
+static void spacebox_win_window_resize(struct sdl2_console *scon, bool asked)
+{
+    int sw, sh;
+    int64_t since;
+
+    if (!scon->real_window) {
+        return;
+    }
+    sw = surface_width(scon->surface);
+    sh = surface_height(scon->surface);
+    since = g_get_monotonic_time() / 1000 - spacebox_win_told_ms;
+    if (!asked && spacebox_win_told_ms && since < SPACEBOX_WIN_FOLLOW_MS &&
+        (sw != spacebox_win_told_w || sh != spacebox_win_told_h)) {
+        fprintf(stderr, "[SPACEBOX-WINDOW] the guest's surface %dx%d is not the size told %" PRId64
+                " ms ago (%dx%d): the window keeps its size\n",
+                sw, sh, since, spacebox_win_told_w, spacebox_win_told_h);
+        return;
+    }
+#else
 void sdl2_window_resize(struct sdl2_console *scon)
 {
     if (!scon->real_window) {
         return;
     }
+#endif
 
     SDL_SetWindowSize(scon->real_window,
                       spacebox_points(surface_width(scon->surface)),
@@ -850,7 +908,11 @@ static void handle_keydown(SDL_Event *ev)
             }
             break;
         case SDL_SCANCODE_U:
+#ifdef CONFIG_WIN32
+            spacebox_win_window_resize(scon, true);
+#else
             sdl2_window_resize(scon);
+#endif
             if (!scon->opengl) {
                 /* re-create scon->texture */
                 sdl2_2d_switch(&scon->dcl, scon->surface);

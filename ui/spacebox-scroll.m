@@ -131,6 +131,25 @@ static bool sp_route(NSEvent *event, const char *origin)
 - (NSEventModifierFlags)modifierFlags { return 0; }
 @end
 
+/* The UI evals' schedule (ui/spacebox-input-test.h): one precise scroll event of a trackpad, as the window's
+ * event monitor gets it from the device. DY > 0 moves the content up (the guest's offset grows), PHASE is
+ * NSEventPhase (began 1, changed 4, ended 8). False when the window is not known yet. */
+bool spacebox_scroll_schedule(double dy, unsigned long phase)
+{
+    if (!sp_initialized) return false;
+    @autoreleasepool {
+        SpScrollFixture *event=[[SpScrollFixture alloc] init];
+        event->sx=0;event->sy=-dy;event->precise=YES;event->ph=phase;event->mp=0;event->inverted=NO;event->win=sp_window;
+        if (!sp_route(event,"schedule")) {
+            id delegate=[sp_window delegate];
+            if ([delegate respondsToSelector:@selector(scrollWheel:)]) [delegate scrollWheel:event];
+            else [[sp_window contentView] scrollWheel:event];
+        }
+        [event release];
+    }
+    return true;
+}
+
 void spacebox_scroll_tick(SDL_Window *window)
 {
     if (!window) return;

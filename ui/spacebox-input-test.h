@@ -167,14 +167,218 @@ static void spacebox_typing_start(struct sdl2_console *scon, const char *line)
     timer_mod_ns(spacebox_typing.timer, spacebox_typing.start_ns);
 }
 
+/*
+ * "schedule FILE OUT DELAY_MS": the UI evals' schedule (dev/spacebox screen/ui/README.md, "The schedule") given
+ * to this window without the OS: for a client where the OS's injection is not allowed. Each event comes at
+ * start + DELAY_MS + t_ms on CLOCK_MONOTONIC (a timer of the main loop) and is then handed over at the next poll
+ * of the window's events, as a person's event that comes at that time waits in the queue for that poll: a key
+ * into SDL's queue (counted as this hook's own), a scroll as the window's event monitor gets a trackpad's
+ * (spacebox-scroll.m). OUT gets the injector's lines (README, "The injector"): t_us the event's coming,
+ * deliver_us its handing over, late_us how late the timer was; "via":"sink". The OS's path before the
+ * application (the HID system, the window server, the application's event queue) is not in it.
+ */
+#if defined(CONFIG_DARWIN)
+bool spacebox_scroll_schedule(double dy, unsigned long phase);
+#endif
+
+typedef struct {
+    int id, sc;          /* sc: the SDL scancode of a key, 0 for a scroll */
+    bool down, control;
+    double dy;
+    unsigned long phase;
+    char key[8];
+    int64_t due_us, came_us, late_us;
+} SpSchedEv;
+
+static struct {
+    QEMUTimer *timer;
+    FILE *out;
+    SpSchedEv *ev;
+    int n, next, given, pending0;
+    int64_t t0_us, max_late_us;
+} sp_sched;
+
+static int64_t sp_mono_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+}
+
+/* the value after "NAME": in one JSON line of the schedule (its writer's own form: no spaces) */
+static const char *sp_jfield(const char *line, const char *name)
+{
+    char pat[32];
+    snprintf(pat, sizeof(pat), "\"%s\":", name);
+    const char *p = strstr(line, pat);
+    return p ? p + strlen(pat) : NULL;
+}
+
+static bool sp_jstr(const char *line, const char *name, char *buf, size_t len)
+{
+    const char *p = sp_jfield(line, name);
+    if (!p || *p != '"') return false;
+    const char *e = strchr(p + 1, '"');
+    if (!e || (size_t)(e - p - 1) >= len) return false;
+    memcpy(buf, p + 1, e - p - 1);
+    buf[e - p - 1] = 0;
+    return true;
+}
+
+static void sp_sched_end(const char *why)
+{
+    if (sp_sched.out) {
+        fprintf(sp_sched.out, "{\"k\":\"end\",\"t_us\":%" PRId64 ",\"given\":%d,\"of\":%d,\"max_late_us\":%" PRId64
+                ",\"why\":\"%s\"}\n", sp_mono_us(), sp_sched.given, sp_sched.n, sp_sched.max_late_us, why);
+        fclose(sp_sched.out);
+        sp_sched.out = NULL;
+    }
+    g_free(sp_sched.ev);
+    sp_sched.ev = NULL;
+    sp_sched.n = sp_sched.next = sp_sched.pending0 = 0;
+    if (sp_sched.timer) timer_del(sp_sched.timer);
+    fprintf(stderr, "[SPACEBOX-INPUT-TEST] schedule %s: %d events given\n", why, sp_sched.given);
+}
+
+static void sp_sched_arm(void)
+{
+    if (sp_sched.next < sp_sched.n) {
+        int64_t wait_ns = (sp_sched.ev[sp_sched.next].due_us - sp_mono_us()) * 1000;
+        timer_mod_ns(sp_sched.timer, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + MAX(wait_ns, 0));
+    }
+}
+
+/* the timer: each event whose time has come; it waits for the next poll */
+static void sp_sched_tick(void *opaque)
+{
+    int64_t now = sp_mono_us();
+    while (sp_sched.next < sp_sched.n && sp_sched.ev[sp_sched.next].due_us <= now) {
+        SpSchedEv *e = &sp_sched.ev[sp_sched.next++];
+        e->came_us = now;
+        e->late_us = now - e->due_us;
+        sp_sched.max_late_us = MAX(sp_sched.max_late_us, e->late_us);
+    }
+    sp_sched_arm();
+}
+
+/* the poll: the events that came since the last one, handed over in their order */
+static void sp_sched_deliver(struct sdl2_console *scon)
+{
+    if (!sp_sched.ev) return;
+    while (sp_sched.pending0 < sp_sched.next) {
+        SpSchedEv *e = &sp_sched.ev[sp_sched.pending0++];
+        int64_t at = sp_mono_us();
+        bool ok;
+        if (e->sc) {
+            SDL_Event ev = {0};
+            ev.type = e->down ? SDL_KEYDOWN : SDL_KEYUP;
+            ev.key.windowID = SDL_GetWindowID(scon->real_window);
+            ev.key.state = e->down ? SDL_PRESSED : SDL_RELEASED;
+            ev.key.keysym.scancode = e->sc;
+            ev.key.keysym.sym = SDL_GetKeyFromScancode(e->sc);
+            ok = SDL_PushEvent(&ev) == 1;
+            if (ok) spacebox_test_keys++;
+        } else {
+#if defined(CONFIG_DARWIN)
+            ok = spacebox_scroll_schedule(e->dy, e->phase);
+#else
+            ok = false;
+#endif
+        }
+        sp_sched.given += ok;
+        if (e->sc) {
+            fprintf(sp_sched.out, "{\"k\":\"inj\",\"id\":%d,\"t_us\":%" PRId64 ",\"type\":\"%s\",\"key\":\"%s\","
+                    "\"down\":%s,\"late_us\":%" PRId64 ",\"deliver_us\":%" PRId64 ",\"tagged\":true,\"via\":\"sink\"%s}\n",
+                    e->id, e->came_us, e->control ? "control" : "key", e->key, e->down ? "true" : "false",
+                    e->late_us, at, ok ? "" : ",\"lost\":true");
+        } else {
+            fprintf(sp_sched.out, "{\"k\":\"inj\",\"id\":%d,\"t_us\":%" PRId64 ",\"type\":\"scroll\",\"dy\":%.9g,"
+                    "\"late_us\":%" PRId64 ",\"deliver_us\":%" PRId64 ",\"tagged\":true,\"via\":\"sink\"%s}\n",
+                    e->id, e->came_us, e->dy, e->late_us, at, ok ? "" : ",\"lost\":true");
+        }
+    }
+    if (sp_sched.pending0 == sp_sched.n) {
+        sp_sched_end("done");
+    }
+}
+
+static void sp_sched_start(const char *line)
+{
+    char file[512], out[512];
+    int delay;
+    g_autofree char *text = NULL;
+
+    if (sscanf(line, "%*s %511s %511s %d", file, out, &delay) != 3 || delay < 0) {
+        fprintf(stderr, "[SPACEBOX-INPUT-TEST] schedule: not taken: %s", line);
+        return;
+    }
+    if (sp_sched.ev) sp_sched_end("replaced");
+    if (!g_file_get_contents(file, &text, NULL, NULL) || !(sp_sched.out = fopen(out, "w"))) {
+        fprintf(stderr, "[SPACEBOX-INPUT-TEST] schedule: cannot read %s or write %s\n", file, out);
+        return;
+    }
+    setvbuf(sp_sched.out, NULL, _IOLBF, 0);
+    g_auto(GStrv) lines = g_strsplit(text, "\n", -1);
+    sp_sched.ev = g_new0(SpSchedEv, g_strv_length(lines));
+    sp_sched.n = sp_sched.next = sp_sched.given = sp_sched.pending0 = 0;
+    sp_sched.max_late_us = 0;
+    sp_sched.t0_us = sp_mono_us() + delay * 1000LL;
+    for (int i = 0; lines[i]; i++) {
+        const char *l = lines[i], *p;
+        char type[16] = "", ph[16] = "";
+        if (!strstr(l, "\"k\":\"ev\"") || !sp_jstr(l, "type", type, sizeof(type))) continue;
+        SpSchedEv *e = &sp_sched.ev[sp_sched.n];
+        if (!(p = sp_jfield(l, "id"))) continue;
+        e->id = atoi(p);
+        if (!(p = sp_jfield(l, "t_ms"))) continue;
+        e->due_us = sp_sched.t0_us + (int64_t)(g_ascii_strtod(p, NULL) * 1000);
+        if (!strcmp(type, "scroll")) {
+            e->dy = (p = sp_jfield(l, "dy")) ? g_ascii_strtod(p, NULL) : 0;
+            sp_jstr(l, "phase", ph, sizeof(ph));
+            e->phase = !strcmp(ph, "begin") ? 1 : !strcmp(ph, "end") ? 8 : 4;
+        } else {
+            sp_jstr(l, "key", e->key, sizeof(e->key));
+            e->down = (p = sp_jfield(l, "down")) && !strncmp(p, "true", 4);
+            e->control = !strcmp(type, "control");
+            if (strlen(e->key) == 1 && e->key[0] >= 'a' && e->key[0] <= 'z') e->sc = SDL_SCANCODE_A + (e->key[0] - 'a');
+            else if (!strcmp(e->key, "F8")) e->sc = SDL_SCANCODE_F8;
+            else if (!strcmp(e->key, "space")) e->sc = SDL_SCANCODE_SPACE;
+            else {
+                fprintf(stderr, "[SPACEBOX-INPUT-TEST] schedule: no scancode for key %s (event %d)\n", e->key, e->id);
+                continue;
+            }
+        }
+        sp_sched.n++;
+    }
+    fprintf(sp_sched.out, "{\"k\":\"hdr\",\"tool\":\"sink-schedule\",\"version\":1,\"clock\":\"CLOCK_MONOTONIC\","
+            "\"t0_us\":%" PRId64 ",\"tag_magic\":\"0x53504556\",\"via\":\"sink\",\"events\":%d,\"schedule\":\"%s\"}\n",
+            sp_sched.t0_us, sp_sched.n, file);
+    if (!sp_sched.timer) sp_sched.timer = timer_new_ns(QEMU_CLOCK_REALTIME, sp_sched_tick, NULL);
+    fprintf(stderr, "[SPACEBOX-INPUT-TEST] schedule: %d events from %s, start in %d ms\n", sp_sched.n, file, delay);
+    if (!sp_sched.n) {
+        sp_sched_end("empty");
+        return;
+    }
+    sp_sched_arm();
+}
+
 /* Synthetic events in this SDL application's queue. Opt-in local validation;
  * does not post events to macOS or inspect any other application. */
 static void spacebox_input_test(struct sdl2_console *scon)
 {
     const char *path = getenv("SPACEBOX_INPUT_TEST");
     if (!path || !scon->real_window) return;
+    sp_sched_deliver(scon);
     g_autofree char *text = NULL;
     if (!spacebox_hook_take(path, &text)) return;
+    if (!strncmp(text, "schedule ", 9)) {
+        sp_sched_start(text);
+        return;
+    }
+    if (!strncmp(text, "schedule-stop", 13)) {
+        if (sp_sched.ev) sp_sched_end("stopped");
+        return;
+    }
     char line[256] = "", command[24];
     int a = 0, b = 0, mod = 0;
     /* its first line, as fgets reads it */
